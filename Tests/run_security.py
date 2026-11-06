@@ -13,6 +13,7 @@ import tempfile
 import threading
 
 binary = str(Path(sys.argv[1]).resolve())
+loopback = "127.0.0.1"
 user = "loopback-audit"
 password = "fixture-only"
 basic = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -40,7 +41,7 @@ def endpoint(cert=None, key=None):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+    with http.server.ThreadingHTTPServer((loopback, 0), Handler) as server:
         if cert:
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.load_cert_chain(cert, key)
@@ -49,7 +50,7 @@ def endpoint(cert=None, key=None):
         thread.start()
         scheme = "https" if cert else "http"
         try:
-            yield f"{scheme}://localhost:{server.server_port}/repo", hits
+            yield f"{scheme}://{loopback}:{server.server_port}/repo", hits
         finally:
             server.shutdown()
             thread.join()
@@ -69,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
     conf = root / "openssl.cnf"
     conf.write_text(
         "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
-        "[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost\n"
+        f"[dn]\nCN={loopback}\n[ext]\nsubjectAltName=IP:{loopback}\n"
     )
     subprocess.run(
         ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -79,21 +80,21 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
 
     # Existing unscoped plaintext entries must never be automatically reused.
     legacy = config / "credentials.json"
-    legacy.write_text(f'{{"localhost|{user}":"{password}"}}')
+    legacy.write_text(f'{{"{loopback}|{user}":"{password}"}}')
     with endpoint() as (url, hits):
         result = run(env, url, "--user", user)
         assert result.returncode != 0 and hits == [("OPTIONS", False)], (result.stderr, hits)
 
     pins = config / "pinned-certs"
     with endpoint(cert, key) as (url, hits):
-        result = run(env, url, "--fetch-cert", "localhost")
+        result = run(env, url, "--fetch-cert", loopback)
         assert result.returncode == 0 and not list(pins.glob("*.crt")), result.stderr
         fingerprint = re.search(r"SHA-256: ([0-9A-F:]+)", result.stdout).group(1)
 
-        result = run(env, url, "--fetch-cert", "localhost", "--fingerprint", "00" * 32)
+        result = run(env, url, "--fetch-cert", loopback, "--fingerprint", "00" * 32)
         assert result.returncode != 0 and not list(pins.glob("*.crt")), result.stderr
 
-        result = run(env, url, "--fetch-cert", "localhost", "--fingerprint", fingerprint,
+        result = run(env, url, "--fetch-cert", loopback, "--fingerprint", fingerprint,
                      "--user", user, "--password", password, "--remember")
         assert result.returncode != 0 and any(authorized for _, authorized in hits), (result.stderr, hits)
         assert "已存入" not in result.stdout
