@@ -1883,11 +1883,13 @@ static int finish_wc_operation(csvn_ctx *ctx, svn_error_t *err, apr_pool_t *pool
 static svn_error_t *reject_file_external(void *baton, const char *path,
                                          const svn_client_status_t *status, apr_pool_t *pool)
 {
-    return status->file_external ? invalid_wc("不能直接修改外部工作副本中的文件") : SVN_NO_ERROR;
+    if (!status->file_external) return SVN_NO_ERROR;
+    return svn_error_createf(SVN_ERR_INCORRECT_PARAMS, NULL, "操作范围包含外部文件：%s", path);
 }
 
 static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
-                                          const char *root, const char *target, apr_pool_t *pool)
+                                          const char *root, const char *target,
+                                          svn_depth_t depth, apr_pool_t *pool)
 {
     const char *relative = svn_dirent_skip_ancestor(anchor, target);
     if (!relative) return invalid_wc("目标超出指定的工作副本范围");
@@ -1919,13 +1921,13 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
         relative = slash + 1;
     }
     svn_opt_revision_t base = csvn_rev_kind(svn_opt_revision_base);
-    return svn_client_status6(NULL, ctx->client, path, &base, svn_depth_empty,
+    return svn_client_status6(NULL, ctx->client, path, &base, depth,
                               TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, NULL,
                               reject_file_external, NULL, pool);
 }
 
 int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
-                                const char *const *targets, int count)
+                                const char *const *targets, int count, int recursive_revert)
 {
     if (!ctx || !root_path || !targets || count < 1) return -100;
     apr_thread_mutex_lock(ctx->mutex);
@@ -1939,7 +1941,8 @@ int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
     if (!err && anchor_kind != svn_node_dir)
         err = invalid_wc("写入范围必须是已版本化的目录");
     for (int i = 0; !err && i < count; ++i)
-        err = validate_write_target(ctx, anchor, root, targets[i], pool);
+        err = validate_write_target(ctx, anchor, root, targets[i],
+                                    recursive_revert ? svn_depth_infinity : svn_depth_empty, pool);
     return finish_wc_operation(ctx, err, pool);
 }
 
