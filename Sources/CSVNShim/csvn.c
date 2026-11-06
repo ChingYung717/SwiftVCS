@@ -1889,7 +1889,7 @@ static svn_error_t *reject_file_external(void *baton, const char *path,
 
 static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
                                           const char *root, const char *target,
-                                          svn_depth_t depth, apr_pool_t *pool)
+                                          svn_depth_t depth, svn_boolean_t adding, apr_pool_t *pool)
 {
     const char *relative = svn_dirent_skip_ancestor(anchor, target);
     if (!relative) return invalid_wc("目标超出指定的工作副本范围");
@@ -1912,6 +1912,7 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
         } else {
             if (errno != ENOENT)
                 return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法访问工作副本路径");
+            if (adding) return invalid_wc("找不到要纳入版本控制的目标");
             svn_node_kind_t kind;
             SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, TRUE, FALSE, pool));
             if (slash ? kind != svn_node_dir : (kind != svn_node_dir && kind != svn_node_file && kind != svn_node_symlink))
@@ -1920,6 +1921,13 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
         if (!slash) break;
         relative = slash + 1;
     }
+    if (adding) {
+        // 路径已逐段验证。没有任何 WC 元数据的真实节点交给 add_parents 处理；
+        // 有记录的节点仍走状态检查（包括文件 external）。
+        svn_node_kind_t kind;
+        SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, TRUE, TRUE, pool));
+        if (kind == svn_node_none) return SVN_NO_ERROR;
+    }
     svn_opt_revision_t base = csvn_rev_kind(svn_opt_revision_base);
     return svn_client_status6(NULL, ctx->client, path, &base, depth,
                               TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, NULL,
@@ -1927,7 +1935,7 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
 }
 
 int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
-                                const char *const *targets, int count, int recursive_revert)
+                                const char *const *targets, int count, int recursive_revert, int adding)
 {
     if (!ctx || !root_path || !targets || count < 1) return -100;
     apr_thread_mutex_lock(ctx->mutex);
@@ -1942,7 +1950,7 @@ int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
         err = invalid_wc("写入范围必须是已版本化的目录");
     for (int i = 0; !err && i < count; ++i)
         err = validate_write_target(ctx, anchor, root, targets[i],
-                                    recursive_revert ? svn_depth_infinity : svn_depth_empty, pool);
+                                    recursive_revert ? svn_depth_infinity : svn_depth_empty, adding, pool);
     return finish_wc_operation(ctx, err, pool);
 }
 

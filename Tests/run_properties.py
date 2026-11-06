@@ -86,6 +86,35 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-properties-") as temporary:
     vcs("propdel", wc, "project:empty", *at_file)
     vcs("propget", wc, "project:empty", *at_file, "--raw", ok=False)
 
+    # add --parents 语义：可以直接纳管尚未纳管目录中的文件。
+    add_wc = base / "add-fixture"
+    svn("checkout", url, add_wc)
+    added = add_wc / "新增目录/有 空格/child.txt"
+    added.parent.mkdir(parents=True)
+    added.write_text("new child\n")
+    vcs("add", add_wc, added.relative_to(add_wc))
+    for item in (added, added.parent, added.parent.parent):
+        assert svn("status", item).startswith(b"A")
+    entire = add_wc / "entire"
+    entire.mkdir()
+    (entire / "file").touch()
+    vcs("add", add_wc, "entire")
+    assert svn("status", entire / "file").startswith(b"A")
+
+    pending = add_wc / "untracked/file.txt"
+    pending.parent.mkdir()
+    pending.touch()
+    (add_wc / "link").symlink_to(added.parent, target_is_directory=True)
+    embedded = pending.parent / "nested"
+    svn("checkout", url, embedded)
+    svn("propset", "svn:externals", "^/" + path + " external.txt", add_wc)
+    svn("update", add_wc)
+    for bad in ("../outside.txt", "link/child.txt", "untracked/nested/" + path,
+                "missing.txt", "external.txt"):
+        vcs("add", add_wc, pending.relative_to(add_wc), bad, ok=False)
+        assert svn("status", pending.parent).startswith(b"?")
+    assert not svn("status", embedded)
+
     vcs("propset", wc, "project:history", "new", *at_file)
     assert vcs("propget", wc, "project:history", *at_file, "--revision", 1, "--raw").stdout == b"old"
     vcs("propset", wc, "svn:mergeinfo", "/trunk:1", *at_file, ok=False)
