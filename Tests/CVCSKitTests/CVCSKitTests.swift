@@ -10,7 +10,18 @@ struct CVCSKitTests {
         testWorkingCopyStatusPendingFlag()
         testKeychainScopeIncludesProtocolPortAndRepository()
         testMergeRevisionRange()
-        print("5 unit tests passed")
+        testCompleteAndTruncatedText()
+        print("6 unit tests passed")
+    }
+
+    private static func testCompleteAndTruncatedText() {
+        let chinese = Data("hello".utf8) + Data([0xD6, 0xD0])
+        let invalidTail = Data("hello".utf8) + Data([0xE4])
+        expect(SVNClient.decodeText(chinese) == "hello中")
+        expect(SVNClient.decodeText(Data("UTF-8中文".utf8)) == "UTF-8中文")
+        expect(SVNClient.decodeText(invalidTail) == nil)
+        expect(SVNClient.decodeText(invalidTail, isTruncated: true) == "hello")
+        expect(SVNClient.decodeText(Data([0])) == nil)
     }
 
     private static func expect(_ condition: Bool, file: StaticString = #fileID, line: UInt = #line) {
