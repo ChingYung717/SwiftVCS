@@ -21,6 +21,15 @@ jobs:
       - name: Install build dependencies
         run: brew install subversion apr apr-util pkgconf
 
+      - name: Record runner toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
+          "$(brew --prefix subversion)/bin/svn" --version --quiet
+          brew --version
+
       - name: Build and run unit checks
         run: |
           source scripts/svn_build_env.sh
@@ -46,12 +55,21 @@ jobs:
           fi
           codesign --verify --deep --strict "$app"
           unzip -tq dist/VCSExplorer-arm64.zip
+          minimum=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")
+          [[ "$minimum" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
+          cd dist
+          printf 'Commit: %s\nArchitecture: arm64 (Apple Silicon)\nMinimum macOS: %s\nSignature: ad hoc, not notarized\n' \
+            "$GITHUB_SHA" "$minimum" > build-info.txt
+          shasum -a 256 VCSExplorer-arm64.zip build-info.txt > SHA256SUMS
 
-      - name: Upload VCSExplorer-arm64.zip artifact
+      - name: Upload verified preview assets
         uses: actions/upload-artifact@v4
         with:
           name: VCSExplorer-arm64
-          path: dist/VCSExplorer-arm64.zip
+          path: |
+            dist/VCSExplorer-arm64.zip
+            dist/SHA256SUMS
+            dist/build-info.txt
           if-no-files-found: error
 
   publish-preview:
@@ -66,6 +84,11 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Checkout release script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download the verified macOS package
         uses: actions/download-artifact@v4
         with:
@@ -76,16 +99,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          tag="build-${GITHUB_SHA}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            test "$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha')" = "$GITHUB_SHA"
-            test "$(gh release view "$tag" --json assets,isDraft --jq '(.isDraft | not) and any(.assets[]; .name == "VCSExplorer-arm64.zip")')" = true
-            exit 0
-          fi
-
-          gh release create "$tag" VCSExplorer-arm64.zip \
-            --target "$GITHUB_SHA" \
-            --title "SwiftVCS preview ${GITHUB_SHA:0:12}" \
-            --prerelease --latest=false \
-            --notes "Apple Silicon preview for commit $GITHUB_SHA. The app uses an ad hoc signature and is not notarized. GitHub provides source ZIP and tar.gz archives for the same commit."
+        run: bash scripts/publish_preview.sh
