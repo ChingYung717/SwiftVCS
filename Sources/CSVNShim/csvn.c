@@ -1934,6 +1934,10 @@ int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
     const char *anchor, *root;
     svn_error_t *err = svn_dirent_get_absolute(&anchor, root_path, pool);
     if (!err) err = svn_client_get_wc_root(&root, anchor, ctx->client, pool, pool);
+    svn_node_kind_t anchor_kind;
+    if (!err) err = svn_wc_read_kind2(&anchor_kind, ctx->client->wc_ctx, anchor, FALSE, FALSE, pool);
+    if (!err && anchor_kind != svn_node_dir)
+        err = invalid_wc("写入范围必须是已版本化的目录");
     for (int i = 0; !err && i < count; ++i)
         err = validate_write_target(ctx, anchor, root, targets[i], pool);
     return finish_wc_operation(ctx, err, pool);
