@@ -15,8 +15,19 @@ elif [ -d "/usr/local/opt/subversion/bin" ]; then
 else
     SVN_BIN="$(dirname "$(command -v svn)")"
 fi
-BASE="$(mktemp -d)" || exit 1
-trap 'rm -rf "$BASE"' EXIT
+TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || exit 1
+BASE="$(mktemp -d "$TEMP_ROOT/swiftvcs-e2e.XXXXXXXX")" || exit 1
+cleanup() {
+    local result=$?
+    trap - EXIT
+    if [[ "$BASE" != "$TEMP_ROOT"/swiftvcs-e2e.* || -L "$BASE" ]] ||
+       { [ -d "$BASE" ] && ! /usr/bin/find -P "$BASE" -depth -delete; }; then
+        printf '无法清理本次测试目录：%s\n' "$BASE" >&2
+        [ "$result" -ne 0 ] || result=1
+    fi
+    exit "$result"
+}
+trap cleanup EXIT
 export CFFIXED_USER_HOME="$BASE/home" HOME="$BASE/home"
 mkdir -p "$HOME"
 T="$BASE/swiftvcs-e2e"   # 注意：URL 里不能有双斜杠，路径必须规范
@@ -72,7 +83,6 @@ CAT_OUT=$("$VCSCTL" cat "file://$T/repo" src/main.txt 2>&1)
 check "读取远端文件内容 (cat)" "hello v2" "$CAT_OUT"
 
 echo "==> 3 检出"
-rm -rf "$T/wc2"
 OUT=$("$VCSCTL" checkout "file://$T/repo" "$T/wc2" 2>&1)
 check "检出成功" "已检出到" "$OUT"
 check "工作副本文件存在" "x" "$([ -f "$T/wc2/src/main.txt" ] && echo x || echo no)"
