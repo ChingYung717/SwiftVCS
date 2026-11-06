@@ -1,5 +1,5 @@
 #!/bin/bash
-# Source this file before building SwiftVCS or importing CSVNKit via SwiftPM.
+# Execute for a SwiftVCS build, or source for other SwiftPM commands.
 _swiftvcs_build_env() {
     local root svn apr apr_util pc_dir
     local script_path
@@ -28,4 +28,10 @@ Libs: -L"$svn/lib" -L"$apr/lib" -L"$apr_util/lib" -lsvn_client-1 -lsvn_ra-1 -lsv
 PC
     export PKG_CONFIG_PATH="$pc_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 }
-_swiftvcs_build_env
+if [ -z "${ZSH_VERSION:-}" ] && [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    _swiftvcs_build_env || exit $?
+    package_root="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
+    exec swift build --package-path "$package_root" "$@"
+else
+    _swiftvcs_build_env
+fi

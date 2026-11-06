@@ -58,13 +58,13 @@ SwiftVCS/
 
 ```bash
 brew install subversion apr apr-util pkgconf
-source scripts/svn_build_env.sh
 ```
 
 ### Build & Run Tests
 
 ```bash
-swift build
+./scripts/svn_build_env.sh
+source scripts/svn_build_env.sh
 swift run SwiftVCSChecks
 ./Tests/run_e2e.sh
 ```
