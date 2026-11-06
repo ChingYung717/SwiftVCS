@@ -74,14 +74,14 @@
 
 ```bash
 brew install subversion apr apr-util pkgconf
-source scripts/svn_build_env.sh
 ```
 
 #### 2. 编译与运行测试
 
 ```bash
 # Debug 构建全部模块 (CVCSKit, CSVNKit, vcsctl, VCSExplorer)
-swift build
+./scripts/svn_build_env.sh
+source scripts/svn_build_env.sh
 swift run SwiftVCSChecks
 
 # 运行 本地离线端到端测试套件（自动创建临时 file:// 仓库完成全链路验证）
@@ -168,10 +168,10 @@ vcsctl log      /path/to/wc --limit 50
 ```bash
 # 1. Install build-time dependencies via Homebrew (Apple Silicon or Intel)
 brew install subversion apr apr-util pkgconf
-source scripts/svn_build_env.sh
 
 # 2. Build all targets
-swift build
+./scripts/svn_build_env.sh
+source scripts/svn_build_env.sh
 swift run SwiftVCSChecks
 
 # 3. Run the offline E2E test suite (uses local file:// repositories)
