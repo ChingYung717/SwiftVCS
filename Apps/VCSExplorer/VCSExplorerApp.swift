@@ -1253,17 +1253,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func showDiff(for item: WorkingCopyStatus? = nil) {
-        if let item {
-            selectWorkingStatus(item)
-        } else {
-            run {
-                let d = try await self.diffCore(forPaths: nil)
-                self.statusText = d.isEmpty ? "无差异" : "\(d.count) 个文件有差异"
-            }
-        }
-    }
-
     func showLog(customPath: String? = nil) {
         run {
             let l = try await self.logCore(customPath: customPath)
