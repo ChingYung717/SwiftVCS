@@ -262,6 +262,8 @@ private struct BrowseEntryRowView: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
+            Button("查看节点属性…") { model.inspectRepositoryProperties(entry) }
+                .disabled(model.isBusy)
             if entry.kind == .directory {
                 Button("进入此目录") {
                     model.open(entry)

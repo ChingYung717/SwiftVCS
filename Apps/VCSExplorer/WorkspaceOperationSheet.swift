@@ -16,12 +16,25 @@ struct WorkspaceOperationSheet: View {
             if case .merge = operation.kind {
                 mergeFields
             } else {
-                Text(verbatim: operation.path).textSelection(.enabled)
+                if !operation.path.isEmpty { Text(verbatim: operation.path).textSelection(.enabled) }
                 if operation.kind.needsDestination {
                     if case .rename = operation.kind {
                         TextField("新文件名", text: $model.operationDestination)
                     } else {
                         TextField("目标路径（相对工作副本）", text: $model.operationDestination)
+                    }
+                }
+                if case .mkdir = operation.kind {
+                    Toggle("同时新建缺失的父目录", isOn: $model.mkdirParents)
+                    if let preview = model.matchingDirectoryPreview {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                resultPaths("将新建", paths: preview.newPaths)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 130)
+                        .textSelection(.enabled)
                     }
                 }
                 if case .delete = operation.kind {
@@ -37,9 +50,13 @@ struct WorkspaceOperationSheet: View {
                 HStack {
                     Spacer()
                     closeButton("取消")
+                    if case .mkdir = operation.kind {
+                        Button("预览") { model.previewMkdir(operation) }
+                            .disabled(model.isBusy || model.operationDestination.isEmpty)
+                    }
                     Button("确认") { model.executeWorkspaceOperation(operation) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.isBusy || (operation.kind.needsDestination && model.operationDestination.isEmpty))
+                        .disabled(model.isBusy || (operation.kind.needsDestination && model.operationDestination.isEmpty) || requiresDirectoryPreview)
                         .help("应用到当前工作副本")
                 }
             }
@@ -47,6 +64,11 @@ struct WorkspaceOperationSheet: View {
         .padding(20)
         .frame(width: 480)
         .interactiveDismissDisabled(model.isBusy)
+    }
+
+    private var requiresDirectoryPreview: Bool {
+        if case .mkdir = operation.kind { return model.matchingDirectoryPreview == nil }
+        return false
     }
 
     private var mergeFields: some View {

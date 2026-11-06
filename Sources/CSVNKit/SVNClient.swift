@@ -1451,6 +1451,131 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
     }
 
+    // MARK: - 节点属性与目录
+
+    private func propertyRevision(_ revision: Int?) throws -> Int32 {
+        guard let revision else { return -1 }
+        guard revision >= 0, let value = Int32(exactly: revision) else {
+            throw VCSError.invalidArgument("修订号超出支持范围")
+        }
+        return value
+    }
+
+    private func readProperties(at target: PropertyTarget, name: String?, revision: Int?,
+                                peg: Int?, inherited: Bool) async throws -> [NodeProperty] {
+        let root: String?
+        let path: String
+        switch target {
+        case .workingCopy(let wc, let relative):
+            root = try writeRoot(wc)
+            path = relative
+        case .repository(let url):
+            guard (url.isFileURL || SVNOrigin(url) != nil), url.user == nil, url.password == nil,
+                  url.query == nil, url.fragment == nil else {
+                throw VCSError.invalidArgument("需要不含凭据、查询参数或片段的仓库 URL")
+            }
+            root = nil
+            path = url.absoluteString
+        }
+        try validateCString(path)
+        if let name { try validateCString(name) }
+        let revision = try propertyRevision(revision)
+        let peg = try propertyRevision(peg)
+        return try await perform {
+            var rows: UnsafeMutablePointer<csvn_property>?
+            var count: Int32 = 0
+            defer { csvn_free_properties(rows, count) }
+            let h = try self.requireHandle()
+            try self.check(csvn_properties(h, root, path, name, revision, peg,
+                                           inherited ? 1 : 0, &rows, &count))
+            guard let rows else { return [] }
+            return (0..<Int(count)).map { index in
+                let row = rows[index]
+                let value = row.data.map { Data(bytes: $0, count: row.length) } ?? Data()
+                return NodeProperty(target: target, source: row.source.map { String(cString: $0) },
+                                    name: String(cString: row.name), value: value)
+            }.sorted { ($0.name, $0.source ?? "") < ($1.name, $1.source ?? "") }
+        }
+    }
+
+    public func properties(at target: PropertyTarget, revision: Int? = nil, peg: Int? = nil,
+                           inherited: Bool = false) async throws -> [NodeProperty] {
+        try await readProperties(at: target, name: nil, revision: revision, peg: peg, inherited: inherited)
+    }
+
+    public func property(_ name: String, at target: PropertyTarget, revision: Int? = nil,
+                         peg: Int? = nil) async throws -> Data? {
+        try await readProperties(at: target, name: name, revision: revision, peg: peg,
+                                 inherited: false).first?.value
+    }
+
+    public func setProperty(_ name: String, value: Data?, workingCopy: URL, path: String) async throws {
+        let root = try writeRoot(workingCopy)
+        try validateCString(path)
+        try validateCString(name)
+        guard NodeProperty.allowsEditing(name) else { throw VCSError.invalidArgument("此属性为只读") }
+        if name.hasPrefix("svn:"), let value, value.contains(0) || String(data: value, encoding: .utf8) == nil {
+            throw VCSError.invalidArgument("此 SVN 属性需要 UTF-8 文本")
+        }
+        try await performWrite {
+            let h = try self.requireHandle()
+            try (value ?? Data()).withUnsafeBytes { buffer in
+                try self.check(csvn_set_property(h, root, path, name, buffer.baseAddress,
+                                                 buffer.count, value == nil ? 1 : 0))
+            }
+        }
+    }
+
+    private func readNativeStrings(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>,
+                                            UnsafeMutablePointer<Int32>) -> Int32) throws -> [String] {
+        var values: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+        var count: Int32 = 0
+        defer { csvn_free_string_array(values, count) }
+        try check(body(&values, &count))
+        guard let values else { return [] }
+        return (0..<Int(count)).compactMap { values[$0].map { String(cString: $0) } }
+    }
+
+    public func ignoreRules(workingCopy: URL, directory: String) async throws -> IgnoreRules {
+        let root = try writeRoot(workingCopy)
+        let url = URL(fileURLWithPath: root).appendingPathComponent(directory)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { throw VCSError.invalidArgument("请选择工作副本目录") }
+        let properties = try await properties(at: .workingCopy(root: workingCopy, path: directory), inherited: true)
+        let defaults = try await perform {
+            let h = try self.requireHandle()
+            return try self.readNativeStrings { csvn_default_ignores(h, $0, $1) }
+        }
+        return IgnoreRules(defaults: defaults,
+                           directoryRules: properties.first { $0.name == "svn:ignore" && $0.source == nil },
+                           globalRules: properties.filter { $0.name == "svn:global-ignores" })
+    }
+
+    public func previewDirectory(workingCopy: URL, path: String, parents: Bool) async throws -> [String] {
+        try await directoryOperation(workingCopy: workingCopy, path: path, parents: parents,
+                                     preview: true, expectedCount: nil)
+    }
+
+    public func makeDirectory(workingCopy: URL, path: String, parents: Bool,
+                              expectedCount: Int? = nil) async throws -> [String] {
+        try await directoryOperation(workingCopy: workingCopy, path: path, parents: parents,
+                                     preview: false, expectedCount: expectedCount)
+    }
+
+    private func directoryOperation(workingCopy: URL, path: String, parents: Bool, preview: Bool,
+                                    expectedCount: Int?) async throws -> [String] {
+        let root = try writeRoot(workingCopy)
+        try validateCString(path)
+        let expected = try propertyRevision(expectedCount)
+        return try await performWrite {
+            let h = try self.requireHandle()
+            return try self.readNativeStrings {
+                csvn_mkdir_working(h, root, path, parents ? 1 : 0, preview ? 1 : 0, expected, $0, $1)
+            }
+        }
+    }
+
     // MARK: 9. 日志
 
     public func log(

@@ -324,6 +324,12 @@ private struct WorkingChangeRowView: View {
                 : AnyShapeStyle(Color.clear)
         )
         .contextMenu {
+            if [.normal, .modified, .added, .replaced].contains(status.kind) {
+                Button("节点属性…") {
+                    model.inspectWorkingProperties(path: status.path, isDirectory: status.isDirectory)
+                }
+                .disabled(model.isBusy)
+            }
             if status.kind == .conflicted {
                 ConflictActions(status: status)
             }

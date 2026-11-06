@@ -198,4 +198,5 @@ echo "================================"
 echo "  通过 $PASS 项，失败 $FAIL 项"
 echo "================================"
 [ "$FAIL" -eq 0 ] || exit 1
-python3 "$HERE/run_p0.py" "$VCSCTL" "$SVN_BIN"
+python3 "$HERE/run_p0.py" "$VCSCTL" "$SVN_BIN" || exit $?
+python3 "$HERE/run_properties.py" "$VCSCTL" "$SVN_BIN"

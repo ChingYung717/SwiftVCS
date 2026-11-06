@@ -689,3 +689,62 @@ public struct VCSTaskProgress: Sendable {
         self.currentPath = currentPath
     }
 }
+
+public enum PropertyTarget: Sendable, Hashable {
+    case workingCopy(root: URL, path: String)
+    case repository(URL)
+
+    public var displayPath: String {
+        switch self {
+        case .workingCopy(_, let path): return path
+        case .repository(let url): return url.absoluteString
+        }
+    }
+}
+
+public struct NodeProperty: Sendable, Equatable, Identifiable {
+    public struct ID: Sendable, Hashable {
+        public let target: PropertyTarget
+        public let source: String?
+        public let name: String
+    }
+
+    public let target: PropertyTarget
+    public let source: String?
+    public let name: String
+    public let value: Data
+    public var id: ID { ID(target: target, source: source, name: name) }
+
+    public init(target: PropertyTarget, source: String?, name: String, value: Data) {
+        self.target = target
+        self.source = source
+        self.name = name
+        self.value = value
+    }
+
+    public static func allowsEditing(_ name: String) -> Bool {
+        !name.isEmpty && (!name.hasPrefix("svn:") ||
+            ["svn:ignore", "svn:eol-style", "svn:keywords", "svn:mime-type"].contains(name))
+    }
+
+    public var isEditable: Bool {
+        guard case .workingCopy = target, source == nil else { return false }
+        return Self.allowsEditing(name)
+    }
+
+    public var textValue: String? {
+        value.contains(0) ? nil : String(data: value, encoding: .utf8)
+    }
+}
+
+public struct IgnoreRules: Sendable, Equatable {
+    public let defaults: [String]
+    public let directoryRules: NodeProperty?
+    public let globalRules: [NodeProperty]
+
+    public init(defaults: [String], directoryRules: NodeProperty?, globalRules: [NodeProperty]) {
+        self.defaults = defaults
+        self.directoryRules = directoryRules
+        self.globalRules = globalRules
+    }
+}

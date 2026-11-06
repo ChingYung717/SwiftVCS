@@ -11,7 +11,7 @@ struct Args {
         "trust-bundle",
         "revision", "r",
         "limit", "source", "from", "to", "peg", "strategy",
-        "ca", "fetch-cert", "fingerprint", "server",
+        "ca", "fetch-cert", "fingerprint", "server", "file", "path",
     ]
 
     var positional: [String] = []
@@ -46,7 +46,7 @@ struct Args {
                         setFlag(rawKey, "")
                         i += 1
                     }
-                } else if rawKey == "dry-run" || rawKey == "exact" {
+                } else if ["dry-run", "exact", "raw", "inherited", "parents"].contains(rawKey) {
                     setFlag(rawKey, "true")
                     i += 1
                 } else if i + 1 < argv.count, !argv[i + 1].hasPrefix("-") {
@@ -127,6 +127,92 @@ func rememberCredentials(_ client: SVNClient) async throws {
     out("凭据已存入 macOS 钥匙串")
 }
 
+// 属性值原样输出时，不经过 Swift 字符串或 print。
+func nodeCommand(_ command: String, _ args: Args) async throws {
+    let read = command == "proplist" || command == "propget"
+    let common: Set<String> = ["user", "password", "trust-bundle", "ca", "server"]
+    let specific: Set<String>
+    switch command {
+    case "proplist": specific = ["path", "revision", "peg", "inherited"]
+    case "propget": specific = ["path", "revision", "peg", "raw"]
+    case "propset": specific = ["path", "file"]
+    case "propdel", "ignore": specific = ["path"]
+    default: specific = ["parents"]
+    }
+    let invalid = VCSError.invalidArgument("参数不正确，请查看 vcsctl 命令帮助")
+    guard let input = args.positional.first, !input.isEmpty,
+          args.duplicates.isEmpty, Set(args.flags.keys).isSubset(of: common.union(specific)),
+          args.flags.values.allSatisfy({ !$0.isEmpty }) else { throw invalid }
+    for flag in ["inherited", "raw", "parents"] {
+        if let value = args.string(flag), value != "true" && value != "false" { throw invalid }
+    }
+    for flag in ["revision", "peg"] where args.string(flag) != nil {
+        guard let n = args.int(flag), n >= 0, n <= Int(Int32.max) else { throw invalid }
+    }
+    let count = args.positional.count
+    let file = args.string("file")
+    switch command {
+    case "proplist", "ignore": guard count == 1 else { throw invalid }
+    case "propset": guard count == (file == nil ? 3 : 2) else { throw invalid }
+    default: guard count == 2 else { throw invalid }
+    }
+    let root = URL(fileURLWithPath: input)
+    let path = args.string("path") ?? "."
+    let isURL = input.contains("://")
+    guard !isURL || (read && args.string("path") == nil) else {
+        throw VCSError.invalidArgument("仓库 URL 只接受完整 URL 的属性查询；写入须指定本地工作副本")
+    }
+    let target: PropertyTarget = isURL ? .repository(requireURL(input)) : .workingCopy(root: root, path: path)
+    let client = try await makeClient(args, url: isURL ? input : nil, workingCopyPath: isURL ? nil : input)
+    let name = count >= 2 ? args.positional[1] : ""
+    let rev = args.int("revision")
+    let peg = args.int("peg")
+
+    switch command {
+    case "proplist":
+        for property in try await client.properties(at: target, revision: rev, peg: peg, inherited: args.bool("inherited")) {
+            out("\(property.name)\t\(property.source ?? "直接设置")")
+        }
+    case "propget":
+        guard let value = try await client.property(name, at: target, revision: rev, peg: peg) else {
+            throw VCSError.invalidArgument("目标未设置属性「\(name)」")
+        }
+        if args.bool("raw") {
+            try FileHandle.standardOutput.write(contentsOf: value)
+        } else {
+            let property = NodeProperty(target: target, source: nil, name: name, value: value)
+            out(property.textValue ?? "[二进制属性，\(value.count) 字节；用 --raw 读取]")
+        }
+    case "propset", "propdel":
+        let value: Data?
+        if command == "propdel" {
+            value = nil
+        } else if let file {
+            value = try Data(contentsOf: URL(fileURLWithPath: file))
+        } else {
+            value = Data(args.positional[2].utf8)
+        }
+        try await client.setProperty(name, value: value, workingCopy: root, path: path)
+        out("已在工作副本\(value == nil ? "删除" : "设置")属性「\(name)」，待提交")
+    case "ignore":
+        let rules = try await client.ignoreRules(workingCopy: root, directory: path)
+        out("配置默认规则：")
+        rules.defaults.forEach(out)
+        out("目录 svn:ignore：")
+        if let local = rules.directoryRules { out(local.textValue ?? "[二进制属性]") }
+        out("svn:global-ignores（含继承）：")
+        for rule in rules.globalRules {
+            out("\(rule.source ?? path)：\(rule.textValue ?? "[二进制属性]")")
+        }
+    case "mkdir":
+        let paths = try await client.makeDirectory(workingCopy: root, path: name,
+                                                   parents: args.bool("parents"), expectedCount: nil)
+        out("已在工作副本新建目录，待提交：\(paths.joined(separator: ", "))")
+    default:
+        throw invalid
+    }
+}
+
 // MARK: - 子命令
 
 let rawArgs = Array(CommandLine.arguments.dropFirst())
@@ -154,6 +240,13 @@ guard let command = rawArgs.first else {
       vcsctl resolve   <工作副本> <路径> --strategy current|base|incoming|local
       vcsctl merge     <工作副本> --source <URL> --revision N [--peg N] [--dry-run]
       vcsctl merge     <工作副本> --source <URL> --from A --to B [--peg N] [--dry-run]
+      vcsctl proplist  <工作副本|URL> [--path 相对路径] [--inherited] [--revision N] [--peg N]
+      vcsctl propget   <工作副本|URL> <属性名> [--path 相对路径] [--raw] [--revision N] [--peg N]
+      vcsctl propset   <工作副本> <属性名> <值> [--path 相对路径]
+      vcsctl propset   <工作副本> <属性名> --file <本地文件> [--path 相对路径]
+      vcsctl propdel   <工作副本> <属性名> [--path 相对路径]
+      vcsctl ignore    <工作副本> [--path 相对目录]
+      vcsctl mkdir     <工作副本> <相对路径> [--parents]
       commit --exact   仅提交明确列出的路径，目录只提交自身
 
     通用选项:
@@ -330,6 +423,9 @@ do {
         let paths = Array(args.positional.dropFirst())
         let n = try await client.revert(workingCopy: URL(fileURLWithPath: wc), paths: paths)
         out("已回滚 \(n) 个路径。")
+
+    case "proplist", "propget", "propset", "propdel", "ignore", "mkdir":
+        try await nodeCommand(command, args)
 
     case "delete", "move", "rename", "copy", "resolve", "merge":
         let common: Set<String> = ["user", "password", "trust-bundle", "ca", "server"]

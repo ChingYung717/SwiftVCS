@@ -97,6 +97,8 @@ python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
 
 ## 后续路线
 
+下一阶段的实施范围、依赖和验收见 [SwiftVCS 下一阶段功能计划](NEXT_STAGE_PLAN.md)。
+
 | 优先级 | 事项 |
 |---|---|
 | P1 代码洞察 | blame、日志按作者或日期筛选、仓库搜索、目录树版本对比。日志已有路径过滤；树差异需比较两个端点，不能直接拼接中间提交的 changed paths。 |
