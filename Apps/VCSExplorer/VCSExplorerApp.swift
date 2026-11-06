@@ -552,13 +552,7 @@ final class AppModel: ObservableObject {
         let c = try clientForWorkingCopy()
         let path = workingCopyPath
         let paths = specificPaths ?? committableWorkingStatuses.map(\.path)
-        let r: CommitResult
-        do {
-            r = try await c.commitSelection(workingCopy: URL(fileURLWithPath: path), paths: paths, message: message)
-        } catch {
-            if workingCopyPath == path { try? await refreshStatusCore() }
-            throw error
-        }
+        let r = try await c.commitSelection(workingCopy: URL(fileURLWithPath: path), paths: paths, message: message)
         if workingCopyPath == path {
             commitSummary = ""
             commitDescription = ""
@@ -1362,7 +1356,14 @@ final class AppModel: ObservableObject {
 
     private func runWorkspaceWrite(_ body: @escaping () async throws -> Void) {
         guard !isBusy, !workingCopyPath.isEmpty else { return }
-        run(body)
+        let path = workingCopyPath
+        run {
+            do { try await body() }
+            catch {
+                if self.workingCopyPath == path { try? await self.refreshStatusCore() }
+                throw error
+            }
+        }
     }
 
     private func run(_ body: @escaping () async throws -> Void) {

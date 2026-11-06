@@ -1,5 +1,6 @@
 """Offline acceptance checks for P0 against a disposable Subversion repository."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -85,8 +86,23 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-p0-") as temp:
     (wc / "pending.txt").unlink()
     (wc / "escape").unlink()
     # 嵌套工作副本独立清理，后续夹具要验证干净副本合并。
-    import shutil
     shutil.rmtree(nested)
+
+    # SVN 叶节点符号链接按版本化节点操作，不跟随其目标。
+    link = wc / "leaf"
+    link.symlink_to(target)
+    vcs("add", wc, "leaf")
+    vcs("revert", wc, "leaf")
+    assert target.read_text() == "do not revert\n"
+    link.unlink()
+
+    external_wc = checkout(trunk, "externals-fixture")
+    svn("propset", "svn:externals", "^/trunk/prop.txt external.txt", external_wc)
+    svn("update", external_wc)
+    external = external_wc / "external.txt"
+    external.write_text("external edit\n")
+    vcs("revert", external_wc, "external.txt", code=1)
+    assert external.read_text() == "external edit\n"
 
     initial = head()
     vcs("delete", wc, "delete.txt")
