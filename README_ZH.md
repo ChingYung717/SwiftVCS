@@ -85,3 +85,7 @@ vcsctl mkdir ./wc docs/guides --parents
 ```
 
 本地属性写入支持自定义属性及 `svn:ignore`、`svn:eol-style`、`svn:keywords`、`svn:mime-type`。本地属性路径用 `--path`，默认工作副本根。省略 `--parents` 时父目录必须已存在并纳入版本控制。参见[界面集成说明](docs/FRONTEND_INTEGRATION.md)。
+
+### 审核 SVN 属性差异
+
+工作副本的差异面板、提交历史及 `vcsctl diff`／`vcsctl show` 会单独显示节点直接属性的前后值。空值与不存在分别标注，二进制属性显示字节数。目录和二进制文件也支持属性审核。

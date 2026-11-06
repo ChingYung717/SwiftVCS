@@ -679,11 +679,39 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return false
     }
 
+    private func propertyChanges(from old: [String: Data], to new: [String: Data]) -> [PropertyChange] {
+        Set(old.keys).union(new.keys).sorted().compactMap { name in
+            guard old[name] != new[name] else { return nil }
+            return PropertyChange(name: name, oldValue: old[name], newValue: new[name])
+        }
+    }
+
+    private func propertySnapshot(_ read: (UnsafeMutablePointer<UnsafeMutablePointer<csvn_property>?>,
+                                          UnsafeMutablePointer<Int32>) -> Int32) throws -> [String: Data] {
+        var rows: UnsafeMutablePointer<csvn_property>?
+        var count: Int32 = 0
+        defer { csvn_free_properties(rows, count) }
+        try check(read(&rows, &count))
+        guard let rows else { return [:] }
+        return Dictionary(uniqueKeysWithValues: (0..<Int(count)).map { index in
+            let row = rows[index]
+            return (String(cString: row.name), row.data.map { Data(bytes: $0, count: row.length) } ?? Data())
+        })
+    }
+
+    private func withProperties(_ changes: [PropertyChange], in diff: FileDiff) -> FileDiff {
+        FileDiff(id: diff.id, path: diff.path, localPath: diff.localPath, isBinary: diff.isBinary,
+                 hunks: diff.hunks, isTruncated: diff.isTruncated,
+                 statusNotice: diff.statusNotice, propertyChanges: changes)
+    }
+
     public func diff(workingCopy: URL, paths: [String]) async throws -> [FileDiff] {
         try await perform {
             let h = try self.requireHandle()
-            let wcPath = workingCopy.standardizedFileURL.path
-            let targets = paths.isEmpty ? [wcPath] : paths.map { self.localPath(workingCopy, $0) }
+            let wcPath = try self.writeRoot(workingCopy)
+            let targets = paths.isEmpty ? [wcPath] : try paths.map {
+                try self.writePath($0, root: wcPath, originalRoot: workingCopy.standardizedFileURL.path)
+            }
 
             var out: [FileDiff] = []
             for t in targets {
@@ -707,6 +735,28 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                                     isTruncated: diff.isTruncated, statusNotice: "部分差异无法完整解码")
                 })
             }
+            var seen: Set<String> = []
+            for target in targets {
+                for status in try self.readStatus(target) where status.kind.isPendingChange {
+                    let path = status.path == "." ? target : target + "/" + status.path
+                    guard seen.insert(path).inserted else { continue }
+                    let relative = path == wcPath ? "." : String(path.dropFirst(wcPath.count + 1))
+                    let old = try self.propertySnapshot {
+                        csvn_wc_property_snapshot(h, path, 1, status.kind == .replaced ? 1 : 0, $0, $1)
+                    }
+                    let new = try self.propertySnapshot { csvn_wc_property_snapshot(h, path, 0, 0, $0, $1) }
+                    let changes = self.propertyChanges(from: old, to: new)
+                    guard !changes.isEmpty else { continue }
+                    if let index = out.firstIndex(where: { $0.path == relative }) {
+                        out[index] = self.withProperties(changes, in: out[index])
+                    } else {
+                        out.append(FileDiff(id: relative, path: relative,
+                                            localPath: URL(fileURLWithPath: path),
+                                            isBinary: Self.isKnownBinaryPath(path), hunks: [],
+                                            propertyChanges: changes))
+                    }
+                }
+            }
             return out
         }
     }
@@ -723,6 +773,34 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             _ = try Self.nativeInteger(copyRevision, field: "复制来源修订号")
         }
         guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
+        let content = try await diffFileContent(revision: revision, nativeRevision: nativeRevision,
+                                                change: change, repoRootURL: repoRootURL, maxBytes: maxBytes)
+        let changes = try await perform {
+            let h = try self.requireHandle()
+            let root = try self.resolveRootURLSync(handle: h, explicit: repoRootURL)
+            let target = Self.buildRepoURL(root: root, repoRelativePath: change.path)
+            func snapshot(_ url: URL, _ revision: Int32) throws -> [String: Data] {
+                try self.propertySnapshot {
+                    csvn_properties(h, nil, url.absoluteString, nil, revision, revision, 0, $0, $1)
+                }
+            }
+            let old: [String: Data]
+            if (change.action == .added || change.action == .replaced),
+               let source = change.copyFromPath, let copyRevision = change.copyFromRevision {
+                old = try snapshot(Self.buildRepoURL(root: root, repoRelativePath: source), Int32(copyRevision))
+            } else if change.action == .added {
+                old = [:]
+            } else {
+                old = try snapshot(target, nativeRevision - 1)
+            }
+            let new = change.action == .deleted ? [:] : try snapshot(target, nativeRevision)
+            return self.propertyChanges(from: old, to: new)
+        }
+        return withProperties(changes, in: content)
+    }
+
+    private func diffFileContent(revision: Int, nativeRevision: Int32, change: ChangedPath,
+                                 repoRootURL: URL?, maxBytes: Int) async throws -> FileDiff {
         if change.kind == .directory {
             let fallbackURL = (repoRootURL ?? self.rootURL ?? self.baseURL)
                 .map { Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
@@ -1021,7 +1099,6 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
         var results: [FileDiff] = []
         for change in entry.changes {
-            if change.kind == .directory { continue }
             if let filter = normalizedFilter {
                 let matches = change.path == filter
                     || change.path.hasPrefix(filter + "/")
@@ -1035,7 +1112,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     repoRootURL: logTarget,
                     maxBytes: maxBytes
                 )
-                results.append(d)
+                if change.kind != .directory || !d.propertyChanges.isEmpty { results.append(d) }
             } catch {
                 let targetURL = Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)
                 results.append(

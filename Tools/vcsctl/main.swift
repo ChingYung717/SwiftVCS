@@ -79,6 +79,23 @@ func die(_ message: String) -> Never {
     exit(1)
 }
 
+func printPropertyChanges(_ changes: [PropertyChange]) {
+    guard !changes.isEmpty else { return }
+    out("SVN 属性变更")
+    func value(_ data: Data?) -> String {
+        guard let data else { return "（不存在）" }
+        if !data.contains(0), let text = String(data: data, encoding: .utf8) {
+            return String(reflecting: text)
+        }
+        return "二进制（\(data.count) 字节）"
+    }
+    for change in changes {
+        out("  \(change.name)")
+        out("  − \(value(change.oldValue))")
+        out("  + \(value(change.newValue))")
+    }
+}
+
 func requireURL(_ raw: String) -> URL {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let url = URL(string: trimmed), (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
@@ -389,6 +406,7 @@ do {
         if diffs.isEmpty { out("无差异。") }
         for d in diffs {
             out("=== \(d.path)  (+\(d.addedCount) -\(d.removedCount)) ===")
+            printPropertyChanges(d.propertyChanges)
             if d.isBinary {
                 out("[二进制文件] \(d.statusNotice ?? "无法显示文本差异")")
                 continue
@@ -598,6 +616,7 @@ do {
         let diffs = try await client.diffRevision(rev, path: pathFilter)
         for d in diffs {
             out("=== \(d.path)  (+\(d.addedCount) -\(d.removedCount)) ===")
+            printPropertyChanges(d.propertyChanges)
             if d.isBinary {
                 out("[二进制文件] \(d.statusNotice ?? "无法显示文本差异")")
                 continue

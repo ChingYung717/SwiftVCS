@@ -38,3 +38,9 @@ GUI 和 CLI 通过 `RepositoryClient` 调用 libsvn。文件操作、解决冲�
 | 新建目录 | 工作副本菜单选择「新建目录…」。输入相对路径，按需开启父目录选项；先调用 `previewDirectory(workingCopy:path:parents:)`，核对待建路径后调用 `makeDirectory(workingCopy:path:parents:expectedCount:)` | 路径或父目录选项变化时须匹配预览；执行时重新检查路径。目标已存在、父目录未纳管、越界、符号链接和嵌套工作副本会拒绝。操作后刷新状态；失败后也检查工作副本状态。 |
 
 现有连接、凭据及提交入口无需适配。CLI 的本地属性路径用 `--path`，缺省为工作副本根；仓库查询传完整 URL。 `propget --raw` 的 stdout 仅含原始字节，未设置时报错；`propset --file` 可读入原始字节。
+
+## 属性差异集成
+
+沿用 `RepositoryClient.diff(workingCopy:paths:)` 和 `diffFile(revision:change:repoRootURL:maxBytes:)`。返回的 `FileDiff.propertyChanges` 默认为空数组，每项包含 `name`、`oldValue` 和 `newValue`，两个值均为 `Data?`。空数据是已设置的空值，`nil` 表示该侧不存在。
+
+工作副本写入属性后，先刷新状态，再重新读取当前差异。二进制文件和目录也需检查 `propertyChanges` 后决定是否显示占位视图。文本及属性均为空时才展示无差异。遇到属性读取失败时沿用差异加载失败或错误提示。原 BASE 被替换覆盖时，后端通过原节点的仓库修订获取其属性。
