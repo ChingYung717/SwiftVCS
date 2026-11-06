@@ -1,0 +1,42 @@
+name: macOS Build & E2E Tests
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    name: Build, E2E Test & Package (macOS arm64)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Subversion & APR via Homebrew
+        run: |
+          brew install subversion apr apr-util
+
+      - name: Build Debug targets
+        run: |
+          swift build
+
+      - name: Run 42-Assertion Offline E2E Suite
+        run: |
+          ./Tests/run_e2e.sh
+
+      - name: Package Standalone VCSExplorer.app
+        run: |
+          ./make_app.sh
+
+      - name: Verify Zero External Homebrew Dylib Paths
+        run: |
+          ! (otool -L dist/VCSExplorer.app/Contents/MacOS/VCSExplorer dist/VCSExplorer.app/Contents/Frameworks/*.dylib | grep -E "/opt/homebrew|/usr/local")
+
+      - name: Upload VCSExplorer-arm64.zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCSExplorer-arm64
+          path: dist/VCSExplorer-arm64.zip

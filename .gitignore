@@ -1,0 +1,18 @@
+# Swift Package Manager & Build Artifacts
+.build/
+.swiftpm/
+dist/
+Package.resolved
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserdata
+DerivedData/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
