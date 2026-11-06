@@ -56,3 +56,10 @@ Thank you for your interest in contributing to **SwiftVCS & VCS Explorer**!
   - Use `Text(verbatim:)` when rendering revision numbers (`r8350`) and line numbers so SwiftUI does not format integers with locale thousands separators.
 - **Testing**: All pull requests must pass `./Tests/run_e2e.sh` with 0 failures.
 - **Security**: Never commit real server URLs, credentials, or internal certificates.
+
+
+## 预发布 / Preview releases
+
+推送到 `main` 后，CI 先运行测试并验证 macOS arm64 安装包，再将此次推送的分支头发布为 `build-<完整提交 SHA>` 预发布版本。Release 提供 `VCSExplorer-arm64.zip`，以及 GitHub 根据同一标签生成的源码 ZIP 和 tar.gz。安装包采用临时签名，供测试使用。
+
+After each push to `main`, CI tests the branch tip and verifies the macOS arm64 package before publishing it as a `build-<full commit SHA>` prerelease. The release includes `VCSExplorer-arm64.zip` and GitHub's source ZIP and tar.gz for the same tag. The app is signed ad hoc for testing.

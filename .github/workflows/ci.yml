@@ -53,3 +53,39 @@ jobs:
           name: VCSExplorer-arm64
           path: dist/VCSExplorer-arm64.zip
           if-no-files-found: error
+
+  publish-preview:
+    name: Publish preview on GitHub Releases
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.sha }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Download the verified macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: VCSExplorer-arm64
+
+      - name: Publish the package for this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="build-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha')" = "$GITHUB_SHA"
+            test "$(gh release view "$tag" --json assets,isDraft --jq '(.isDraft | not) and any(.assets[]; .name == "VCSExplorer-arm64.zip")')" = true
+            exit 0
+          fi
+
+          gh release create "$tag" VCSExplorer-arm64.zip \
+            --target "$GITHUB_SHA" \
+            --title "SwiftVCS preview ${GITHUB_SHA:0:12}" \
+            --prerelease --latest=false \
+            --notes "Apple Silicon preview for commit $GITHUB_SHA. The app uses an ad hoc signature and is not notarized. GitHub provides source ZIP and tar.gz archives for the same commit."
