@@ -47,6 +47,17 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-p0-") as temp:
     svn("commit", wc, "-m", "base fixtures")
     svn("update", wc)
 
+    # GUI 启动时可能没有 locale 环境变量，C locale 也必须保留中文错误。
+    locale_env = {key: value for key, value in os.environ.items()
+                  if key not in ("LANG", "LC_ALL", "LC_CTYPE")}
+    for env in (locale_env, dict(locale_env, LC_ALL="C")):
+        failure = subprocess.run(
+            [str(vcsctl), "delete", str(wc), "."], env=env,
+            capture_output=True, encoding="utf-8", timeout=30,
+        )
+        assert failure.returncode == 1, failure
+        assert "路径包含不允许的目录" in failure.stderr and "{U+" not in failure.stderr, failure.stderr
+
     def head():
         return int(call(svn_bin / "svnlook", "youngest", repository).strip())
 
