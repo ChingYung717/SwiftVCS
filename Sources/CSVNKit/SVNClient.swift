@@ -1378,13 +1378,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         throw VCSError.invalidArgument("写入目标必须在指定工作副本内")
     }
 
-    private func validateWriteTargets(_ targets: [String], root: String) throws {
+    private func validateWriteTargets(_ targets: [String], root: String, recursiveRevert: Bool = false) throws {
         let count = try Self.nativeInteger(targets.count, field: "目标数量", minimum: 1)
         var paths: [UnsafePointer<CChar>?] = targets.map { strdup($0).map { UnsafePointer($0) } }
         defer { paths.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
         guard !paths.contains(where: { $0 == nil }) else { throw VCSError.underlying("无法分配路径") }
         let h = try requireHandle()
-        try check(csvn_validate_write_targets(h, root, &paths, count))
+        try check(csvn_validate_write_targets(h, root, &paths, count, recursiveRevert ? 1 : 0))
     }
 
     private func writeTargets(_ wc: URL, _ paths: [String], exact: Bool, committing: Bool) throws -> [String] {
@@ -1393,7 +1393,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         var targets = paths.isEmpty ? [root] : Set(try paths.map {
             try writePath($0, root: root, originalRoot: wc.standardizedFileURL.path)
         })
-        try validateWriteTargets(targets.sorted(), root: root)
+        let recursiveRevert = !committing && !exact
+        try validateWriteTargets(targets.sorted(), root: root, recursiveRevert: recursiveRevert)
         let statuses = try readStatus(root)
         if exact {
             let available = Set(statuses.map { absolute($0.path) })
@@ -1410,7 +1411,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             for item in statuses where includes(absolute(item.path)) {
                 for partner in [item.movedFrom, item.movedTo].compactMap({ $0 }) where !includes(absolute(partner)) {
                     let target = try writePath(partner, root: root, originalRoot: root)
-                    try validateWriteTargets([target], root: root)
+                    try validateWriteTargets([target], root: root, recursiveRevert: recursiveRevert)
                     targets.insert(target)
                     changed = true
                 }

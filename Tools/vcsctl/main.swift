@@ -265,6 +265,7 @@ guard let command = rawArgs.first else {
       vcsctl ignore    <工作副本> [--path 相对目录]
       vcsctl mkdir     <工作副本> <相对路径> [--parents]
       commit --exact   仅提交明确列出的路径，目录只提交自身
+      revert --exact   仅回滚明确列出的路径，目录只回滚自身
 
     通用选项:
       --user <用户名>  --password <口令>  --revision <修订号>  --limit <条数>
@@ -445,7 +446,10 @@ do {
         guard let wc = args.positional.first else { die("需要工作副本目录") }
         let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
-        let n = try await client.revert(workingCopy: URL(fileURLWithPath: wc), paths: paths)
+        let workingCopy = URL(fileURLWithPath: wc)
+        let n = try await (args.bool("exact")
+            ? client.revertSelection(workingCopy: workingCopy, paths: paths)
+            : client.revert(workingCopy: workingCopy, paths: paths))
         out("已回滚 \(n) 个路径。")
 
     case "proplist", "propget", "propset", "propdel", "ignore", "mkdir":

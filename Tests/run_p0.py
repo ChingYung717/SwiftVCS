@@ -97,12 +97,44 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-p0-") as temp:
     link.unlink()
 
     external_wc = checkout(trunk, "externals-fixture")
-    svn("propset", "svn:externals", "^/trunk/prop.txt external.txt", external_wc)
+    svn("propset", "svn:externals", "^/trunk/prop.txt external.txt", external_wc / "dir")
     svn("update", external_wc)
-    external = external_wc / "external.txt"
-    external.write_text("external edit\n")
-    vcs("revert", external_wc, "external.txt", code=1)
-    assert external.read_text() == "external edit\n"
+    external = external_wc / "dir/external.txt"
+    external.write_bytes(b"external edit\n")
+    svn("propset", "fixture:value", "external edit", external)
+    ordinary = external_wc / "copy.txt"
+    ordinary.write_bytes(b"ordinary edit\n")
+    snapshot = svn("status", external_wc)
+    for targets in (("dir/external.txt",), ("dir",), (), ("copy.txt", "dir")):
+        error = vcs("revert", external_wc, *targets, code=1)
+        assert "dir/external.txt" in error, error
+        assert ordinary.read_bytes() == b"ordinary edit\n"
+        assert external.read_bytes() == b"external edit\n"
+        assert svn("propget", "--strict", "fixture:value", external) == "external edit"
+        assert svn("status", external_wc) == snapshot
+    # 精确回滚父目录属性时不会写入子项。
+    vcs("revert", external_wc, "--exact", code=1)
+    vcs("revert", external_wc, "dir", "--exact")
+    svn("propget", "svn:externals", external_wc / "dir", code=1)
+    assert external.read_bytes() == b"external edit\n"
+    assert svn("propget", "--strict", "fixture:value", external) == "external edit"
+    # 仅含目录 external 或嵌套工作副本的父目录可以正常回滚。
+    external_wc = checkout(trunk, "nested-revert")
+    outside_dir = external_wc / "dir-external/selected.txt"
+    svn("propset", "svn:externals", "^/trunk/dir dir-external", external_wc)
+    svn("update", external_wc)
+    outside_dir.write_bytes(b"directory external edit\n")
+    svn("propset", "fixture:value", "directory external edit", outside_dir)
+    embedded = external_wc / "nested"
+    svn("checkout", trunk, embedded)
+    (embedded / "prop.txt").write_bytes(b"nested edit\n")
+    ordinary = external_wc / "copy.txt"
+    ordinary.write_bytes(b"ordinary edit\n")
+    vcs("revert", external_wc)
+    assert ordinary.read_bytes() == b"base\nsecond\n"
+    assert outside_dir.read_bytes() == b"directory external edit\n"
+    assert svn("propget", "--strict", "fixture:value", outside_dir) == "directory external edit"
+    assert (embedded / "prop.txt").read_bytes() == b"nested edit\n"
 
     initial = head()
     vcs("delete", wc, "delete.txt")
