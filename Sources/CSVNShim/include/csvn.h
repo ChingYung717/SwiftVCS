@@ -102,6 +102,23 @@ int csvn_merge_range(csvn_ctx *ctx, const char *root, const char *source, int fr
                      int to, int peg, int dry_run, csvn_merge_result *result);
 void csvn_free_merge_result(csvn_merge_result *result);
 
+typedef struct {
+    char *name;
+    char *source; /* NULL 表示直接设置 */
+    void *data;
+    size_t length;
+} csvn_property;
+
+int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
+                    const char *name, int revision, int peg, int inherited,
+                    csvn_property **output, int *count);
+void csvn_free_properties(csvn_property *items, int count);
+int csvn_set_property(csvn_ctx *ctx, const char *root, const char *relative,
+                      const char *name, const void *data, size_t length, int remove);
+int csvn_default_ignores(csvn_ctx *ctx, char ***output, int *count);
+int csvn_mkdir_working(csvn_ctx *ctx, const char *root, const char *relative,
+                       int parents, int preview, int expected_count, char ***output, int *count);
+
 /* 取最近一次失败的错误信息（线程安全地返回上下文的内部缓冲） */
 const char *csvn_last_error(csvn_ctx *ctx);
 

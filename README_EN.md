@@ -88,3 +88,19 @@ SwiftVCS is released under the **[MIT License](./LICENSE)**. See **[THIRD_PARTY_
 Enable normal entries in Changes to delete, rename, move, or copy versioned files with history. Text conflicts support current, base, incoming and local resolution. Use the working copy menu to preview and apply a same-repository single revision or forward range. Review both file changes and `svn:mergeinfo` before committing.
 
 [GUI and CLI integration](docs/FRONTEND_INTEGRATION.md)
+
+## Node properties and working-copy directories
+
+Open **Node Properties** from a versioned file or directory in Changes (enable normal items when needed). The working-copy menu offers root properties, ignore rules, and directory creation with a preview. Repository Browse offers read-only properties. Property edits and new directories stay local until you explicitly commit.
+
+```bash
+vcsctl proplist ./wc --path src --inherited
+vcsctl propget https://svn.example.org/project/trunk project:label --revision 42 --peg 42 --raw
+vcsctl propset ./wc svn:ignore '*.local' --path src
+vcsctl propset ./wc project:payload --file payload.bin --path src/example.txt
+vcsctl propdel ./wc project:payload --path src/example.txt
+vcsctl ignore ./wc --path src
+vcsctl mkdir ./wc docs/guides --parents
+```
+
+Working-copy edits support custom properties and `svn:ignore`, `svn:eol-style`, `svn:keywords`, and `svn:mime-type`. Local property paths default to the working-copy root. Omit `--parents` to require an existing versioned parent. See [GUI and CLI integration](docs/FRONTEND_INTEGRATION.md).

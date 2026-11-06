@@ -2111,3 +2111,268 @@ void csvn_free_merge_result(csvn_merge_result *result)
     csvn_free_string_array(result->conflicts, result->conflict_count);
     csvn_free_string_array(result->skipped, result->skipped_count);
 }
+
+/* ---- 节点属性与工作副本目录 ---- */
+
+static svn_error_t *inspect_node(const char **target, apr_array_header_t *missing,
+                                csvn_ctx *ctx, const char *root_path, const char *relative,
+                                apr_pool_t *pool)
+{
+    const char *root;
+    SVN_ERR(validate_root(&root, ctx, root_path, pool));
+    if (!missing && !strcmp(relative, ".")) {
+        *target = root;
+        return SVN_NO_ERROR;
+    }
+    if (svn_path_is_url(relative) || strchr(relative, '\\'))
+        return invalid_wc("需要工作副本内的相对路径");
+
+    const char *path = root;
+    const char *existing = root;
+    const char *start = relative;
+    svn_node_kind_t kind;
+    while (TRUE) {
+        const char *slash = strchr(start, '/');
+        size_t length = slash ? (size_t)(slash - start) : strlen(start);
+        const char *part = apr_pstrndup(pool, start, length);
+        if (!length || !strcmp(part, ".") || !strcmp(part, "..") || !strcasecmp(part, ".svn"))
+            return invalid_wc("路径包含不允许的目录");
+        path = svn_dirent_join(path, part, pool);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) return invalid_wc("此操作暂不支持符号链接");
+            if (slash || missing) {
+                if (!S_ISDIR(st.st_mode)) return invalid_wc("父路径不是目录");
+                if (!slash) return invalid_wc("目标目录已存在");
+            } else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+                return invalid_wc("此操作需要版本化的普通文件或目录");
+            }
+            existing = path;
+        } else {
+            if (!missing || errno != ENOENT)
+                return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法访问工作副本路径");
+            APR_ARRAY_PUSH(missing, const char *) = svn_dirent_skip_ancestor(root, path);
+        }
+        if (!slash) break;
+        start = slash + 1;
+    }
+
+    const char *actual;
+    SVN_ERR(svn_client_get_wc_root(&actual, existing, ctx->client, pool, pool));
+    if (strcmp(actual, root) != 0) return invalid_wc("路径属于其他工作副本");
+    SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, existing, FALSE, FALSE, pool));
+    if (missing ? kind != svn_node_dir : (kind != svn_node_dir && kind != svn_node_file))
+        return invalid_wc("目标或现有父目录未纳入版本控制");
+    if (missing) {
+        for (int i = 0; i < missing->nelts; ++i) {
+            const char *new_path = svn_dirent_join(root, APR_ARRAY_IDX(missing, i, const char *), pool);
+            SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, new_path, TRUE, FALSE, pool));
+            if (kind != svn_node_none && kind != svn_node_unknown)
+                return invalid_wc("目标路径已有版本控制记录");
+        }
+        SVN_ERR(validate_ordinary_file(ctx, existing, FALSE, pool));
+    }
+    *target = path;
+    return SVN_NO_ERROR;
+}
+
+typedef struct {
+    const char *name;
+    const char *source;
+    const svn_string_t *value;
+} property_row;
+
+static void collect_properties(apr_array_header_t *rows, apr_hash_t *properties,
+                               const char *source, apr_pool_t *scratch)
+{
+    if (!properties) return;
+    for (apr_hash_index_t *i = apr_hash_first(scratch, properties); i; i = apr_hash_next(i)) {
+        const void *key;
+        void *value;
+        apr_hash_this(i, &key, NULL, &value);
+        property_row *row = apr_array_push(rows);
+        row->name = apr_pstrdup(rows->pool, key);
+        row->source = apr_pstrdup(rows->pool, source);
+        row->value = svn_string_dup(value, rows->pool);
+    }
+}
+
+static svn_error_t *receive_properties(void *baton, const char *path, apr_hash_t *properties,
+                                       apr_array_header_t *inherited, apr_pool_t *scratch)
+{
+    apr_array_header_t *rows = baton;
+    collect_properties(rows, properties, NULL, scratch);
+    if (inherited) {
+        for (int i = 0; i < inherited->nelts; ++i) {
+            svn_prop_inherited_item_t *item = APR_ARRAY_IDX(inherited, i, svn_prop_inherited_item_t *);
+            collect_properties(rows, item->prop_hash, item->path_or_url, scratch);
+        }
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *export_properties(csvn_property **output, int *count, const apr_array_header_t *rows)
+{
+    if (!rows->nelts) return SVN_NO_ERROR;
+    csvn_property *items = calloc((size_t)rows->nelts, sizeof(*items));
+    if (!items) return svn_error_create(APR_ENOMEM, NULL, "无法分配属性结果");
+    for (int i = 0; i < rows->nelts; ++i) {
+        property_row row = APR_ARRAY_IDX(rows, i, property_row);
+        items[i].name = strdup(row.name);
+        items[i].source = row.source ? strdup(row.source) : NULL;
+        items[i].length = row.value->len;
+        items[i].data = row.value->len ? malloc(row.value->len) : NULL;
+        if (!items[i].name || (row.source && !items[i].source) || (row.value->len && !items[i].data)) {
+            csvn_free_properties(items, rows->nelts);
+            return svn_error_create(APR_ENOMEM, NULL, "无法复制属性值");
+        }
+        if (row.value->len) memcpy(items[i].data, row.value->data, row.value->len);
+    }
+    *output = items;
+    *count = rows->nelts;
+    return SVN_NO_ERROR;
+}
+
+void csvn_free_properties(csvn_property *items, int count)
+{
+    if (!items) return;
+    for (int i = 0; i < count; ++i) {
+        free(items[i].name);
+        free(items[i].source);
+        free(items[i].data);
+    }
+    free(items);
+}
+
+int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
+                    const char *name, int revision, int peg, int inherited,
+                    csvn_property **output, int *count)
+{
+    if (!ctx || !path_or_url || !output || !count) return -100;
+    *output = NULL;
+    *count = 0;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *target;
+    svn_error_t *err = NULL;
+    if (root)
+        err = inspect_node(&target, NULL, ctx, root, path_or_url, pool);
+    else
+        target = csvn_canon_url(path_or_url, pool);
+    if (!err && name && !svn_prop_name_is_valid(name))
+        err = invalid_wc("属性名称无效");
+
+    svn_opt_revision_t rev = revision >= 0 ? csvn_rev_number(revision) :
+        csvn_rev_kind(root ? svn_opt_revision_working : svn_opt_revision_head);
+    svn_opt_revision_t anchor = peg >= 0 ? csvn_rev_number(peg) :
+        csvn_rev_kind(root ? svn_opt_revision_working : svn_opt_revision_head);
+    apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
+    if (!err && name) {
+        apr_hash_t *values;
+        err = svn_client_propget5(&values, NULL, name, target, &anchor, &rev, NULL,
+                                  svn_depth_empty, NULL, ctx->client, pool, pool);
+        if (!err && apr_hash_count(values)) {
+            void *value;
+            apr_hash_this(apr_hash_first(pool, values), NULL, NULL, &value);
+            property_row row = {name, NULL, value};
+            APR_ARRAY_PUSH(rows, property_row) = row;
+        }
+    } else if (!err) {
+        err = svn_client_proplist4(target, &anchor, &rev, svn_depth_empty, NULL, inherited,
+                                   receive_properties, rows, ctx->client, pool);
+    }
+    if (!err) err = export_properties(output, count, rows);
+    return finish_wc_operation(ctx, err, pool);
+}
+
+static svn_boolean_t editable_property(const char *name)
+{
+    if (!svn_prop_name_is_valid(name) || svn_property_kind2(name) != svn_prop_regular_kind)
+        return FALSE;
+    if (strncmp(name, "svn:", 4)) return TRUE;
+    return !strcmp(name, SVN_PROP_IGNORE) || !strcmp(name, SVN_PROP_EOL_STYLE) ||
+           !strcmp(name, SVN_PROP_KEYWORDS) || !strcmp(name, SVN_PROP_MIME_TYPE);
+}
+
+int csvn_set_property(csvn_ctx *ctx, const char *root, const char *relative,
+                      const char *name, const void *data, size_t length, int remove)
+{
+    if (!ctx || !root || !relative || !name || (length && !data)) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *target;
+    svn_error_t *err = inspect_node(&target, NULL, ctx, root, relative, pool);
+    if (!err && !editable_property(name)) err = invalid_wc("此属性为只读或名称无效");
+    if (!err) err = validate_ordinary_file(ctx, target, FALSE, pool);
+    if (!err) {
+        apr_array_header_t *targets = apr_array_make(pool, 1, sizeof(const char *));
+        APR_ARRAY_PUSH(targets, const char *) = target;
+        const svn_string_t *value = remove ? NULL : svn_string_ncreate(data ? data : "", length, pool);
+        err = svn_client_propset_local(name, value, targets, svn_depth_empty, FALSE, NULL,
+                                       ctx->client, pool);
+    }
+    return finish_wc_operation(ctx, err, pool);
+}
+
+static svn_error_t *export_strings(char ***output, int *count, const apr_array_header_t *values)
+{
+    if (!values->nelts) return SVN_NO_ERROR;
+    char **items = calloc((size_t)values->nelts, sizeof(*items));
+    if (!items) return svn_error_create(APR_ENOMEM, NULL, "无法分配列表");
+    for (int i = 0; i < values->nelts; ++i) {
+        items[i] = strdup(APR_ARRAY_IDX(values, i, const char *));
+        if (!items[i]) {
+            csvn_free_string_array(items, values->nelts);
+            return svn_error_create(APR_ENOMEM, NULL, "无法复制列表");
+        }
+    }
+    *output = items;
+    *count = values->nelts;
+    return SVN_NO_ERROR;
+}
+
+int csvn_default_ignores(csvn_ctx *ctx, char ***output, int *count)
+{
+    if (!ctx || !output || !count) return -100;
+    *output = NULL;
+    *count = 0;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    apr_array_header_t *patterns;
+    svn_error_t *err = svn_wc_get_default_ignores(&patterns, ctx->client->config, pool);
+    if (!err) err = export_strings(output, count, patterns);
+    return finish_wc_operation(ctx, err, pool);
+}
+
+int csvn_mkdir_working(csvn_ctx *ctx, const char *root, const char *relative,
+                       int parents, int preview, int expected_count, char ***output, int *count)
+{
+    if (!ctx || !root || !relative || !output || !count) return -100;
+    *output = NULL;
+    *count = 0;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    apr_array_header_t *missing = apr_array_make(pool, 4, sizeof(const char *));
+    const char *target;
+    svn_error_t *err = inspect_node(&target, missing, ctx, root, relative, pool);
+    if (!err && !parents && missing->nelts > 1)
+        err = invalid_wc("父目录不存在，请显式允许创建父目录");
+    if (!err && expected_count >= 0 && expected_count != missing->nelts)
+        err = invalid_wc("待创建目录已改变，请重新预览");
+    if (!err) err = export_strings(output, count, missing);
+    if (!err && !preview) {
+        apr_array_header_t *targets = apr_array_make(pool, 1, sizeof(const char *));
+        APR_ARRAY_PUSH(targets, const char *) = target;
+        err = svn_client_mkdir4(targets, parents, NULL, NULL, NULL, ctx->client, pool);
+        if (err) {
+            csvn_free_string_array(*output, *count);
+            *output = NULL;
+            *count = 0;
+        }
+    }
+    return finish_wc_operation(ctx, err, pool);
+}

@@ -69,3 +69,19 @@ SwiftVCS/
 在「更改」开启「含正常项」可对已纳管文件执行删除、重命名、移动或保留历史复制。冲突文件支持四种文本处理策略。工作副本菜单中的「合并指定修订」支持同仓库的单修订和正向范围，先预演再应用。提交合并时应同时审核文件与 `svn:mergeinfo`。
 
 [界面与命令说明](docs/FRONTEND_INTEGRATION.md)
+
+## 节点属性与新建目录
+
+「更改」列表可通过右键查看版本化文件和目录的属性，正常项需开启「含正常项」。工作副本菜单提供根目录属性、忽略规则和「新建目录…」。仓库「浏览」中的属性面板为只读。设置属性、删除属性和建目录都先留在工作副本，显式提交后才影响仓库。
+
+```bash
+vcsctl proplist ./wc --path src --inherited
+vcsctl propget https://svn.example.org/project/trunk project:label --revision 42 --peg 42 --raw
+vcsctl propset ./wc svn:ignore '*.local' --path src
+vcsctl propset ./wc project:payload --file payload.bin --path src/example.txt
+vcsctl propdel ./wc project:payload --path src/example.txt
+vcsctl ignore ./wc --path src
+vcsctl mkdir ./wc docs/guides --parents
+```
+
+本地属性写入支持自定义属性及 `svn:ignore`、`svn:eol-style`、`svn:keywords`、`svn:mime-type`。本地属性路径用 `--path`，默认工作副本根。省略 `--parents` 时父目录必须已存在并纳入版本控制。参见[界面集成说明](docs/FRONTEND_INTEGRATION.md)。

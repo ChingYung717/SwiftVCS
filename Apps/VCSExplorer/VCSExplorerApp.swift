@@ -79,6 +79,7 @@ final class AppModel: ObservableObject {
         didSet {
             if oldValue != workingCopyPath {
                 workspaceOperation = nil
+                propertyInspection = nil
                 mergeResult = nil
                 mergeError = nil
                 updateConflicts = []
@@ -106,6 +107,15 @@ final class AppModel: ObservableObject {
 
     @Published var workspaceOperation: WorkspaceOperation?
     @Published var operationDestination = ""
+    @Published var mkdirParents = false
+    @Published var mkdirPreview: DirectoryPreview?
+    @Published var propertyInspection: PropertyInspection?
+    @Published var nodeProperties: [NodeProperty] = []
+    @Published var nodeIgnoreRules: IgnoreRules?
+    @Published var propertyFeedback: String?
+    @Published var propertyName = ""
+    @Published var propertyValue = ""
+    @Published var pendingPropertyDeletion: String?
     @Published var mergeSource = ""
     @Published var mergeRange = ""
     @Published var mergePeg = ""
@@ -887,6 +897,7 @@ final class AppModel: ObservableObject {
         password = ""
         pendingProbedCertificate = nil
         repoInfo = nil
+        propertyInspection = nil
         entries = []
         logs = []
         currentPath = ""
@@ -1491,9 +1502,119 @@ final class AppModel: ObservableObject {
     }
 }
 
+struct PropertyInspection: Identifiable {
+    let id = UUID()
+    let target: PropertyTarget
+    let isDirectory: Bool
+
+    var isWorkingCopy: Bool {
+        if case .workingCopy = target { return true }
+        return false
+    }
+}
+
+struct DirectoryPreview {
+    let path: String
+    let parents: Bool
+    let newPaths: [String]
+}
+
+extension AppModel {
+    func inspectWorkingProperties(path: String, isDirectory: Bool) {
+        guard !workingCopyPath.isEmpty, !isBusy else { return }
+        inspectProperties(PropertyInspection(
+            target: .workingCopy(root: URL(fileURLWithPath: workingCopyPath), path: path),
+            isDirectory: isDirectory))
+    }
+
+    func inspectRepositoryProperties(_ entry: RepositoryEntry) {
+        guard let base = repoInfo?.url, !isBusy else { return }
+        let url = entry.path.split(separator: "/").reduce(base) { $0.appendingPathComponent(String($1)) }
+        inspectProperties(PropertyInspection(target: .repository(url), isDirectory: entry.kind == .directory))
+    }
+
+    private func inspectProperties(_ inspection: PropertyInspection) {
+        nodeProperties = []
+        nodeIgnoreRules = nil
+        propertyFeedback = nil
+        propertyName = ""
+        propertyValue = ""
+        pendingPropertyDeletion = nil
+        propertyInspection = inspection
+        run { try await self.loadProperties(inspection) }
+    }
+
+    private func loadProperties(_ inspection: PropertyInspection) async throws {
+        let client: any RepositoryClient
+        switch inspection.target {
+        case .workingCopy: client = try clientForWorkingCopy()
+        case .repository: client = try ensureClient()
+        }
+        let rows = try await client.properties(at: inspection.target, revision: nil, peg: nil, inherited: true)
+        guard propertyInspection?.id == inspection.id else { return }
+        nodeProperties = rows
+        if case .workingCopy(let root, let path) = inspection.target, inspection.isDirectory {
+            let rules = try await client.ignoreRules(workingCopy: root, directory: path)
+            guard propertyInspection?.id == inspection.id else { return }
+            nodeIgnoreRules = rules
+        }
+    }
+
+    func changeProperty(_ inspection: PropertyInspection, name: String, text: String?) {
+        guard propertyInspection?.id == inspection.id,
+              case .workingCopy(let root, let path) = inspection.target,
+              root == URL(fileURLWithPath: workingCopyPath) else { return }
+        if text != nil, nodeProperties.contains(where: { $0.source == nil && $0.name == name && $0.textValue == nil }) {
+            errorText = "二进制属性请通过命令行编辑"
+            return
+        }
+        runWorkspaceWrite {
+            guard self.propertyInspection?.id == inspection.id,
+                  root == URL(fileURLWithPath: self.workingCopyPath) else { return }
+            self.propertyFeedback = nil
+            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            try await client.setProperty(name, value: text.map { Data($0.utf8) }, workingCopy: root, path: path)
+            guard self.propertyInspection?.id == inspection.id else { return }
+            let feedback = "属性已\(text == nil ? "删除" : "设置")，待提交"
+            self.propertyFeedback = feedback
+            self.statusText = feedback
+            await self.refreshAfterWrite(path: self.workingCopyPath)
+            do {
+                try await self.loadProperties(inspection)
+            } catch {
+                self.nodeProperties = []
+                self.nodeIgnoreRules = nil
+                throw VCSError.underlying("属性已修改，重新读取失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    var matchingDirectoryPreview: DirectoryPreview? {
+        guard let preview = mkdirPreview, preview.path == operationDestination,
+              preview.parents == mkdirParents else { return nil }
+        return preview
+    }
+
+    func previewMkdir(_ operation: WorkspaceOperation) {
+        guard case .mkdir = operation.kind, workspaceOperation?.id == operation.id,
+              operation.root == workingCopyPath, !isBusy else { return }
+        let path = operationDestination
+        let parents = mkdirParents
+        mkdirPreview = nil
+        run {
+            guard self.workspaceOperation?.id == operation.id else { return }
+            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            let paths = try await client.previewDirectory(
+                workingCopy: URL(fileURLWithPath: operation.root), path: path, parents: parents)
+            guard self.workspaceOperation?.id == operation.id else { return }
+            self.mkdirPreview = DirectoryPreview(path: path, parents: parents, newPaths: paths)
+        }
+    }
+}
+
 struct WorkspaceOperation: Identifiable {
     enum Kind {
-        case delete, rename, move, copy, resolve(ConflictResolution), merge
+        case delete, rename, move, copy, resolve(ConflictResolution), merge, mkdir
 
         var title: String {
             switch self {
@@ -1503,12 +1624,13 @@ struct WorkspaceOperation: Identifiable {
             case .copy: return "保留历史复制"
             case .resolve(let strategy): return strategy.displayName
             case .merge: return "合并指定修订"
+            case .mkdir: return "新建目录"
             }
         }
 
         var needsDestination: Bool {
             switch self {
-            case .rename, .move, .copy: return true
+            case .rename, .move, .copy, .mkdir: return true
             default: return false
             }
         }
@@ -1524,6 +1646,8 @@ extension AppModel {
     func requestWorkspaceOperation(_ kind: WorkspaceOperation.Kind, path: String = "") {
         guard !workingCopyPath.isEmpty, !isBusy else { return }
         operationDestination = ""
+        mkdirParents = false
+        mkdirPreview = nil
         mergeResult = nil
         mergeError = nil
         workspaceOperation = WorkspaceOperation(kind: kind, root: workingCopyPath, path: path)
@@ -1531,8 +1655,9 @@ extension AppModel {
 
     func executeWorkspaceOperation(_ operation: WorkspaceOperation) {
         let input = operationDestination
+        let directory = matchingDirectoryPreview
         runWorkspaceWrite {
-            guard operation.root == self.workingCopyPath else { return }
+            guard operation.root == self.workingCopyPath, self.workspaceOperation?.id == operation.id else { return }
             let client: any RepositoryClient = try self.clientForWorkingCopy()
             let wc = URL(fileURLWithPath: operation.root)
             do {
@@ -1555,6 +1680,11 @@ extension AppModel {
                     _ = try await client.move(workingCopy: wc, source: operation.path, destination: destination)
                 case .resolve(let strategy):
                     try await client.resolve(workingCopy: wc, path: operation.path, strategy: strategy)
+                case .mkdir:
+                    guard let directory else { return }
+                    self.mkdirPreview = nil
+                    _ = try await client.makeDirectory(workingCopy: wc, path: directory.path,
+                                                       parents: directory.parents, expectedCount: directory.newPaths.count)
                 case .merge:
                     return
                 }

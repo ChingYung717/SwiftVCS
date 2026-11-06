@@ -338,6 +338,16 @@ struct RepoToolbar: View {
                     model.showWorkspacePopover = false
                     model.update()
                 }
+                PopoverActionRow(icon: "list.bullet.rectangle", title: "根目录属性与忽略规则…") {
+                    model.showWorkspacePopover = false
+                    model.inspectWorkingProperties(path: ".", isDirectory: true)
+                }
+                .disabled(model.isBusy)
+                PopoverActionRow(icon: "folder.badge.plus", title: "新建目录…") {
+                    model.showWorkspacePopover = false
+                    model.requestWorkspaceOperation(.mkdir)
+                }
+                .disabled(model.isBusy)
                 PopoverActionRow(icon: "arrow.triangle.merge", title: "合并指定修订…") {
                     model.showWorkspacePopover = false
                     model.requestWorkspaceOperation(.merge)

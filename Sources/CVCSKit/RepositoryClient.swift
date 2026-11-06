@@ -57,6 +57,13 @@ public protocol RepositoryClient: AnyObject, Sendable {
     func resolve(workingCopy: URL, path: String, strategy: ConflictResolution) async throws
     func merge(workingCopy: URL, request: MergeRequest, dryRun: Bool) async throws -> MergeResult
 
+    func properties(at target: PropertyTarget, revision: Int?, peg: Int?, inherited: Bool) async throws -> [NodeProperty]
+    func property(_ name: String, at target: PropertyTarget, revision: Int?, peg: Int?) async throws -> Data?
+    func setProperty(_ name: String, value: Data?, workingCopy: URL, path: String) async throws
+    func ignoreRules(workingCopy: URL, directory: String) async throws -> IgnoreRules
+    func previewDirectory(workingCopy: URL, path: String, parents: Bool) async throws -> [String]
+    func makeDirectory(workingCopy: URL, path: String, parents: Bool, expectedCount: Int?) async throws -> [String]
+
     // MARK: 差异
 
     /// 计算工作副本相对基线版本的差异。
@@ -99,6 +106,32 @@ public protocol RepositoryClient: AnyObject, Sendable {
 }
 
 public extension RepositoryClient {
+    func properties(at target: PropertyTarget, revision: Int? = nil, peg: Int? = nil,
+                    inherited: Bool = false) async throws -> [NodeProperty] {
+        throw VCSError.notSupported("读取节点属性")
+    }
+
+    func property(_ name: String, at target: PropertyTarget, revision: Int? = nil,
+                  peg: Int? = nil) async throws -> Data? {
+        throw VCSError.notSupported("读取节点属性")
+    }
+
+    func setProperty(_ name: String, value: Data?, workingCopy: URL, path: String) async throws {
+        throw VCSError.notSupported("编辑节点属性")
+    }
+
+    func ignoreRules(workingCopy: URL, directory: String) async throws -> IgnoreRules {
+        throw VCSError.notSupported("读取忽略规则")
+    }
+
+    func previewDirectory(workingCopy: URL, path: String, parents: Bool) async throws -> [String] {
+        throw VCSError.notSupported("预览新建目录")
+    }
+
+    func makeDirectory(workingCopy: URL, path: String, parents: Bool, expectedCount: Int? = nil) async throws -> [String] {
+        throw VCSError.notSupported("新建工作副本目录")
+    }
+
     func add(workingCopy: URL, paths: [String]) async throws -> Int {
         throw VCSError.notSupported("纳入版本控制")
     }

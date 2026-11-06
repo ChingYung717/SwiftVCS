@@ -27,3 +27,14 @@ GUI 和 CLI 通过 `RepositoryClient` 调用 libsvn。文件操作、解决冲�
 操作完成但刷新失败时，界面会提示重新读取状态。已有快捷键继续适用。
 
 「更改」列表会显示本地工作副本已记录的 SVN 锁持有者。正常文件可开启「含正常项」查看。列表沿用本地状态读取。
+
+## 节点属性、忽略规则与建目录
+
+| 界面操作 | 参数和调用顺序 | 结果与界面处理 |
+|---|---|---|
+| 查看节点属性 | 在「更改」对版本化文件或目录点右键；查看正常项前先开启「含正常项」。工作副本菜单可查看根目录。在「浏览」对仓库文件或目录点右键。先确定 `PropertyTarget.workingCopy(root:path:)` 或 `.repository(URL)`，再调用 `properties(at:revision:peg:inherited:)` | 默认分别读取工作副本当前值和仓库 HEAD。行标识含目标、来源和名称；区分直接声明和继承声明，二进制值显示字节数。仓库和继承行只读。历史修订和 peg 由 SDK、CLI 提供。 |
+| 设置或删除 | 在本地面板输入名称与文本，或从属性行编辑；删除需要确认。调用 `setProperty(_:value:workingCopy:path:)`，UTF-8 文本转为 `Data`，空文本转为空数据，删除传 `nil` | 保存后刷新工作副本状态和属性列表，显示待提交。二进制值用 CLI 编辑；未纳管路径、越界、只读属性和不符合 SVN 类型规则的值会报错。写入成功但刷新失败时保留成功提示并显示刷新错误。 |
+| 查看忽略规则 | 本地目录属性面板调用 `ignoreRules(workingCopy:directory:)`；可直接编辑当前目录的 `svn:ignore` | 分开显示配置默认模式、目录直接声明的 `svn:ignore` 和各来源的 `svn:global-ignores`。父目录的 `svn:ignore` 不应用到后代目录。 |
+| 新建目录 | 工作副本菜单选择「新建目录…」。输入相对路径，按需开启父目录选项；先调用 `previewDirectory(workingCopy:path:parents:)`，核对待建路径后调用 `makeDirectory(workingCopy:path:parents:expectedCount:)` | 路径或父目录选项变化时须匹配预览；执行时重新检查路径。目标已存在、父目录未纳管、越界、符号链接和嵌套工作副本会拒绝。操作后刷新状态；失败后也检查工作副本状态。 |
+
+现有连接、凭据及提交入口无需适配。CLI 的本地属性路径用 `--path`，缺省为工作副本根；仓库查询传完整 URL。 `propget --raw` 的 stdout 仅含原始字节，未设置时报错；`propset --file` 可读入原始字节。
