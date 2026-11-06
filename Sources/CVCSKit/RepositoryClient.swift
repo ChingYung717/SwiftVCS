@@ -49,6 +49,14 @@ public protocol RepositoryClient: AnyObject, Sendable {
     @discardableResult
     func revert(workingCopy: URL, paths: [String]) async throws -> Int
 
+    func add(workingCopy: URL, paths: [String]) async throws -> Int
+    func cat(path: String, revision: Int?) async throws -> Data
+    func delete(workingCopy: URL, paths: [String]) async throws -> [String]
+    func move(workingCopy: URL, source: String, destination: String) async throws -> [String]
+    func copy(workingCopy: URL, source: String, destination: String) async throws -> [String]
+    func resolve(workingCopy: URL, path: String, strategy: ConflictResolution) async throws
+    func merge(workingCopy: URL, request: MergeRequest, dryRun: Bool) async throws -> MergeResult
+
     // MARK: 差异
 
     /// 计算工作副本相对基线版本的差异。
@@ -91,6 +99,34 @@ public protocol RepositoryClient: AnyObject, Sendable {
 }
 
 public extension RepositoryClient {
+    func add(workingCopy: URL, paths: [String]) async throws -> Int {
+        throw VCSError.notSupported("纳入版本控制")
+    }
+
+    func cat(path: String, revision: Int?) async throws -> Data {
+        throw VCSError.notSupported("读取仓库文件")
+    }
+
+    func delete(workingCopy: URL, paths: [String]) async throws -> [String] {
+        throw VCSError.notSupported("删除工作副本文件")
+    }
+
+    func move(workingCopy: URL, source: String, destination: String) async throws -> [String] {
+        throw VCSError.notSupported("移动工作副本文件")
+    }
+
+    func copy(workingCopy: URL, source: String, destination: String) async throws -> [String] {
+        throw VCSError.notSupported("复制工作副本文件")
+    }
+
+    func resolve(workingCopy: URL, path: String, strategy: ConflictResolution) async throws {
+        throw VCSError.notSupported("解决冲突")
+    }
+
+    func merge(workingCopy: URL, request: MergeRequest, dryRun: Bool) async throws -> MergeResult {
+        throw VCSError.notSupported("合并修订")
+    }
+
     func diffFile(
         revision: Int,
         change: ChangedPath,

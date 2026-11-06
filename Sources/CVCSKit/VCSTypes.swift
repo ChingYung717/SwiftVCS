@@ -20,6 +20,8 @@ public enum VCSError: Error, LocalizedError, Sendable {
     case server(code: Int, message: String)
     /// 参数非法
     case invalidArgument(String)
+    case notSupported(String)
+    case mergeInterrupted(String)
     /// 其他
     case underlying(String)
 
@@ -41,6 +43,10 @@ public enum VCSError: Error, LocalizedError, Sendable {
             return "服务端错误 [\(code)]：\(message)"
         case .invalidArgument(let detail):
             return "参数错误：\(detail)"
+        case .notSupported(let detail):
+            return "不支持：\(detail)"
+        case .mergeInterrupted(let detail):
+            return "合并中止，工作副本可能已有改动：\(detail)"
         case .underlying(let detail):
             return detail
         }
@@ -144,6 +150,75 @@ public struct RepositoryEntry: Sendable, Hashable, Identifiable {
 
 // MARK: - Working copy status
 
+public enum ConflictKind: String, CaseIterable, Sendable, Hashable {
+    case text, property, tree, binary, unknown
+
+    public var displayName: String {
+        switch self {
+        case .text: return "文本"
+        case .property: return "属性"
+        case .tree: return "树"
+        case .binary: return "二进制"
+        case .unknown: return "未知"
+        }
+    }
+}
+
+public enum ConflictResolution: String, CaseIterable, Sendable, Hashable {
+    case current, base, incoming, local
+
+    public var displayName: String {
+        switch self {
+        case .current: return "采用工作文件当前内容"
+        case .base: return "采用冲突基线"
+        case .incoming: return "采用传入版本"
+        case .local: return "采用冲突前本地版本"
+        }
+    }
+}
+
+public struct MergeRequest: Sendable, Equatable {
+    public let source: URL
+    public let from: Int32
+    public let to: Int32
+    public let peg: Int32
+
+    public init(source: URL, from: Int, to: Int, peg: Int? = nil) throws {
+        guard let start = Int32(exactly: from), let end = Int32(exactly: to),
+              let anchor = Int32(exactly: peg ?? to), start >= 0, end > start, anchor > 0 else {
+            throw VCSError.invalidArgument("合并需要有效的正向修订范围和 peg 修订")
+        }
+        self.source = source
+        self.from = start
+        self.to = end
+        self.peg = anchor
+    }
+
+    public init(source: URL, revision: Int, peg: Int? = nil) throws {
+        guard revision > 0 else { throw VCSError.invalidArgument("合并修订必须大于零") }
+        try self.init(source: source, from: revision - 1, to: revision, peg: peg)
+    }
+}
+
+public struct MergeResult: Sendable, Equatable {
+    public let request: MergeRequest
+    public let dryRun: Bool
+    public let changedPaths: [String]
+    public let conflictedPaths: [String]
+    public let skippedPaths: [String]
+    public let refreshRequired: Bool
+
+    public init(request: MergeRequest, dryRun: Bool, changedPaths: [String],
+                conflictedPaths: [String], skippedPaths: [String], refreshRequired: Bool = false) {
+        self.request = request
+        self.dryRun = dryRun
+        self.changedPaths = changedPaths
+        self.conflictedPaths = conflictedPaths
+        self.skippedPaths = skippedPaths
+        self.refreshRequired = refreshRequired
+    }
+}
+
 /// 工作副本中一个路径的状态
 public struct WorkingCopyStatus: Sendable, Hashable, Identifiable {
     public enum Kind: Sendable, Hashable {
@@ -199,6 +274,12 @@ public struct WorkingCopyStatus: Sendable, Hashable, Identifiable {
     public let isDirectory: Bool
     /// 本地修改的锁（若被锁定）
     public let lockOwner: String?
+    public let movedFrom: String?
+    public let movedTo: String?
+    public let conflictKinds: Set<ConflictKind>
+    public let resolutions: Set<ConflictResolution>
+    public let mergeInfoChanged: Bool
+    public let movedDestinationModified: Bool
 
     public init(
         id: String,
@@ -208,7 +289,13 @@ public struct WorkingCopyStatus: Sendable, Hashable, Identifiable {
         baseRevision: Int,
         workingRevision: Int? = nil,
         isDirectory: Bool = false,
-        lockOwner: String? = nil
+        lockOwner: String? = nil,
+        movedFrom: String? = nil,
+        movedTo: String? = nil,
+        conflictKinds: Set<ConflictKind> = [],
+        resolutions: Set<ConflictResolution> = [],
+        mergeInfoChanged: Bool = false,
+        movedDestinationModified: Bool = false
     ) {
         self.id = id
         self.path = path
@@ -218,6 +305,12 @@ public struct WorkingCopyStatus: Sendable, Hashable, Identifiable {
         self.workingRevision = workingRevision
         self.isDirectory = isDirectory
         self.lockOwner = lockOwner
+        self.movedFrom = movedFrom
+        self.movedTo = movedTo
+        self.conflictKinds = conflictKinds
+        self.resolutions = resolutions
+        self.mergeInfoChanged = mergeInfoChanged
+        self.movedDestinationModified = movedDestinationModified
     }
 }
 

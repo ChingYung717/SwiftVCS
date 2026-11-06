@@ -38,6 +38,12 @@ typedef struct {
     int working_revision; /* -1 = 无 */
     int is_directory;
     char lock_owner[256];
+    char moved_from[1024];
+    char moved_to[1024];
+    unsigned int conflict_kinds; /* 文本、属性、树、二进制、未知 */
+    int mergeinfo_changed;
+    int moved_destination_modified;
+    unsigned int resolutions;    /* current、base、incoming、local */
 } csvn_status_item;
 
 /* ---- 日志条目 ---- */
@@ -75,6 +81,26 @@ csvn_ctx *csvn_context_create(const char *username,
 const char *csvn_auth_realm(csvn_ctx *ctx);
 
 void csvn_context_destroy(csvn_ctx *ctx);
+
+/* 工作副本操作：所有路径必须相对 root，目标须在同一工作副本内。 */
+int csvn_delete_files(csvn_ctx *ctx, const char *root, const char *const *paths, int count);
+int csvn_move_file(csvn_ctx *ctx, const char *root, const char *source, const char *destination);
+int csvn_copy_file(csvn_ctx *ctx, const char *root, const char *source, const char *destination);
+int csvn_resolve_text(csvn_ctx *ctx, const char *root, const char *path, int strategy);
+
+typedef struct {
+    char **changed;
+    int changed_count;
+    char **conflicts;
+    int conflict_count;
+    char **skipped;
+    int skipped_count;
+    int started;
+} csvn_merge_result;
+
+int csvn_merge_range(csvn_ctx *ctx, const char *root, const char *source, int from,
+                     int to, int peg, int dry_run, csvn_merge_result *result);
+void csvn_free_merge_result(csvn_merge_result *result);
 
 /* 取最近一次失败的错误信息（线程安全地返回上下文的内部缓冲） */
 const char *csvn_last_error(csvn_ctx *ctx);
@@ -159,13 +185,14 @@ int csvn_commit(csvn_ctx *ctx,
                 const char *const *targets,
                 int target_count,
                 const char *message,
+                int exact,
                 int *out_revision,
                 int *out_committed_count);
 
 /* 8. 回滚 */
 int csvn_revert(csvn_ctx *ctx,
                 const char *const *paths,
-                int path_count);
+                int path_count, int exact);
 
 /* 9. 日志。out_entries 由 csvn_free_log 释放 */
 int csvn_log(csvn_ctx *ctx,
@@ -199,6 +226,8 @@ static inline const char *csvn_entry_name_p(const csvn_entry *e) { return e->nam
 static inline const char *csvn_entry_author_p(const csvn_entry *e) { return e->author; }
 static inline const char *csvn_status_path_p(const csvn_status_item *s) { return s->path; }
 static inline const char *csvn_status_name_p(const csvn_status_item *s) { return s->name; }
+static inline const char *csvn_status_moved_from_p(const csvn_status_item *s) { return s->moved_from; }
+static inline const char *csvn_status_moved_to_p(const csvn_status_item *s) { return s->moved_to; }
 static inline const char *csvn_status_lock_p(const csvn_status_item *s) { return s->lock_owner; }
 static inline const char *csvn_log_author_p(const csvn_log_entry *e) { return e->author; }
 

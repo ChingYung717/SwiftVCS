@@ -82,3 +82,9 @@ swift run SwiftVCSChecks
 ## 4. License
 
 SwiftVCS is released under the **[MIT License](./LICENSE)**. See **[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)** for licenses of bundled third-party libraries (Apache Subversion, APR, Serf, OpenSSL, LZ4, utf8proc).
+
+## Working copy collaboration
+
+Enable normal entries in Changes to delete, rename, move, or copy versioned files with history. Text conflicts support current, base, incoming and local resolution. Use the working copy menu to preview and apply a same-repository single revision or forward range. Review both file changes and `svn:mergeinfo` before committing.
+
+[GUI and CLI integration](docs/FRONTEND_INTEGRATION.md)

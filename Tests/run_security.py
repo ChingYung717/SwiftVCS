@@ -5,6 +5,7 @@ import http.server
 import os
 from pathlib import Path
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -25,9 +26,14 @@ def endpoint(cert=None, key=None):
         def log_message(self, *_args):
             pass
 
-        def do_OPTIONS(self):
+        def __getattr__(self, name):
+            if name.startswith("do_"):
+                return self.reply
+            raise AttributeError(name)
+
+        def reply(self):
             authorized = self.headers.get("Authorization") == basic
-            hits.append(authorized)
+            hits.append((self.command, authorized))
             self.send_response(403 if authorized else 401)
             if not authorized:
                 self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
@@ -76,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
     legacy.write_text(f'{{"localhost|{user}":"{password}"}}')
     with endpoint() as (url, hits):
         result = run(env, url, "--user", user)
-        assert result.returncode != 0 and hits == [False], (result.stderr, hits)
+        assert result.returncode != 0 and hits == [("OPTIONS", False)], (result.stderr, hits)
 
     pins = config / "pinned-certs"
     with endpoint(cert, key) as (url, hits):
@@ -89,12 +95,29 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
 
         result = run(env, url, "--fetch-cert", "localhost", "--fingerprint", fingerprint,
                      "--user", user, "--password", password, "--remember")
-        assert result.returncode != 0 and any(hits), (result.stderr, hits)
+        assert result.returncode != 0 and any(authorized for _, authorized in hits), (result.stderr, hits)
         assert "已存入" not in result.stdout
         assert len(list(pins.glob("*.crt"))) == 1
 
         with endpoint(cert, key) as (other_url, other_hits):
             result = run(env, other_url, "--user", user, "--password", password)
             assert result.returncode != 0 and not other_hits, (result.stderr, other_hits)
+
+    # A merge into a file:// working copy must reject an HTTP source before issuing requests.
+    admin = shutil.which("svnadmin")
+    svn = shutil.which("svn")
+    assert admin and svn, "svnadmin and svn are required for the isolated merge test"
+    repository = root / "repository"
+    working = root / "working"
+    subprocess.run([admin, "create", str(repository)], env=env, check=True, capture_output=True)
+    subprocess.run([svn, "checkout", repository.as_uri(), str(working)],
+                   env=env, check=True, capture_output=True)
+    with endpoint() as (url, hits):
+        result = subprocess.run(
+            [binary, "merge", str(working), "--source", url, "--revision", "1", "--dry-run"],
+            env=env, capture_output=True, text=True, timeout=25,
+        )
+        assert result.returncode == 1 and not hits, (result.stderr, hits)
+        assert "同一 SVN 端点" in result.stderr
 
 print("Loopback security checks passed")

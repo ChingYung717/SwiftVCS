@@ -48,6 +48,9 @@ struct RootView: View {
             ConnectSheet()
                 .environmentObject(model)
         }
+        .sheet(item: $model.workspaceOperation) { operation in
+            WorkspaceOperationSheet(operation: operation).environmentObject(model)
+        }
         .background {
             // 全局快捷键绑定（仅保留带 ⌘ 修饰的标准快捷键，避免拦截输入框方向键或与系统冲突）
             Group {

@@ -59,3 +59,9 @@ SwiftVCS/
 ## 4. 开源协议
 
 本项目代码基于 **[MIT License](./LICENSE)** 开源；打包内置的第三方动态库（Apache Subversion、APR、Serf、OpenSSL 等）许可证声明详见 **[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)**。
+
+## 工作副本协作
+
+在「更改」开启「含正常项」可对已纳管文件执行删除、重命名、移动或保留历史复制。冲突文件支持四种文本处理策略。工作副本菜单中的「合并指定修订」支持同仓库的单修订和正向范围，先预演再应用。提交合并时应同时审核文件与 `svn:mergeinfo`。
+
+[界面与命令说明](docs/FRONTEND_INTEGRATION.md)

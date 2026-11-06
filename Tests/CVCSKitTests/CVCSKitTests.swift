@@ -9,7 +9,8 @@ struct CVCSKitTests {
         testParseMultiFileDiffDoesNotBleedHeadersIntoPreviousHunk()
         testWorkingCopyStatusPendingFlag()
         testKeychainScopeIncludesProtocolPortAndRepository()
-        print("4 unit tests passed")
+        testMergeRevisionRange()
+        print("5 unit tests passed")
     }
 
     private static func expect(_ condition: Bool, file: StaticString = #fileID, line: UInt = #line) {
@@ -97,5 +98,17 @@ struct CVCSKitTests {
         expect(KeychainStore.service(for: otherRepository) != scope)
         expect(KeychainStore.service(for: insecure) == nil)
         expect(KeychainStore.service(for: embedded) == nil)
+    }
+
+    private static func testMergeRevisionRange() {
+        let source = require(URL(string: "https://example.invalid/repo/branches/feature"))
+        let single = require(try? MergeRequest(source: source, revision: 1))
+        expect(single.from == 0 && single.to == 1 && single.peg == 1)
+        let range = require(try? MergeRequest(source: source, from: 2, to: 7, peg: 10))
+        expect(range.from == 2 && range.to == 7 && range.peg == 10)
+        expect((try? MergeRequest(source: source, revision: Int.min)) == nil)
+        expect((try? MergeRequest(source: source, revision: Int(Int32.max) + 1)) == nil)
+        expect((try? MergeRequest(source: source, from: 7, to: 2)) == nil)
+        expect((try? MergeRequest(source: source, from: 2, to: 7, peg: 0)) == nil)
     }
 }

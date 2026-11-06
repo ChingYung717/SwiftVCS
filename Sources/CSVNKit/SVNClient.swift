@@ -131,6 +131,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
     }
 
+    // 跨实例串行化进程内工作副本写操作，libsvn 继续负责磁盘工作副本锁。
+    private static let workingCopyWriteLock = NSLock()
+
+    private func performWrite<T>(_ body: @escaping () throws -> T) async throws -> T {
+        try await perform { try Self.workingCopyWriteLock.withLock(body) }
+    }
+
     /// 把 shim 的返回码翻译成统一的 VCSError。
     private func check(_ rc: Int32) throws {
         guard rc != 0 else { return }
@@ -389,7 +396,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     @discardableResult
     public func checkout(path: String?, to destination: URL, revision: Int?) async throws -> URL {
         let target = try url(for: path)
-        return try await perform {
+        return try await performWrite {
             let h = try self.requireHandle()
             var rev: Int32 = 0
             let dest = destination.path
@@ -410,7 +417,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         revision: Int?,
         progress: (@Sendable (VCSTaskProgress) -> Void)?
     ) async throws -> UpdateResult {
-        try await perform {
+        try await performWrite {
             let h = try self.requireHandle()
             let wc = workingCopy.path
             var rev: Int32 = 0
@@ -444,59 +451,46 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     // MARK: 5. 状态
 
     public func status(of workingCopy: URL) async throws -> [WorkingCopyStatus] {
-        try await perform {
-            let h = try self.requireHandle()
-            let wcPath = workingCopy.standardizedFileURL.path
-            var items: UnsafeMutablePointer<csvn_status_item>? = nil
-            var count: Int32 = 0
+        try await perform { try self.readStatus(workingCopy.standardizedFileURL.resolvingSymlinksInPath().path) }
+    }
 
-            let rc = wcPath.withCString { p in
-                csvn_status(h, p, &items, &count)
+    private func readStatus(_ root: String) throws -> [WorkingCopyStatus] {
+        let h = try requireHandle()
+        var items: UnsafeMutablePointer<csvn_status_item>?
+        var count: Int32 = 0
+        try check(root.withCString { csvn_status(h, $0, &items, &count) })
+        defer { csvn_free_status(items, count) }
+        guard let items else { return [] }
+
+        func relative(_ path: String) -> String? {
+            if path == root { return "." }
+            guard path.hasPrefix(root + "/") else { return nil }
+            return String(path.dropFirst(root.count + 1))
+        }
+        return (0..<Int(count)).compactMap { i in
+            var s = items[i]
+            let path = String(cString: csvn_status_path_p(&s))
+            guard let rel = relative(path) else { return nil }
+            let kind = Self.mapStatusKind(s.kind)
+            if rel == "." && kind == .normal { return nil }
+            let lockOwner = String(cString: csvn_status_lock_p(&s))
+            let conflictKinds = ConflictKind.allCases.enumerated().compactMap { index, kind in
+                s.conflict_kinds & (1 << index) != 0 ? kind : nil
             }
-            try self.check(rc)
-            defer { csvn_free_status(items, count) }
-            guard let items else { return [] }
-
-            var result: [WorkingCopyStatus] = []
-            result.reserveCapacity(Int(count))
-            for i in 0..<Int(count) {
-                var s = items.advanced(by: i).pointee
-                let path = String(cString: csvn_status_path_p(&s))
-                let name = String(cString: csvn_status_name_p(&s))
-                let lockOwner = String(cString: csvn_status_lock_p(&s))
-                let kind = Self.mapStatusKind(s.kind)
-
-                // 相对工作副本根的路径
-                var rel = path
-                if path == wcPath {
-                    rel = "."
-                } else if path.hasPrefix(wcPath + "/") {
-                    rel = String(path.dropFirst(wcPath.count + 1))
-                } else if path.hasPrefix(workingCopy.path) {
-                    rel = String(path.dropFirst(workingCopy.path.count))
-                    if rel.hasPrefix("/") { rel.removeFirst() }
-                    if rel.isEmpty { rel = "." }
-                }
-
-                // 若是工作副本根目录自身且无改动，则不冗余展示 "."
-                if rel == "." && kind == .normal {
-                    continue
-                }
-
-                result.append(
-                    WorkingCopyStatus(
-                        id: rel,
-                        path: rel,
-                        name: rel == "." ? "." : name,
-                        kind: kind,
-                        baseRevision: Int(s.base_revision),
-                        workingRevision: s.working_revision >= 0 ? Int(s.working_revision) : nil,
-                        isDirectory: s.is_directory != 0,
-                        lockOwner: lockOwner.isEmpty ? nil : lockOwner
-                    )
-                )
+            let resolutions = ConflictResolution.allCases.enumerated().compactMap { index, strategy in
+                s.resolutions & (1 << index) != 0 ? strategy : nil
             }
-            return result
+            return WorkingCopyStatus(
+                id: rel, path: rel, name: rel == "." ? "." : String(cString: csvn_status_name_p(&s)),
+                kind: kind, baseRevision: Int(s.base_revision),
+                workingRevision: s.working_revision >= 0 ? Int(s.working_revision) : nil,
+                isDirectory: s.is_directory != 0, lockOwner: lockOwner.isEmpty ? nil : lockOwner,
+                movedFrom: relative(String(cString: csvn_status_moved_from_p(&s))),
+                movedTo: relative(String(cString: csvn_status_moved_to_p(&s))),
+                conflictKinds: Set(conflictKinds), resolutions: Set(resolutions),
+                mergeInfoChanged: s.mergeinfo_changed != 0,
+                movedDestinationModified: s.moved_destination_modified != 0
+            )
         }
     }
 
@@ -1237,9 +1231,19 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         message: String,
         progress: (@Sendable (VCSTaskProgress) -> Void)?
     ) async throws -> CommitResult {
-        try await perform {
+        try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: false)
+    }
+
+    /// 提交已逐项审核的路径。目录项仅提交自身属性，子路径须明确列出。
+    public func commitSelection(workingCopy: URL, paths: [String], message: String) async throws -> CommitResult {
+        guard !paths.isEmpty else { throw VCSError.invalidArgument("请选择要提交的路径") }
+        return try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: true)
+    }
+
+    private func commitPaths(workingCopy: URL, paths: [String], message: String, exact: Bool) async throws -> CommitResult {
+        try await performWrite {
             let h = try self.requireHandle()
-            let targets = paths.isEmpty ? [workingCopy.path] : paths.map { self.localPath(workingCopy, $0) }
+            let targets = try self.writeTargets(workingCopy, paths, exact: exact, committing: true)
 
             var cStrings: [UnsafeMutablePointer<CChar>] = []
             defer { for s in cStrings { free(s) } }
@@ -1250,7 +1254,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let rc = cStrings.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) { p in
                     message.withCString { m in
-                        csvn_commit(h, p, Int32(buf.count), m, &rev, &committed)
+                        csvn_commit(h, p, Int32(buf.count), m, exact ? 1 : 0, &rev, &committed)
                     }
                 }
             }
@@ -1263,20 +1267,187 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     @discardableResult
     public func revert(workingCopy: URL, paths: [String]) async throws -> Int {
-        try await perform {
+        try await revertPaths(workingCopy: workingCopy, paths: paths, exact: false)
+    }
+
+    public func revertSelection(workingCopy: URL, paths: [String]) async throws -> Int {
+        guard !paths.isEmpty else { throw VCSError.invalidArgument("请选择要放弃的路径") }
+        return try await revertPaths(workingCopy: workingCopy, paths: paths, exact: true)
+    }
+
+    private func revertPaths(workingCopy: URL, paths: [String], exact: Bool) async throws -> Int {
+        try await performWrite {
             let h = try self.requireHandle()
-            let targets = paths.isEmpty ? [workingCopy.path] : paths.map { self.localPath(workingCopy, $0) }
+            let targets = try self.writeTargets(workingCopy, paths, exact: exact, committing: false)
             var cStrings: [UnsafeMutablePointer<CChar>] = []
             defer { for s in cStrings { free(s) } }
             cStrings = targets.map { strdup($0) }
 
             let rc = cStrings.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) { p in
-                    csvn_revert(h, p, Int32(buf.count))
+                    csvn_revert(h, p, Int32(buf.count), exact ? 1 : 0)
                 }
             }
             try self.check(rc)
             return targets.count
+        }
+    }
+
+    private func writeTargets(_ wc: URL, _ paths: [String], exact: Bool, committing: Bool) throws -> [String] {
+        let root = wc.standardizedFileURL.resolvingSymlinksInPath()
+        if paths.isEmpty && committing { return [root.path] }
+        if exact {
+            for path in paths {
+                try validateCString(path)
+                guard path == "." || (!path.isEmpty && !path.hasPrefix("/") &&
+                      !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: {
+                          $0.isEmpty || $0 == ".." || $0 == "." || $0.lowercased() == ".svn"
+                      })) else {
+                    throw VCSError.invalidArgument("精确操作需要工作副本内的相对路径")
+                }
+            }
+        }
+        var targets = paths.isEmpty ? [root.path] : Set(paths.map {
+            URL(fileURLWithPath: self.localPath(root, $0)).standardizedFileURL.path
+        })
+        let statuses = try readStatus(root.path)
+        if exact {
+            let available = Set(statuses.map(\.path))
+            guard paths.allSatisfy({ available.contains($0) }) else {
+                throw VCSError.invalidArgument("所选路径状态已改变，请刷新工作副本")
+            }
+        }
+        func absolute(_ relative: String) -> String { localPath(root, relative) }
+        func includes(_ path: String) -> Bool {
+            targets.contains(path) || (!exact && targets.contains { path.hasPrefix($0 + "/") })
+        }
+        var changed = true
+        while changed {
+            changed = false
+            for item in statuses where includes(absolute(item.path)) {
+                for partner in [item.movedFrom, item.movedTo].compactMap({ $0 }) where !includes(absolute(partner)) {
+                    targets.insert(absolute(partner))
+                    changed = true
+                }
+            }
+        }
+        if committing {
+            let conflicts = statuses.filter { $0.kind == .conflicted && includes(absolute($0.path)) }
+            if !conflicts.isEmpty { throw VCSError.conflictsPresent(conflicts.map(\.path)) }
+            if statuses.contains(where: \.mergeInfoChanged),
+               statuses.contains(where: { $0.kind.isPendingChange && !includes(absolute($0.path)) }) {
+                throw VCSError.invalidArgument("检测到合并记录变更，请审核并一并提交所有待提交的版本化路径")
+            }
+        }
+        if !committing, statuses.contains(where: {
+            $0.movedFrom != nil && includes(absolute($0.path)) && ($0.movedDestinationModified || $0.isDirectory)
+        }) {
+            throw VCSError.invalidArgument("移动目标含本地改动或是目录，请先备份后再处理，防止丢失数据")
+        }
+        return targets.sorted()
+    }
+
+    // MARK: - P0 工作副本文件操作
+
+    private func writeRoot(_ url: URL) throws -> String {
+        guard url.isFileURL else { throw VCSError.invalidArgument("需要本地 SVN 工作副本") }
+        return url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private func validateCString(_ value: String) throws {
+        guard !value.utf8.contains(0) else { throw VCSError.invalidArgument("路径包含空字符") }
+    }
+
+    public func delete(workingCopy: URL, paths: [String]) async throws -> [String] {
+        let root = try writeRoot(workingCopy)
+        let paths = Array(Set(paths)).sorted()
+        guard !paths.isEmpty, let count = Int32(exactly: paths.count) else {
+            throw VCSError.invalidArgument("请指定要删除的文件")
+        }
+        for path in paths { try validateCString(path) }
+        return try await performWrite {
+            let h = try self.requireHandle()
+            var strings: [UnsafePointer<CChar>?] = paths.map { strdup($0).map { UnsafePointer($0) } }
+            defer { strings.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
+            guard !strings.contains(where: { $0 == nil }) else {
+                throw VCSError.underlying("无法分配路径")
+            }
+            try self.check(csvn_delete_files(h, root, &strings, count))
+            return paths
+        }
+    }
+
+    public func move(workingCopy: URL, source: String, destination: String) async throws -> [String] {
+        try await transfer(workingCopy, source, destination, copying: false)
+    }
+
+    public func copy(workingCopy: URL, source: String, destination: String) async throws -> [String] {
+        try await transfer(workingCopy, source, destination, copying: true)
+    }
+
+    private func transfer(_ wc: URL, _ source: String, _ destination: String, copying: Bool) async throws -> [String] {
+        let root = try writeRoot(wc)
+        try validateCString(source)
+        try validateCString(destination)
+        return try await performWrite {
+            let h = try self.requireHandle()
+            let rc = copying ? csvn_copy_file(h, root, source, destination)
+                             : csvn_move_file(h, root, source, destination)
+            try self.check(rc)
+            return copying ? [destination] : [source, destination]
+        }
+    }
+
+    public func resolve(workingCopy: URL, path: String, strategy: ConflictResolution) async throws {
+        let root = try writeRoot(workingCopy)
+        try validateCString(path)
+        guard let option = ConflictResolution.allCases.firstIndex(of: strategy) else {
+            throw VCSError.invalidArgument("未知冲突策略")
+        }
+        try await performWrite {
+            let h = try self.requireHandle()
+            try self.check(csvn_resolve_text(h, root, path, Int32(option)))
+        }
+    }
+
+    public func merge(workingCopy: URL, request: MergeRequest, dryRun: Bool) async throws -> MergeResult {
+        let root = try writeRoot(workingCopy)
+        let source = request.source
+        guard source.user == nil, source.password == nil, source.query == nil, source.fragment == nil else {
+            throw VCSError.invalidArgument("合并源需为无附加凭据或参数的仓库 URL")
+        }
+        return try await performWrite {
+            guard let targetURL = Self.workingCopyURL(at: URL(fileURLWithPath: root)),
+                  (source.isFileURL && targetURL.isFileURL) ||
+                    (SVNOrigin(source) != nil && SVNOrigin(source) == SVNOrigin(targetURL)) else {
+                throw VCSError.invalidArgument("合并源必须与目标使用同一 SVN 端点")
+            }
+            let h = try self.requireHandle()
+            var raw = csvn_merge_result()
+            defer { csvn_free_merge_result(&raw) }
+            let rc = csvn_merge_range(h, root, source.absoluteString, request.from,
+                                      request.to, request.peg, dryRun ? 1 : 0, &raw)
+            do {
+                try self.check(rc)
+            } catch {
+                if !dryRun && raw.started != 0 { throw VCSError.mergeInterrupted(error.localizedDescription) }
+                throw error
+            }
+            func paths(_ items: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?, _ count: Int32) -> [String] {
+                guard let items else { return [] }
+                return (0..<Int(count)).compactMap { items[$0].map { String(cString: $0) } }.sorted()
+            }
+            let changed = paths(raw.changed, raw.changed_count)
+            let conflicts = paths(raw.conflicts, raw.conflict_count)
+            let skipped = paths(raw.skipped, raw.skipped_count)
+            if !dryRun, let actual = try? self.readStatus(root) {
+                return MergeResult(request: request, dryRun: false,
+                                   changedPaths: actual.filter { $0.kind.isPendingChange }.map(\.path).sorted(),
+                                   conflictedPaths: actual.filter { $0.kind == .conflicted }.map(\.path).sorted(),
+                                   skippedPaths: skipped)
+            }
+            return MergeResult(request: request, dryRun: dryRun, changedPaths: changed,
+                               conflictedPaths: conflicts, skippedPaths: skipped, refreshRequired: !dryRun)
         }
     }
 
@@ -1387,7 +1558,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     /// 将未版本控制的文件或目录纳入版本控制（`svn add`）。
     @discardableResult
     public func add(workingCopy: URL, paths: [String]) async throws -> Int {
-        try await perform {
+        try await performWrite {
             let h = try self.requireHandle()
             let targets = paths.isEmpty ? [workingCopy.path] : paths.map { self.localPath(workingCopy, $0) }
             var cStrings: [UnsafeMutablePointer<CChar>] = []

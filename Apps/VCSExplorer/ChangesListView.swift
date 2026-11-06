@@ -13,7 +13,7 @@ struct ChangesListView: View {
         VStack(spacing: 0) {
             // 顶部全选与状态过滤栏
             HStack(spacing: 8) {
-                if !model.workingCopyPath.isEmpty && !displayedStatuses.isEmpty {
+                if !model.workingCopyPath.isEmpty && !model.committableWorkingStatuses.isEmpty {
                     Toggle("", isOn: Binding(
                         get: { model.areAllChangesChecked },
                         set: { model.setAllChangesChecked($0) }
@@ -23,7 +23,7 @@ struct ChangesListView: View {
                     .help("全选 / 取消全选待提交文件")
                 }
 
-                Text(verbatim: "\(displayedStatuses.count) 个变更文件")
+                Text(verbatim: model.showAllStatuses ? "\(displayedStatuses.count) 个条目" : "\(displayedStatuses.count) 个变更项")
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.secondary)
 
@@ -51,6 +51,13 @@ struct ChangesListView: View {
             Divider()
 
             // 中间变更文件列表
+            if !model.updateConflicts.isEmpty {
+                Text(verbatim: "有 \(model.updateConflicts.count) 处冲突待处理")
+                    .font(.caption)
+                    .foregroundStyle(Theme.statusColor(.conflicted))
+                    .padding(.vertical, 4)
+            }
+
             if model.workingCopyPath.isEmpty {
                 EmptyStateView(
                     imageName: "no-changes",
@@ -143,7 +150,8 @@ struct ChangesListView: View {
                 model.pendingRevertStatus = nil
             }
         } message: { item in
-            Text(verbatim: "文件「\(item.path)」的本地修改将被还原到工作副本 BASE 版本，此操作不可撤销。")
+            let paths = model.pairedPaths(for: item.path).sorted().joined(separator: "、")
+            Text(verbatim: "将放弃所列路径的版本化改动：\(paths)。目录项只处理自身。若移动目标含本地改动，会拒绝操作以保护文件内容。")
         }
     }
 
@@ -235,6 +243,17 @@ private struct WorkingChangeRowView: View {
         return String(status.path[status.path.startIndex..<idx])
     }
 
+    private var rowDetail: String {
+        if status.kind == .conflicted {
+            let names = status.conflictKinds.map(\.displayName).sorted().joined(separator: "、")
+            return names.isEmpty ? "冲突" : "\(names)冲突"
+        }
+        if status.mergeInfoChanged { return "svn:mergeinfo" }
+        if let path = status.movedTo { return "→ \(path)" }
+        if let path = status.movedFrom { return "← \(path)" }
+        return ""
+    }
+
     var body: some View {
         let icon = FileIcon.symbol(for: status.path, isDirectory: status.isDirectory)
         let isCommittable = status.kind != .normal && status.kind != .ignored
@@ -267,6 +286,14 @@ private struct WorkingChangeRowView: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
+                        if !rowDetail.isEmpty {
+                            Text(verbatim: rowDetail)
+                                .font(.caption2)
+                                .foregroundStyle(isSelected ? .white : Theme.statusColor(status.kind))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(rowDetail)
+                        }
                     }
 
                     Spacer(minLength: 4)
@@ -285,6 +312,25 @@ private struct WorkingChangeRowView: View {
                 : AnyShapeStyle(Color.clear)
         )
         .contextMenu {
+            if status.kind == .conflicted {
+                ConflictActions(status: status)
+            }
+            if !status.isDirectory && [.normal, .modified, .added, .replaced].contains(status.kind) {
+                if status.kind == .normal {
+                    Button("标记删除…", role: .destructive) {
+                        model.requestWorkspaceOperation(.delete, path: status.path)
+                    }
+                    .disabled(model.isBusy)
+                    .help("删除本地文件，仓库在提交后更新")
+                }
+                Button("重命名…") { model.requestWorkspaceOperation(.rename, path: status.path) }
+                    .disabled(model.isBusy).help("同目录改名")
+                Button("移动…") { model.requestWorkspaceOperation(.move, path: status.path) }
+                    .disabled(model.isBusy).help("移动到工作副本内的目标")
+                Button("保留历史复制…") { model.requestWorkspaceOperation(.copy, path: status.path) }
+                    .disabled(model.isBusy).help("复制到工作副本内的目标并保留来源历史")
+            }
+
             if status.kind.isPendingChange {
                 Button("查看差异") {
                     model.selectWorkingStatus(status)

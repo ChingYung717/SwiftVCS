@@ -75,7 +75,17 @@ final class AppModel: ObservableObject {
     @Published var isPreviewLoading = false
 
     // MARK: 工作副本（Changes）
-    @Published var workingCopyPath = ""
+    @Published var workingCopyPath = "" {
+        didSet {
+            if oldValue != workingCopyPath {
+                workspaceOperation = nil
+                mergeResult = nil
+                mergeError = nil
+                updateConflicts = []
+                pendingRevertStatus = nil
+            }
+        }
+    }
     @Published var statuses: [WorkingCopyStatus] = []
     @Published var selectedStatus: WorkingCopyStatus?
     @Published var showAllStatuses = false
@@ -93,6 +103,15 @@ final class AppModel: ObservableObject {
     @Published var customLogPath: String? = nil
     @Published var hasMoreLogs = false
     @Published var isLoadingMoreLogs = false
+
+    @Published var workspaceOperation: WorkspaceOperation?
+    @Published var operationDestination = ""
+    @Published var mergeSource = ""
+    @Published var mergeRange = ""
+    @Published var mergePeg = ""
+    @Published var mergeResult: MergeResult?
+    @Published var mergeError: String?
+    @Published var updateConflicts: [String] = []
 
     // MARK: 证书与状态提示
     @Published var rememberPassword = false
@@ -182,15 +201,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func pairedPaths(for path: String) -> Set<String> {
+        var paths: Set<String> = [path]
+        var pending = [path]
+        while let next = pending.popLast(), let row = statuses.first(where: { $0.path == next }) {
+            for partner in [row.movedFrom, row.movedTo].compactMap({ $0 }) where paths.insert(partner).inserted {
+                pending.append(partner)
+            }
+        }
+        return paths
+    }
+
     func bindingForCheckedPath(_ path: String) -> Binding<Bool> {
         Binding(
             get: { self.checkedPaths.contains(path) },
             set: { isOn in
-                if isOn {
-                    self.checkedPaths.insert(path)
-                } else {
-                    self.checkedPaths.remove(path)
-                }
+                let paths = self.pairedPaths(for: path)
+                if isOn { self.checkedPaths.formUnion(paths) }
+                else { self.checkedPaths.subtract(paths) }
             }
         )
     }
@@ -404,8 +432,11 @@ final class AppModel: ObservableObject {
         let c = try ensureClient()
         let oldCommittablePaths = Set(statuses.filter { $0.kind != .normal && $0.kind != .ignored }.map(\.path))
         let previousChecked = checkedPaths
-        let newStatuses = try await c.status(of: URL(fileURLWithPath: workingCopyPath))
+        let path = workingCopyPath
+        let newStatuses = try await c.status(of: URL(fileURLWithPath: path))
+        guard workingCopyPath == path else { return }
         statuses = newStatuses
+        updateConflicts = newStatuses.filter { $0.kind == .conflicted }.map(\.path).sorted()
         lastRefresh = Date()
 
         let newCommittablePaths = Set(newStatuses.filter { $0.kind != .normal && $0.kind != .ignored }.map(\.path))
@@ -418,8 +449,8 @@ final class AppModel: ObservableObject {
             checkedPaths = newCommittablePaths
         }
 
-        if let sel = selectedStatus, newStatuses.contains(where: { $0.path == sel.path }) {
-            // 保持原选中
+        if let sel = selectedStatus, let refreshed = newStatuses.first(where: { $0.path == sel.path }) {
+            if sel != refreshed { selectWorkingStatus(refreshed) }
         } else if let firstChanged = newStatuses.first(where: { $0.kind != .normal && $0.kind != .ignored }) {
             selectWorkingStatus(firstChanged)
         } else {
@@ -431,12 +462,19 @@ final class AppModel: ObservableObject {
 
     func updateCore() async throws -> UpdateResult {
         let c = try clientForWorkingCopy()
+        let path = workingCopyPath
         let r = try await c.update(
-            workingCopy: URL(fileURLWithPath: workingCopyPath),
+            workingCopy: URL(fileURLWithPath: path),
             revision: nil,
             progress: nil
         )
-        try await refreshStatusCore()
+        guard workingCopyPath == path else { return r }
+        await refreshAfterWrite(path: path)
+        if !r.conflicts.isEmpty {
+            updateConflicts = Array(Set(updateConflicts).union(r.conflicts.map {
+                $0.hasPrefix(path + "/") ? String($0.dropFirst(path.count + 1)) : $0
+            })).sorted()
+        }
         return r
     }
 
@@ -496,35 +534,45 @@ final class AppModel: ObservableObject {
 
     func commitCore(message: String, specificPaths: [String]? = nil) async throws -> CommitResult {
         let c = try clientForWorkingCopy()
+        let path = workingCopyPath
         let paths = specificPaths ?? committableWorkingStatuses.map(\.path)
-        let r = try await c.commit(
-            workingCopy: URL(fileURLWithPath: workingCopyPath),
-            paths: paths,
-            message: message,
-            progress: nil
-        )
-        commitSummary = ""
-        commitDescription = ""
-        try await refreshStatusCore()
+        let r: CommitResult
+        do {
+            r = try await c.commitSelection(workingCopy: URL(fileURLWithPath: path), paths: paths, message: message)
+        } catch {
+            if workingCopyPath == path { try? await refreshStatusCore() }
+            throw error
+        }
+        if workingCopyPath == path {
+            commitSummary = ""
+            commitDescription = ""
+            await refreshAfterWrite(path: path)
+        }
         return r
     }
 
     func revertCore(_ item: WorkingCopyStatus) async throws {
-        let c = try ensureClient()
-        _ = try await c.revert(
-            workingCopy: URL(fileURLWithPath: workingCopyPath),
-            paths: [item.path]
-        )
-        try await refreshStatusCore()
+        let c = try clientForWorkingCopy()
+        let path = workingCopyPath
+        _ = try await c.revertSelection(workingCopy: URL(fileURLWithPath: path),
+                                        paths: pairedPaths(for: item.path).sorted())
+        await refreshAfterWrite(path: path)
     }
 
     func addCore(_ item: WorkingCopyStatus) async throws {
-        let c = try ensureClient()
-        _ = try await c.add(
-            workingCopy: URL(fileURLWithPath: workingCopyPath),
-            paths: [item.path]
-        )
-        try await refreshStatusCore()
+        let c = try clientForWorkingCopy()
+        let path = workingCopyPath
+        _ = try await c.add(workingCopy: URL(fileURLWithPath: path), paths: [item.path])
+        await refreshAfterWrite(path: path)
+    }
+
+    private func refreshAfterWrite(path: String) async {
+        guard workingCopyPath == path else { return }
+        do {
+            try await refreshStatusCore()
+        } catch {
+            errorText = "操作已完成，刷新失败：\(error.localizedDescription)"
+        }
     }
 
     func previewFileCore(_ entry: RepositoryEntry) async throws {
@@ -1193,9 +1241,15 @@ final class AppModel: ObservableObject {
     }
 
     func update() {
-        run {
+        let path = workingCopyPath
+        runWorkspaceWrite {
             let r = try await self.updateCore()
+            guard self.workingCopyPath == path else { return }
             self.statusText = "已同步到 r\(r.revision)（更新 \(r.updatedCount)，新增 \(r.addedCount)，删除 \(r.deletedCount)）"
+            if !self.updateConflicts.isEmpty {
+                self.statusText += "，\(self.updateConflicts.count) 处冲突待处理"
+                self.sidebarTab = .changes
+            }
         }
     }
 
@@ -1270,18 +1324,36 @@ final class AppModel: ObservableObject {
             return
         }
 
-        run {
+        if selectedItems.contains(where: { $0.kind == .unversioned && $0.isDirectory }) {
+            errorText = "请先将所选目录纳入版本控制，然后审核并选择目录中的文件"
+            return
+        }
+        let conflicts = selectedItems.filter { $0.kind == .conflicted }.map(\.path)
+        guard conflicts.isEmpty else {
+            errorText = VCSError.conflictsPresent(conflicts).localizedDescription
+            return
+        }
+        if statuses.contains(where: \.mergeInfoChanged),
+           statuses.contains(where: { $0.kind.isPendingChange && !checkedPaths.contains($0.path) }) {
+            errorText = "检测到合并记录变更，请审核并一并勾选所有待提交的版本化路径"
+            return
+        }
+        let workspace = workingCopyPath
+        runWorkspaceWrite {
+            guard self.workingCopyPath == workspace else { return }
             // 若勾选了未纳入版本控制的文件，先自动执行 svn add
             let unversionedPaths = selectedItems.filter { $0.kind == .unversioned }.map(\.path)
             if !unversionedPaths.isEmpty {
-                let c = try self.ensureClient()
+                let c = try self.clientForWorkingCopy()
                 _ = try await c.add(
                     workingCopy: URL(fileURLWithPath: self.workingCopyPath),
                     paths: unversionedPaths
                 )
             }
+            guard self.workingCopyPath == workspace else { return }
             let targetPaths = selectedItems.map(\.path)
             let r = try await self.commitCore(message: fullMessage, specificPaths: targetPaths)
+            guard self.workingCopyPath == workspace else { return }
             _ = try? await self.logCore(customPath: self.customLogPath)
             self.statusText = r.revision > 0
                 ? "已提交 r\(r.revision)（共 \(r.committedCount) 项）"
@@ -1290,20 +1362,26 @@ final class AppModel: ObservableObject {
     }
 
     func revert(_ item: WorkingCopyStatus) {
-        run {
+        let path = workingCopyPath
+        runWorkspaceWrite {
             try await self.revertCore(item)
-            self.statusText = "已回滚 \(item.path)"
+            if self.workingCopyPath == path { self.statusText = "已回滚 \(item.path)" }
         }
     }
 
     func add(_ item: WorkingCopyStatus) {
-        run {
+        runWorkspaceWrite {
             try await self.addCore(item)
             self.statusText = "已纳入版本控制 \(item.path)"
         }
     }
 
     // MARK: - 通用执行器
+
+    private func runWorkspaceWrite(_ body: @escaping () async throws -> Void) {
+        guard !isBusy, !workingCopyPath.isEmpty else { return }
+        run(body)
+    }
 
     private func run(_ body: @escaping () async throws -> Void) {
         busyCount += 1
@@ -1421,5 +1499,138 @@ final class AppModel: ObservableObject {
         }
 
         return lines
+    }
+}
+
+struct WorkspaceOperation: Identifiable {
+    enum Kind {
+        case delete, rename, move, copy, resolve(ConflictResolution), merge
+
+        var title: String {
+            switch self {
+            case .delete: return "标记删除"
+            case .rename: return "重命名"
+            case .move: return "移动"
+            case .copy: return "保留历史复制"
+            case .resolve(let strategy): return strategy.displayName
+            case .merge: return "合并指定修订"
+            }
+        }
+
+        var needsDestination: Bool {
+            switch self {
+            case .rename, .move, .copy: return true
+            default: return false
+            }
+        }
+    }
+
+    let id = UUID()
+    let kind: Kind
+    let root: String
+    let path: String
+}
+
+extension AppModel {
+    func requestWorkspaceOperation(_ kind: WorkspaceOperation.Kind, path: String = "") {
+        guard !workingCopyPath.isEmpty, !isBusy else { return }
+        operationDestination = ""
+        mergeResult = nil
+        mergeError = nil
+        workspaceOperation = WorkspaceOperation(kind: kind, root: workingCopyPath, path: path)
+    }
+
+    func executeWorkspaceOperation(_ operation: WorkspaceOperation) {
+        let input = operationDestination
+        runWorkspaceWrite {
+            guard operation.root == self.workingCopyPath else { return }
+            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            let wc = URL(fileURLWithPath: operation.root)
+            do {
+                switch operation.kind {
+                case .delete:
+                    _ = try await client.delete(workingCopy: wc, paths: [operation.path])
+                case .copy:
+                    _ = try await client.copy(workingCopy: wc, source: operation.path, destination: input)
+                case .move, .rename:
+                    let destination: String
+                    if case .rename = operation.kind {
+                        guard !input.contains("/"), !input.contains("\\") else {
+                            throw VCSError.invalidArgument("改名只接受新文件名")
+                        }
+                        let parent = operation.path.split(separator: "/").dropLast().map(String.init)
+                        destination = (parent + [input]).joined(separator: "/")
+                    } else {
+                        destination = input
+                    }
+                    _ = try await client.move(workingCopy: wc, source: operation.path, destination: destination)
+                case .resolve(let strategy):
+                    try await client.resolve(workingCopy: wc, path: operation.path, strategy: strategy)
+                case .merge:
+                    return
+                }
+            } catch {
+                if self.workingCopyPath == operation.root { try? await self.refreshStatusCore() }
+                throw error
+            }
+            guard self.workingCopyPath == operation.root else { return }
+            self.workspaceOperation = nil
+            self.statusText = "\(operation.kind.title)完成，仓库尚未提交"
+            await self.refreshAfterWrite(path: operation.root)
+        }
+    }
+
+    var requestedMerge: MergeRequest? {
+        guard let url = URL(string: mergeSource.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme != nil else { return nil }
+        let input = mergeRange.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pegText = mergePeg.trimmingCharacters(in: .whitespacesAndNewlines)
+        let peg = Int(pegText)
+        if !pegText.isEmpty && peg == nil { return nil }
+        if let revision = Int(input) {
+            return try? MergeRequest(source: url, revision: revision, peg: peg)
+        }
+        let bounds = input.split(separator: ":", omittingEmptySubsequences: false)
+        guard bounds.count == 2, let from = Int(bounds[0]), let to = Int(bounds[1]) else { return nil }
+        return try? MergeRequest(source: url, from: from, to: to, peg: peg)
+    }
+
+    func executeMerge(_ operation: WorkspaceOperation, dryRun: Bool) {
+        guard let request = requestedMerge, operation.root == workingCopyPath else { return }
+        if !dryRun {
+            guard let preview = mergeResult, preview.dryRun, preview.request == request else { return }
+        }
+        runWorkspaceWrite {
+            guard operation.root == self.workingCopyPath else { return }
+            self.mergeError = nil
+            self.mergeResult = nil
+            do {
+                let client: any RepositoryClient = try self.clientForWorkingCopy()
+                let result = try await client.merge(workingCopy: URL(fileURLWithPath: operation.root),
+                                                    request: request, dryRun: dryRun)
+                guard self.workingCopyPath == operation.root else { return }
+                self.mergeResult = result
+                if !dryRun {
+                    self.sidebarTab = .changes
+                    self.statusText = result.changedPaths.isEmpty && result.conflictedPaths.isEmpty &&
+                        result.skippedPaths.isEmpty && !result.refreshRequired
+                        ? "没有可合并的变更" : "合并已应用到工作副本，尚未提交"
+                    await self.refreshAfterWrite(path: operation.root)
+                }
+            } catch {
+                guard self.workingCopyPath == operation.root else { return }
+                self.mergeError = error.localizedDescription
+                if case VCSError.mergeInterrupted = error {
+                    self.sidebarTab = .changes
+                    try? await self.refreshStatusCore()
+                }
+            }
+        }
+    }
+
+    func openConflictFile(_ status: WorkingCopyStatus) {
+        guard !status.resolutions.isEmpty else { return }
+        let url = URL(fileURLWithPath: workingCopyPath).appendingPathComponent(status.path)
+        if !NSWorkspace.shared.open(url) { errorText = "无法打开工作文件" }
     }
 }
