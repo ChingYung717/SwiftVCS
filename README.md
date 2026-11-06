@@ -46,7 +46,7 @@
      - 二进制文件（`.jar`、`.png`、`.pdf` 等）：毫秒级识别并展示二进制信息卡片，绝不阻塞 UI，且在工作副本混合改动时按 `Index:` 分段解码，不会因二进制 `NUL` 字节截断后续文本文件差异。
 
 4. **企业内网自签名 HTTPS 证书两步核验 (`Two-Step TLS Fingerprint Verification`)**
-   - 针对使用内部私有 CA 或自签名证书的企业 SVN 服务器，提供「抓取并核验服务器证书 → 展示证书主体（Subject）与 `SHA-256` 指纹 → 用户确认无误后写入本地合并 CA 包」的两步安全信任流，避免盲目信任（Blind TOFU）。
+   - 针对使用内部私有 CA 或自签名证书的企业 SVN 服务器，提供「抓取并核验服务器证书 → 展示证书主体（Subject）与 `SHA-256` 指纹 → 用户确认无误后仅对该 HTTPS 主机和端口信任叶证书」的两步安全信任流，避免盲目信任（Blind TOFU）。
 
 ### 系统架构图
 
@@ -68,12 +68,13 @@
 ### 快速开始与构建打包
 
 #### 1. 环境要求
-- **操作系统**：macOS 14.0 (Sonoma) 或更高版本（自动识别 Apple Silicon `/opt/homebrew` 与 Intel `/usr/local`）
+- **操作系统**：macOS 14.0 (Sonoma) 或更高版本（预编译包的最低版本取决于实际打包的动态库）
 - **开发工具**：Xcode Command Line Tools（Swift 5.9+）
 - **构建依赖**：通过 Homebrew 安装 `subversion` 与 `apr`（仅编译时需要；打包后的 `VCSExplorer.app` 已将全部依赖 `.dylib` 内置到 `Contents/Frameworks/`，目标机器无需安装 Homebrew）：
 
 ```bash
-brew install subversion apr apr-util
+brew install subversion apr apr-util pkgconf
+source scripts/svn_build_env.sh
 ```
 
 #### 2. 编译与运行测试
@@ -81,8 +82,9 @@ brew install subversion apr apr-util
 ```bash
 # Debug 构建全部模块 (CVCSKit, CSVNKit, vcsctl, VCSExplorer)
 swift build
+swift run SwiftVCSChecks
 
-# 运行 42 项完全离线的本地端到端测试套件（自动创建临时 file:// 仓库完成全链路验证）
+# 运行 本地离线端到端测试套件（自动创建临时 file:// 仓库完成全链路验证）
 ./Tests/run_e2e.sh
 ```
 
@@ -95,19 +97,22 @@ swift build
 执行 `./make_app.sh` 会自动：
 1. 以 Release 模式编译 `VCSExplorer`；
 2. 递归扫描并将 `libsvn_*`、`libapr*`、`libserf`、`libssl`、`libcrypto` 等 22 个非系统动态库拷入 `dist/VCSExplorer.app/Contents/Frameworks/`；
-3. 使用 `install_name_tool` 将所有动态库加载路径重写为 `@rpath/<name>.dylib`，并用 `vtool` 统一对齐 `LC_BUILD_VERSION`（`minos 14.0`）；
+3. 将内置动态库加载路径重写为 `@rpath/<name>.dylib`，保留原始部署版本，并附带实际版本的许可证、NOTICE 和 gettext 源码；
 4. 生成应用图标 `AppIcon.icns`、拷入空状态插画资源、执行 ad-hoc 代码签名与校验，最终输出：
    - `dist/VCSExplorer.app`
-   - `dist/VCSExplorer-arm64.zip`（可直接上传至 GitHub Releases 分发）
+   - `dist/VCSExplorer-<架构>.zip`
+
+默认产物使用 ad-hoc 签名，供本地测试。正式分发时用 `SWIFTVCS_SIGN_IDENTITY` 指定 Developer ID Application 身份，用 `SWIFTVCS_NOTARY_PROFILE` 指定已配置的公证凭据。
 
 ### 命令行工具 `vcsctl` 速查
 
 ```bash
-# 连接并查看仓库信息（--remember 可将凭据以 0600 权限存入 ~/.config/vcs-explorer/credentials.json）
+# HTTPS 口令认证成功后可用 --remember 保存至 macOS 钥匙串
 vcsctl info https://svn.example.com/repo --user alice --password '***' --remember
 
-# 抓取并导入企业自签名 HTTPS 证书（自动打印 SHA-256 指纹）
+# 先查看指纹，再用管理员通过独立渠道提供的指纹确认
 vcsctl info https://svn.example.com/repo --fetch-cert svn.example.com
+vcsctl info https://svn.example.com/repo --fetch-cert svn.example.com --fingerprint '<经核验的 SHA-256 指纹>'
 
 # 浏览远端目录与读取文件内容
 vcsctl ls   https://svn.example.com/repo trunk/src
@@ -139,7 +144,7 @@ vcsctl log      /path/to/wc --limit 50
 1. **Five-Layer Native Architecture**
    - **`CVCSKit`**: VCS-agnostic Swift domain models and the async `RepositoryClient` protocol (`RepositoryInfo`, `RepositoryEntry`, `WorkingCopyStatus`, `LogEntry`, `ChangedPath`, `FileDiff`, `SplitDiffRow`).
    - **`CSVNShim`**: C11 bridge (`csvn.h` / `csvn.c`) wrapping `libsvn` with APR subpools, streaming output caps (`max_bytes`), and thread-local error propagation.
-   - **`CSVNKit`**: Concurrency-safe `SVNClient`, multi-encoding text decoder (UTF-8, GB18030, GBK, UTF-16, ISO-8859-1), `TrustStore` for custom/self-signed TLS CAs, and `KeychainStore` (`0600` atomic credential storage).
+   - **`CSVNKit`**: Concurrency-safe `SVNClient`, multi-encoding text decoder (UTF-8, GB18030, GBK, UTF-16, ISO-8859-1), `TrustStore` for custom/self-signed TLS CAs, and `KeychainStore` (macOS Keychain, scoped to the HTTPS repository and authentication realm).
    - **`vcsctl`**: Command-line interface supporting `info`, `ls`, `cat`, `checkout`, `update`, `status`, `add`, `diff`, `commit`, `revert`, `log`, and commit-level `show`.
    - **`VCSExplorer`**: Native macOS SwiftUI desktop client modeled after **GitHub Desktop**.
 
@@ -156,28 +161,32 @@ vcsctl log      /path/to/wc --limit 50
    - Powered by `svn_client_diff_peg7` and `svn_client_diff7`: accurately diffs copied/moved files against their `copyfrom` source, synthesizes full-file additions/deletions when appropriate, skips binary files (`.jar`, `.png`, `.pdf`, etc.) without blocking the UI, and decodes multi-file working copy diffs section-by-section so binary `NUL` bytes never truncate subsequent text file diffs.
 
 4. **Two-Step TLS Certificate Fingerprint Verification**
-   - For enterprise SVN servers using self-signed certificates or private CAs, `VCS Explorer` probes the server certificate first, displays its Subject and `SHA-256` fingerprint, and only adds it to the local CA bundle after explicit user confirmation.
+   - For enterprise SVN servers using self-signed certificates or private CAs, `VCS Explorer` probes the server certificate first, displays its Subject and `SHA-256` fingerprint, and only trusts that leaf certificate for its HTTPS host and port after confirmation.
 
 ### Build, Test & Standalone Packaging
 
 ```bash
 # 1. Install build-time dependencies via Homebrew (Apple Silicon or Intel)
-brew install subversion apr apr-util
+brew install subversion apr apr-util pkgconf
+source scripts/svn_build_env.sh
 
 # 2. Build all targets
 swift build
+swift run SwiftVCSChecks
 
-# 3. Run the 42-assertion offline E2E test suite (uses local file:// repositories)
+# 3. Run the offline E2E test suite (uses local file:// repositories)
 ./Tests/run_e2e.sh
 
 # 4. Package a standalone, self-contained macOS app bundle
 ./make_app.sh
 # Outputs:
 #   dist/VCSExplorer.app (bundles all 22 libsvn/libapr/libserf dylibs under Contents/Frameworks/ via @rpath)
-#   dist/VCSExplorer-arm64.zip
+#   dist/VCSExplorer-<arch>.zip
 ```
 
 ---
+
+To consume `CSVNKit` from another Swift package, install the Homebrew dependencies and source `scripts/svn_build_env.sh` from a SwiftVCS checkout before building the consumer. SwiftPM uses the exported `PKG_CONFIG_PATH` to find the native libraries.
 
 ## 开源协议与第三方声明 / License & Third-Party Notices
 

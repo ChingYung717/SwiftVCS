@@ -13,8 +13,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     private var handle: OpaquePointer?
     private let queue = DispatchQueue(label: "vcs.svn.backend", qos: .userInitiated)
     private let stateLock = NSLock()
-    /// 保活传给 C 的字符串（libsvn 内部会拷贝，但我们仍持有原始内存以防万一）
-    private var keepAlive: [UnsafeMutablePointer<CChar>] = []
+    private let username: String?
+    private let password: String?
+    private let configDir: String?
+    private let trustBundlePath: String?
+    private let useSavedCredentials: Bool
+    private var credentialURL: URL?
+    private var rememberedConnection: (url: URL, username: String, password: String, realm: String)?
     private var _baseURL: URL?
     private var _rootURL: URL?
 
@@ -34,44 +39,84 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     // MARK: 初始化
 
-    /// - Parameters:
-    ///   - trustBundlePath: 自定义 CA bundle 路径。设置后 OpenSSL 会通过
-    ///     `SSL_CERT_FILE` 使用它（必须在建立任何 TLS 会话之前生效）。
+    /// 自定义 CA 通过当前 SVN 上下文的配置传递。
     public init(
         username: String? = nil,
         password: String? = nil,
         configDir: String? = nil,
         trustBundlePath: String? = nil,
-        baseURL: URL? = nil
+        baseURL: URL? = nil,
+        useSavedCredentials: Bool = true
     ) throws {
-        var errbuf = [CChar](repeating: 0, count: 2048)
-
-        if let trustBundlePath, FileManager.default.fileExists(atPath: trustBundlePath) {
-            setenv("SSL_CERT_FILE", trustBundlePath, 1)
-        }
-
-        let u = Self.dup(username)
-        let p = Self.dup(password)
-        let c = Self.dup(configDir)
-        keepAlive = [u, p, c].compactMap { $0 }
-
-        let h = csvn_context_create(u, p, c, &errbuf, Int32(errbuf.count))
-        guard let h else {
-            let msg = String(cString: errbuf)
-            throw VCSError.underlying("无法初始化 SVN 上下文：\(msg)")
-        }
-        handle = h
+        self.username = username
+        self.password = password
+        self.configDir = configDir
+        self.trustBundlePath = trustBundlePath
+        self.useSavedCredentials = useSavedCredentials
+        credentialURL = baseURL
         self.baseURL = baseURL
+        handle = try createHandle(url: baseURL, credentials: nil).handle
     }
 
     deinit {
         if let h = handle { csvn_context_destroy(h) }
-        for s in keepAlive { free(s) }
     }
 
-    private static func dup(_ s: String?) -> UnsafeMutablePointer<CChar>? {
-        guard let s else { return nil }
-        return strdup(s)
+    private func createHandle(url: URL?, credentials: Credentials?) throws
+        -> (handle: OpaquePointer, user: String?, password: String?) {
+        if let url, url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
+            throw VCSError.invalidArgument("请通过独立参数传递凭据")
+        }
+        var user = username
+        var secret = password
+        var realm: String?
+        if let url, let credentialURL, Self.trimTrailingSlash(credentialURL) != Self.trimTrailingSlash(url) {
+            user = nil
+            secret = nil
+        }
+        switch credentials?.kind {
+        case .usernamePassword(let suppliedUser, let suppliedPassword):
+            user = suppliedUser
+            secret = suppliedPassword
+        case .keychain(let service, let account):
+            guard let url, let saved = try KeychainStore.loadReference(service: service, username: account, url: url) else {
+                throw VCSError.authenticationFailed("该仓库没有对应的钥匙串凭据")
+            }
+            user = account
+            secret = saved.password
+            realm = saved.realm
+        case nil:
+            if let url, useSavedCredentials, let user, secret == nil,
+               let saved = try KeychainStore.load(url: url, username: user) {
+                secret = saved.password
+                realm = saved.realm
+            }
+        }
+
+        let origin = url.flatMap(SVNOrigin.init)
+        let pin = origin.flatMap { $0.scheme == "https" ? TrustStore.shared.pinnedCertificate(for: $0) : nil }
+        var errbuf = [CChar](repeating: 0, count: 2048)
+        let strings = [user, secret, configDir, origin?.authPrefix, realm, pin,
+                       origin?.scheme == "https" ? trustBundlePath : nil, origin?.host]
+        let cStrings = strings.map { value in value.flatMap { strdup($0) } }
+        defer { for value in cStrings { free(value) } }
+        guard let h = csvn_context_create(cStrings[0], cStrings[1], cStrings[2], cStrings[3],
+                                          cStrings[4], cStrings[5], cStrings[6], cStrings[7],
+                                          &errbuf, Int32(errbuf.count)) else {
+            throw VCSError.underlying("无法初始化 SVN 上下文：\(String(cString: errbuf))")
+        }
+        return (h, user, secret)
+    }
+
+    /// 仅保存已成功连接且实际完成口令认证的 HTTPS 凭据。
+    @discardableResult
+    public func rememberPassword() async throws -> Bool {
+        try await perform {
+            guard let connection = self.rememberedConnection else { return false }
+            try KeychainStore.save(url: connection.url, username: connection.username,
+                                   password: connection.password, realm: connection.realm)
+            return true
+        }
     }
 
     // MARK: 基础设施
@@ -194,7 +239,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     /// 离线读取本地工作副本所关联的远端仓库 URL（直接查询 `.svn/wc.db`）。
     public static func workingCopyURL(at workingCopy: URL) -> URL? {
         var errbuf = [CChar](repeating: 0, count: 512)
-        guard let ctx = csvn_context_create(nil, nil, nil, &errbuf, Int32(errbuf.count)) else {
+        guard let ctx = csvn_context_create(nil, nil, nil, nil, nil, nil, nil, nil, &errbuf, Int32(errbuf.count)) else {
             return nil
         }
         defer { csvn_context_destroy(ctx) }
@@ -210,9 +255,21 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     // MARK: 1. 连接
 
     public func connect(to url: URL, credentials: Credentials?) async throws -> RepositoryInfo {
-        // 凭据在构造时已交给 libsvn；这里只做连接与能力探测。
         try await perform {
-            let h = try self.requireHandle()
+            self.rememberedConnection = nil
+            let candidate = try self.createHandle(url: url, credentials: credentials)
+            let h = candidate.handle
+            let previous = self.handle
+            self.handle = h
+            var connected = false
+            defer {
+                if connected {
+                    if let previous { csvn_context_destroy(previous) }
+                } else {
+                    self.handle = previous
+                    csvn_context_destroy(h)
+                }
+            }
             var uuid = [CChar](repeating: 0, count: 256)
             var rev: Int32 = 0
             let rc = url.absoluteString.withCString { u in
@@ -236,6 +293,15 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 self.rootURL = nil
             }
 
+            if KeychainStore.service(for: url) != nil,
+               let username = candidate.user, let password = candidate.password,
+               let value = csvn_auth_realm(h), value.pointee != 0 {
+                self.rememberedConnection = (url, username, password, String(cString: value))
+            }
+            if self.credentialURL == nil {
+                self.credentialURL = url
+            }
+            connected = true
             return RepositoryInfo(
                 url: url,
                 uuid: String(cString: uuid).isEmpty ? nil : String(cString: uuid),
@@ -248,6 +314,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     public func disconnect() async {
         try? await perform {
+            if let handle = self.handle {
+                csvn_context_destroy(handle)
+                self.handle = nil
+            }
+            self.rememberedConnection = nil
             self.baseURL = nil
             self.rootURL = nil
         }
@@ -1225,10 +1296,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             // 目标路径：可以是工作副本里的相对路径，也可以直接给仓库 URL
             // （svn_client_log4 的 target 既接受工作副本路径，也接受 URL）
             //
-            // 注意：URL(fileURLWithPath:) 与 file:// 仓库 URL 的 scheme 都是 "file"，
-            // 因此通过检查目录下是否存在 `.svn` 来区分「本地工作副本目录」与「file:// 仓库 URL」。
+            // 工作副本子目录没有自己的 .svn；让 libsvn 查询所属工作副本。
             let isWorkingCopyDir = workingCopy.isFileURL &&
-                FileManager.default.fileExists(atPath: workingCopy.appendingPathComponent(".svn").path)
+                Self.workingCopyURL(at: workingCopy) != nil
             let target: String
             if !isWorkingCopyDir, workingCopy.scheme != nil {
                 var u = workingCopy

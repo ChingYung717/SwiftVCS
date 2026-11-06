@@ -1,5 +1,5 @@
 #!/bin/bash
-# 组装 VCSExplorer.app（原生 arm64，ad-hoc 签名）
+# 组装当前架构的 VCSExplorer.app，可选 Developer ID 签名与公证。
 # 用法: ./make_app.sh [输出目录]
 set -euo pipefail
 
@@ -7,7 +7,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HERE/dist}"
 APP="$OUT/VCSExplorer.app"
 NAME="VCSExplorer"
-BUNDLE_ID="local.vcsexplorer"
+SIGN_IDENTITY="${SWIFTVCS_SIGN_IDENTITY:--}"
+NOTARY_PROFILE="${SWIFTVCS_NOTARY_PROFILE:-}"
+source "$HERE/scripts/svn_build_env.sh"
+source "$HERE/scripts/bundle_notices.sh"
+if [ -n "$NOTARY_PROFILE" ] && [ "$SIGN_IDENTITY" = "-" ]; then
+    echo '公证需要 SWIFTVCS_SIGN_IDENTITY 指定 Developer ID Application 身份' >&2
+    exit 1
+fi
 
 echo "==> 编译 release 版本"
 cd "$HERE"
@@ -26,7 +33,11 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 bundle_dylibs() {
     local main_bin="$APP/Contents/MacOS/$NAME"
     local fw_dir="$APP/Contents/Frameworks"
-    mkdir -p "$fw_dir"
+    local notices="$APP/Contents/Resources/ThirdParty"
+    local brew_prefix
+    brew_prefix="$(brew --prefix)"
+    mkdir -p "$fw_dir" "$notices"
+    printf 'Library\tFormula\tVersion\n' > "$notices/components.tsv"
 
     while true; do
         local found_new=0
@@ -38,7 +49,7 @@ bundle_dylibs() {
         for target in "${targets[@]}"; do
             while IFS= read -r dep; do
                 case "$dep" in
-                    /opt/homebrew/*|/usr/local/*)
+                    "$brew_prefix"/*|/opt/homebrew/*|/usr/local/*)
                         local base
                         base="$(basename "$dep")"
                         local dest="$fw_dir/$base"
@@ -46,9 +57,7 @@ bundle_dylibs() {
                             cp -L "$dep" "$dest"
                             chmod 755 "$dest"
                             install_name_tool -id "@rpath/$base" "$dest"
-                            if command -v /usr/bin/vtool >/dev/null 2>&1; then
-                                /usr/bin/vtool -set-build-version macos 14.0 14.0 -replace -output "$dest" "$dest" 2>/dev/null || true
-                            fi
+                            bundle_dylib_notices "$dep" "$notices" "$base"
                             found_new=1
                         fi
                         install_name_tool -change "$dep" "@rpath/$base" "$target"
@@ -62,18 +71,18 @@ bundle_dylibs() {
         fi
     done
 
-    install_name_tool -delete_rpath "/opt/homebrew/opt/subversion/lib" "$main_bin" 2>/dev/null || true
-    install_name_tool -delete_rpath "/opt/homebrew/opt/apr/lib" "$main_bin" 2>/dev/null || true
-    install_name_tool -delete_rpath "/usr/local/opt/subversion/lib" "$main_bin" 2>/dev/null || true
-    install_name_tool -delete_rpath "/usr/local/opt/apr/lib" "$main_bin" 2>/dev/null || true
-    while IFS= read -r rpath_entry; do
-        case "$rpath_entry" in
-            /Library/Developer/CommandLineTools/*|/opt/homebrew/*|/usr/local/*)
-                install_name_tool -delete_rpath "$rpath_entry" "$main_bin" 2>/dev/null || true
-                ;;
-        esac
-    done < <(otool -l "$main_bin" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "$main_bin" 2>/dev/null || true
+    for target in "$main_bin" "$fw_dir"/*.dylib; do
+        while IFS= read -r rpath_entry; do
+            case "$rpath_entry" in
+                "$brew_prefix"/*|/Library/Developer/CommandLineTools/*|/opt/homebrew/*|/usr/local/*)
+                    install_name_tool -delete_rpath "$rpath_entry" "$target"
+                    ;;
+            esac
+        done < <(otool -l "$target" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
+    done
+    if ! otool -l "$main_bin" | awk '/cmd LC_RPATH/{getline; getline; if ($2 == "@executable_path/../Frameworks") found=1} END {exit !found}'; then
+        install_name_tool -add_rpath "@executable_path/../Frameworks" "$main_bin"
+    fi
 }
 
 echo "==> 收集并重写内置动态库 (Frameworks)"
@@ -92,7 +101,23 @@ for illust in welcome.png no-changes.png select-commit.png; do
     fi
 done
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cp "$HERE/LICENSE" "$HERE/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
+# 保留 dylib 的原始部署版本，以实际依赖中的最高版本为准。
+MIN_MACOS="$(otool -l "$APP/Contents/MacOS/$NAME" "$APP/Contents/Frameworks/"*.dylib |
+    awk '
+        /cmd LC_BUILD_VERSION/ { build=1; next }
+        build && $1=="minos" { print $2; build=0 }
+        /cmd LC_VERSION_MIN_MACOSX/ { legacy=1; next }
+        legacy && $1=="version" { print $2; legacy=0 }
+    ' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+[ -n "$MIN_MACOS" ] || { echo '无法读取最低 macOS 版本' >&2; exit 1; }
+ARCH="$(lipo -archs "$APP/Contents/MacOS/$NAME")"
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *) echo "不支持的产物架构：$ARCH" >&2; exit 1 ;;
+esac
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -105,7 +130,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>SwiftVCS</string>
     <key>CFBundleDocumentTypes</key>
@@ -114,18 +139,28 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "==> 签名（ad-hoc；不启用沙箱，故无容器身份问题）"
-for dylib in "$APP/Contents/Frameworks"/*.dylib; do
-    if [ -f "$dylib" ]; then
-        codesign --force --sign - "$dylib"
-    fi
+echo "==> 签名（${ARCH}，macOS ${MIN_MACOS}+）"
+sign_args=(--force --sign "$SIGN_IDENTITY")
+if [ "$SIGN_IDENTITY" != "-" ]; then
+    sign_args+=(--options runtime --timestamp)
+fi
+for dylib in "$APP/Contents/Frameworks/"*.dylib; do
+    codesign "${sign_args[@]}" "$dylib"
 done
-codesign --force --deep --sign - "$APP" 2>&1 | tail -1
-codesign --verify --strict --verbose=1 "$APP" && echo "    签名校验通过"
+codesign "${sign_args[@]}" "$APP"
+codesign --verify --deep --strict --verbose=1 "$APP"
 
-ZIP_OUT="$OUT/VCSExplorer-arm64.zip"
-rm -f "$ZIP_OUT"
-ditto -c -k --keepParent "$APP" "$ZIP_OUT"
+ZIP_OUT="$OUT/VCSExplorer-$ARCH.zip"
+ZIP_TMP="$OUT/.VCSExplorer-$ARCH-$$.zip"
+trap 'rm -f "$ZIP_TMP"' EXIT
+ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
+if [ -n "$NOTARY_PROFILE" ]; then
+    xcrun notarytool submit "$ZIP_TMP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
+fi
+mv -f "$ZIP_TMP" "$ZIP_OUT"
 
 echo "==> 产物"
 du -sh "$APP" "$ZIP_OUT"

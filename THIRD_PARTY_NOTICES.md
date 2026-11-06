@@ -6,6 +6,10 @@ When building from source or distributing prebuilt `VCSExplorer.app` bundles gen
 
 在从源码编译或分发由 `./make_app.sh` 生成的 `VCSExplorer.app` 独立应用包时，程序链接并内置了以下开源项目的动态库：
 
+The binary package includes the exact component versions, license texts and notices in `Contents/Resources/ThirdParty`. The packaging process relocates and re-signs the shared libraries.
+
+二进制包在 `Contents/Resources/ThirdParty` 附有实际组件版本、许可证正文和声明。打包时会改写动态库加载路径并重新签名。
+
 ---
 
 ## 1. Apache Subversion (`libsvn_*`)
@@ -41,7 +45,7 @@ When building from source or distributing prebuilt `VCSExplorer.app` bundles gen
 ## 7. GNU gettext runtime (`libintl`)
 - **Homepage**: https://www.gnu.org/software/gettext/
 - **License**: GNU Lesser General Public License (LGPL) v2.1+
-- **Note**: Linked dynamically as an unmodified shared library (`@rpath/libintl.8.dylib`) inside `Contents/Frameworks/`.
+- **Note**: Linked dynamically as a shared library (`@rpath/libintl.8.dylib`) inside `Contents/Frameworks/`. The package includes the matching source archive, build recipe and LGPL text.
 
 ---
 

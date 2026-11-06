@@ -1,0 +1,4 @@
+module CSVNDependencies [system] {
+    header "svn_dependencies.h"
+    export *
+}

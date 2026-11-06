@@ -11,7 +11,7 @@ struct Args {
         "trust-bundle",
         "revision", "r",
         "limit",
-        "ca", "fetch-cert", "server",
+        "ca", "fetch-cert", "fingerprint", "server",
     ]
 
     var positional: [String] = []
@@ -73,73 +73,50 @@ func die(_ message: String) -> Never {
 
 func requireURL(_ raw: String) -> URL {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let url = URL(string: trimmed), let scheme = url.scheme, !scheme.isEmpty else {
-        die("非法的仓库 URL：\(raw)")
+    guard let url = URL(string: trimmed), (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+        die("非法的仓库 URL，请通过独立选项传递认证凭据")
     }
     return url
 }
 
 func out(_ s: String) { print(s) }
 
-func makeClient(_ args: Args, url: String? = nil, workingCopyPath: String? = nil) throws -> SVNClient {
-    var user = args.string("user")
-    var pass = args.string("password")
-
-    // --ca <证书文件>：导入为受信任的内部 CA
-    if let caPath = args.string("ca") {
-        let data = try Data(contentsOf: URL(fileURLWithPath: caPath))
-        let name = URL(fileURLWithPath: caPath).deletingPathExtension().lastPathComponent
-        let fp = TrustStore.sha256Fingerprint(of: data)
-        try TrustStore.shared.addCertificate(pem: data, name: name)
-        print("已导入证书：\(name) (SHA-256: \(fp))")
-    }
-    // --fetch-cert <主机>：从服务器抓取并信任其证书（自签名场景）
-    if let host = args.string("fetch-cert") {
-        let probed = try TrustStore.shared.probeCertificate(host: host)
-        try TrustStore.shared.addCertificate(pem: probed.pemData, name: host)
-        print("已导入服务器证书：\(host) (SHA-256: \(probed.sha256Fingerprint))")
-    }
-    TrustStore.shared.install()
-
-    var resolvedHost: String? = nil
-    if let u = url, u.contains("://") {
-        resolvedHost = URL(string: u)?.host
-    }
-    if resolvedHost == nil, let s = args.string("server") {
-        resolvedHost = s
-    }
-    if resolvedHost == nil, let wc = workingCopyPath ?? (url?.contains("://") == false ? url : nil) {
-        resolvedHost = SVNClient.workingCopyURL(at: URL(fileURLWithPath: wc))?.host
+func makeClient(_ args: Args, url: String? = nil, workingCopyPath: String? = nil,
+                rememberBeforeOperation: Bool = true) async throws -> SVNClient {
+    let repository: URL?
+    if let url, url.contains("://") {
+        repository = requireURL(url)
+    } else if let wc = workingCopyPath ?? url {
+        repository = SVNClient.workingCopyURL(at: URL(fileURLWithPath: wc))
+    } else {
+        repository = nil
     }
 
-    // 钥匙串 / 凭据库里存过就直接用（即使未显式传 --user 也自动匹配该主机的已存账号）
-    if let h = resolvedHost {
-        if user == nil {
-            user = KeychainStore.listAccounts(server: h).first
-        }
-        if pass == nil, let u = user {
-            if let p = KeychainStore.load(server: h, username: u) { pass = p }
-        }
+    if let host = args.string("server"), repository.flatMap(SVNOrigin.init)?.host != host.lowercased() {
+        throw VCSError.invalidArgument("--server 必须与实际仓库的主机一致")
     }
 
-    // --remember：把凭据存进 macOS 钥匙串与凭据库
-    if args.bool("remember"), let h = resolvedHost, let u = user, let p = pass {
-        try KeychainStore.save(username: u, password: p, server: h)
-        var settings = AppSettingsStore.load()
-        if let uStr = url, uStr.contains("://") {
-            settings.repoURL = uStr.hasSuffix("/") ? String(uStr.dropLast()) : uStr
-        }
-        settings.username = u
-        AppSettingsStore.save(settings)
-        print("凭据已存入钥匙串：\(h) / \(u)")
-    }
-
-    let trustBundlePath = args.string("trust-bundle") ?? TrustStore.shared.caBundleURL.path
-    return try SVNClient(
-        username: user,
-        password: pass,
-        trustBundlePath: trustBundlePath
+    let client = try SVNClient(
+        username: args.string("user"),
+        password: args.string("password"),
+        trustBundlePath: args.string("trust-bundle") ?? args.string("ca"),
+        baseURL: repository
     )
+    if rememberBeforeOperation && args.bool("remember") {
+        guard let repository, SVNOrigin(repository)?.scheme == "https" else {
+            throw VCSError.invalidArgument("仅支持保存 HTTPS 仓库的凭据")
+        }
+        _ = try await client.connect(to: repository, credentials: nil)
+        try await rememberCredentials(client)
+    }
+    return client
+}
+
+func rememberCredentials(_ client: SVNClient) async throws {
+    guard try await client.rememberPassword() else {
+        throw VCSError.invalidArgument("仅在成功完成 HTTPS 口令认证后才能保存凭据")
+    }
+    out("凭据已存入 macOS 钥匙串")
 }
 
 // MARK: - 子命令
@@ -166,10 +143,10 @@ guard let command = rawArgs.first else {
     通用选项:
       --user <用户名>  --password <口令>  --revision <修订号>  --limit <条数>
       --trust-bundle <证书包路径>
-      --ca <证书文件>      导入并信任一张内部 CA 证书（PEM/DER）
-      --fetch-cert <主机>  从服务器抓取证书并信任（自签名场景）
-      --server <主机>      用于查找钥匙串中已保存的凭据
-      --remember           把凭据存入 macOS 钥匙串（之后可免密连接）
+      --ca <PEM 文件>             仅在当前 SVN 会话使用的 CA 证书包
+      info --fetch-cert <主机>     显示服务器叶证书的 SHA-256 指纹
+      info --fingerprint <指纹>    与独立获得的指纹匹配后信任证书
+      --remember                 成功认证后保存到 macOS 钥匙串，复用时传 --user
     """)
     exit(0)
 }
@@ -177,12 +154,35 @@ guard let command = rawArgs.first else {
 let args = parseArgs(Array(rawArgs.dropFirst()))
 
 do {
+    if command != "info" &&
+        (args.string("fetch-cert") != nil || args.string("fingerprint") != nil) {
+        throw VCSError.invalidArgument("--fetch-cert 和 --fingerprint 请用于 info")
+    }
     switch command {
     case "info":
         guard let urlString = args.positional.first else { die("需要仓库 URL") }
         let repoURL = requireURL(urlString)
-        let client = try makeClient(args, url: urlString)
+        if let host = args.string("fetch-cert") {
+            guard let origin = SVNOrigin(repoURL), origin.scheme == "https", origin.host == host.lowercased() else {
+                throw VCSError.invalidArgument("--fetch-cert 必须匹配 HTTPS 仓库主机")
+            }
+            let probed = try TrustStore.shared.probeCertificate(host: origin.host, port: origin.port)
+            out("SHA-256: \(probed.sha256Fingerprint)")
+            guard let fingerprint = args.string("fingerprint") else { break }
+            let normalized = fingerprint.replacingOccurrences(of: ":", with: "").uppercased()
+            let actual = probed.sha256Fingerprint.replacingOccurrences(of: ":", with: "")
+            guard normalized == actual else {
+                throw VCSError.invalidArgument("SHA-256 指纹不匹配，证书未保存")
+            }
+            try TrustStore.shared.trust(probed, for: repoURL)
+        } else if args.string("fingerprint") != nil {
+            throw VCSError.invalidArgument("--fingerprint 需与 --fetch-cert 一起使用")
+        }
+        let client = try await makeClient(args, url: urlString, rememberBeforeOperation: false)
         let info = try await client.connect(to: repoURL, credentials: nil)
+        if args.bool("remember") {
+            try await rememberCredentials(client)
+        }
         out("仓库 URL : \(info.url)")
         if let root = info.rootURL {
             out("仓库根   : \(root)")
@@ -193,7 +193,7 @@ do {
     case "ls":
         guard let urlString = args.positional.first else { die("需要仓库 URL") }
         let repoURL = requireURL(urlString)
-        let client = try makeClient(args, url: urlString)
+        let client = try await makeClient(args, url: urlString)
         _ = try await client.connect(to: repoURL, credentials: nil)
         let entries = try await client.browse(path: args.positional.count > 1 ? args.positional[1] : nil)
         out("修订  大小        类型  作者              路径")
@@ -210,7 +210,7 @@ do {
         let urlString = args.positional[0]
         let filePath = args.positional[1]
         let repoURL = requireURL(urlString)
-        let client = try makeClient(args, url: urlString)
+        let client = try await makeClient(args, url: urlString)
         _ = try await client.connect(to: repoURL, credentials: nil)
         let data = try await client.cat(path: filePath, revision: args.int("revision") ?? args.int("r"))
         FileHandle.standardOutput.write(data)
@@ -219,7 +219,7 @@ do {
         guard args.positional.count >= 2 else { die("需要 <url> <本地目录> [子路径]") }
         let urlString = args.positional[0]
         let repoURL = requireURL(urlString)
-        let client = try makeClient(args, url: urlString)
+        let client = try await makeClient(args, url: urlString)
         let dest = URL(fileURLWithPath: args.positional[1])
         let subPath = args.positional.count > 2 ? args.positional[2] : nil
         _ = try await client.connect(to: repoURL, credentials: nil)
@@ -228,7 +228,7 @@ do {
 
     case "update":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let r = try await client.update(workingCopy: URL(fileURLWithPath: wc), revision: args.int("revision") ?? args.int("r"), progress: nil)
         out("已同步到 r\(r.revision)（更新 \(r.updatedCount)，新增 \(r.addedCount)，删除 \(r.deletedCount)）")
         if !r.conflicts.isEmpty {
@@ -238,7 +238,7 @@ do {
 
     case "status":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let items = try await client.status(of: URL(fileURLWithPath: wc))
         let changed = items.filter { $0.kind.isPendingChange || $0.kind == .unversioned }
         if changed.isEmpty {
@@ -258,14 +258,14 @@ do {
 
     case "add":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
         let n = try await client.add(workingCopy: URL(fileURLWithPath: wc), paths: paths)
         out("已纳入版本控制 \(n) 个路径。")
 
     case "diff":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
         let diffs = try await client.diff(workingCopy: URL(fileURLWithPath: wc), paths: paths)
         if diffs.isEmpty { out("无差异。") }
@@ -292,14 +292,18 @@ do {
     case "commit":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
         guard let message = args.string("m") ?? args.string("message"), !message.isEmpty else { die("需要 -m \"提交说明\"") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
         let r = try await client.commit(workingCopy: URL(fileURLWithPath: wc), paths: paths, message: message, progress: nil)
-        out("已提交 r\(r.revision)，共 \(r.committedCount) 个条目。")
+        if r.revision > 0 {
+            out("已提交 r\(r.revision)，共 \(r.committedCount) 个条目。")
+        } else {
+            out("没有可提交的改动。")
+        }
 
     case "revert":
         guard let wc = args.positional.first else { die("需要工作副本目录") }
-        let client = try makeClient(args, workingCopyPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
         let n = try await client.revert(workingCopy: URL(fileURLWithPath: wc), paths: paths)
         out("已回滚 \(n) 个路径。")
@@ -307,7 +311,7 @@ do {
     case "log":
         guard let target = args.positional.first else { die("需要工作副本目录或仓库 URL") }
         // 既支持工作副本路径，也支持直接给仓库 URL
-        let client = try makeClient(args, url: target)
+        let client = try await makeClient(args, url: target)
         let path = args.positional.count > 1 ? args.positional[1] : nil
         let url = target.contains("://") ? requireURL(target) : URL(fileURLWithPath: target)
         let entries = try await client.log(
@@ -348,7 +352,7 @@ do {
             die("无效的修订号：\(revRaw)")
         }
 
-        let client = try makeClient(args, url: target)
+        let client = try await makeClient(args, url: target)
         let repoURL: URL
         if target.contains("://") {
             repoURL = requireURL(target)

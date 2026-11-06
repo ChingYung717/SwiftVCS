@@ -2,13 +2,37 @@ import CryptoKit
 import Foundation
 import Security
 
-/// 证书信任库：管理内部服务器的自签名 CA。
-///
-/// libsvn 的 serf 后端用 OpenSSL 校验 TLS，`SSL_CTX_set_default_verify_paths()`
-/// 会读取 `SSL_CERT_FILE` 环境变量。因此把「系统根证书 + 用户导入的内部 CA」
-/// 合并成一个 bundle 并设置该环境变量，即可让内部服务器被信任，而不影响其它站点。
-public final class TrustStore: @unchecked Sendable {
+/// libsvn 认证使用的源站标识，显式补齐协议的默认端口。
+public struct SVNOrigin: Hashable, Sendable {
+    public let scheme: String
+    public let host: String
+    public let port: Int
 
+    public init?(_ url: URL) {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host,
+              !host.isEmpty, !host.contains("/"), url.password == nil,
+              url.user == nil || scheme == "svn+ssh" else { return nil }
+        let defaultPort: Int
+        switch scheme {
+        case "https": defaultPort = 443
+        case "http": defaultPort = 80
+        case "svn": defaultPort = 3690
+        case "svn+ssh": defaultPort = 22
+        default: return nil
+        }
+        let port = url.port ?? defaultPort
+        guard (1...65535).contains(port) else { return nil }
+        self.scheme = scheme
+        self.host = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        self.port = port
+    }
+
+    public var endpoint: String { "\(host):\(port)" }
+    var authPrefix: String { "\(scheme)://\(endpoint)" }
+}
+
+/// 按 HTTPS 主机和端口保存人工核验过的叶证书。
+public final class TrustStore: Sendable {
     public struct CertificateInfo: Sendable, Hashable, Identifiable {
         public var id: String { name }
         public let name: String
@@ -49,13 +73,11 @@ public final class TrustStore: @unchecked Sendable {
 
     public let root: URL
     private let certsDir: URL
-    private let bundleURL: URL
 
     private init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         root = home.appendingPathComponent(".config/vcs-explorer")
-        certsDir = root.appendingPathComponent("certs")
-        bundleURL = root.appendingPathComponent("ca-bundle.crt")
+        certsDir = root.appendingPathComponent("pinned-certs")
         try? FileManager.default.createDirectory(
             at: root,
             withIntermediateDirectories: true,
@@ -70,20 +92,12 @@ public final class TrustStore: @unchecked Sendable {
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: certsDir.path)
     }
 
-    /// 系统根证书包（macOS 自带）。
-    private static let systemBundles = [
-        "/etc/ssl/cert.pem",
-        "/opt/homebrew/etc/openssl@3/certs/ca-certificates.crt",
-    ]
-
-    public var caBundleURL: URL { bundleURL }
-
     /// 计算证书数据（PEM 或 DER）的 SHA-256 指纹（格式如 `AA:BB:CC:...`）。
     public static func sha256Fingerprint(of data: Data) -> String {
         let text = String(decoding: data, as: UTF8.self)
         let blocks = extractPEMBlocks(from: text)
         let derData: Data
-        if let block = blocks.last ?? blocks.first, let decoded = Self.derData(fromPEMBlock: block) {
+        if let block = blocks.first, let decoded = Self.derData(fromPEMBlock: block) {
             derData = decoded
         } else {
             derData = data
@@ -135,86 +149,52 @@ public final class TrustStore: @unchecked Sendable {
             }
     }
 
-    /// 导入一张 PEM/DER 证书。
-    public func addCertificate(pem data: Data, name: String) throws {
-        var text = String(decoding: data, as: UTF8.self)
-
-        if !text.contains("BEGIN CERTIFICATE") {
-            // 认为是 DER，用 openssl 转成 PEM
-            let tmp = root.appendingPathComponent(".import-\(UUID().uuidString).der")
-            try data.write(to: tmp)
-            defer { try? FileManager.default.removeItem(at: tmp) }
-            let converted = try runOpenssl(["x509", "-inform", "DER", "-in", tmp.path])
-            text = converted
-        }
-
-        let blocks = Self.extractPEMBlocks(from: text)
-        let validBlocks = blocks.filter { block in
-            guard let der = Self.derData(fromPEMBlock: block), !der.isEmpty else { return false }
-            return SecCertificateCreateWithData(nil, der as CFData) != nil
-        }
-        guard !validBlocks.isEmpty else {
+    public func trust(_ certificate: ProbedCertificate, for url: URL) throws {
+        guard let origin = SVNOrigin(url), origin.scheme == "https",
+              origin.host == certificate.host.lowercased(), origin.port == certificate.port,
+              let der = Self.certificateDER(certificate.pemData),
+              Self.sha256Fingerprint(of: der) == certificate.sha256Fingerprint else {
             throw TrustStoreError.notACertificate
         }
-        let normalized = validBlocks.joined(separator: "\n") + "\n"
-
-        let safe = sanitized(name)
-        guard !safe.isEmpty else {
-            throw TrustStoreError.notACertificate
-        }
-        let dest = certsDir.appendingPathComponent("\(safe).crt")
-        try normalized.write(to: dest, atomically: true, encoding: .utf8)
+        let dest = certsDir.appendingPathComponent("\(origin.endpoint).crt")
+        try der.write(to: dest, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest.path)
-        try rebuildBundle()
     }
 
     public func removeCertificate(name: String) throws {
-        let dest = certsDir.appendingPathComponent("\(sanitized(name)).crt")
+        guard name == URL(fileURLWithPath: name).lastPathComponent, !name.isEmpty else {
+            throw TrustStoreError.notACertificate
+        }
+        let dest = certsDir.appendingPathComponent("\(name).crt")
         if FileManager.default.fileExists(atPath: dest.path) {
             try FileManager.default.removeItem(at: dest)
         }
-        try rebuildBundle()
     }
 
-    /// 重建 bundle = 系统根证书 + 所有导入的内部证书。
-    public func rebuildBundle() throws {
-        var combined = Data()
-        var wroteAny = false
-        for p in Self.systemBundles where FileManager.default.fileExists(atPath: p) {
-            combined.append(try Data(contentsOf: URL(fileURLWithPath: p)))
-            combined.append(Data("\n".utf8))
-            wroteAny = true
-            break
-        }
-        for c in importedCertificates() {
-            combined.append(try Data(contentsOf: c.url))
-            combined.append(Data("\n".utf8))
-        }
-        guard wroteAny else { return }
-        try combined.write(to: bundleURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: bundleURL.path)
+    func pinnedCertificate(for origin: SVNOrigin) -> String? {
+        guard origin.scheme == "https",
+              let data = try? Data(contentsOf: certsDir.appendingPathComponent("\(origin.endpoint).crt")),
+              let der = Self.certificateDER(data) else { return nil }
+        return der.base64EncodedString()
     }
 
-    /// 让当前进程信任该 bundle（必须在任何 TLS 会话建立之前调用）。
-    public func install() {
-        try? rebuildBundle()
-        guard FileManager.default.fileExists(atPath: bundleURL.path) else { return }
-        setenv("SSL_CERT_FILE", bundleURL.path, 1)
+    private static func certificateDER(_ data: Data) -> Data? {
+        let block = extractPEMBlocks(from: String(decoding: data, as: UTF8.self)).first
+        let der = block.flatMap(derData(fromPEMBlock:)) ?? data
+        return SecCertificateCreateWithData(nil, der as CFData) == nil ? nil : der
     }
 
     /// 预抓取服务器证书并提取主体摘要与 SHA-256 指纹，但不写入信任库（供界面展示指纹并由用户确认后再信任）。
     public func probeCertificate(host: String, port: Int = 443) throws -> ProbedCertificate {
+        guard !host.isEmpty, !host.hasPrefix("-"), (1...65535).contains(port) else {
+            throw TrustStoreError.cannotFetchCertificate
+        }
+        let address = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
         let pem = try runOpenssl([
-            "s_client", "-connect", "\(host):\(port)", "-servername", host, "-showcerts",
+            "s_client", "-connect", address, "-servername", host, "-showcerts",
         ])
         let blocks = Self.extractPEMBlocks(from: pem)
-        let validBlocks = blocks.filter { block in
-            guard let der = Self.derData(fromPEMBlock: block), !der.isEmpty else { return false }
-            return SecCertificateCreateWithData(nil, der as CFData) != nil
-        }
-        guard let targetCertBlock = validBlocks.last,
-              !targetCertBlock.isEmpty,
+        guard let targetCertBlock = blocks.first,
               let der = Self.derData(fromPEMBlock: targetCertBlock),
               let secCert = SecCertificateCreateWithData(nil, der as CFData) else {
             throw TrustStoreError.cannotFetchCertificate
@@ -229,22 +209,6 @@ public final class TrustStore: @unchecked Sendable {
             subjectSummary: summary,
             sha256Fingerprint: fp
         )
-    }
-
-    /// 从服务器抓取其证书并导入（用于自签名场景）。
-    /// 只保存服务器证书链中的自签名根/颁发者证书（最后一个 PEM 块）或叶子证书，并校验证书非空。
-    @discardableResult
-    public func fetchCertificate(host: String, port: Int = 443) throws -> String {
-        let probed = try probeCertificate(host: host, port: port)
-        try addCertificate(pem: probed.pemData, name: host)
-        return host
-    }
-
-    // MARK: - 内部
-
-    private func sanitized(_ s: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
-        return String(s.unicodeScalars.filter { allowed.contains($0) })
     }
 
     @discardableResult
@@ -284,103 +248,83 @@ public enum TrustStoreError: Error, LocalizedError {
     }
 }
 
-// MARK: - 钥匙串与凭据存储
+// MARK: - 钥匙串
 
-/// 凭据安全存储（`~/.config/vcs-explorer/credentials.json`，权限 `0600`）。
-///
-/// 说明：由于 `vcsctl`、Debug 版 `VCSExplorer` 与打包后的 `dist/VCSExplorer.app` 使用
-/// ad-hoc 签名（无付费开发者 Team ID），各二进制拥有不同的 CDHash。若直接写入系统
-/// Legacy Keychain (`login.keychain-db`)，跨进程或重新打包后读取会触发 `SecurityAgent`
-/// 模态授权弹窗并阻塞 GUI/CLI 线程。因此这里将凭据以 0600 权限保存在用户私密配置目录中。
 public enum KeychainStore {
-
-    private static var storeFileURL: URL {
-        TrustStore.shared.root.appendingPathComponent("credentials.json")
+    struct SavedPassword: Codable {
+        let password: String
+        let realm: String
     }
 
-    public static func save(username: String, password: String, server: String) throws {
-        var map = readMap()
-        map["\(server)|\(username)"] = password
-        try writeMap(map)
+    public static func service(for url: URL) -> String? {
+        guard let origin = SVNOrigin(url), origin.scheme == "https",
+              url.query == nil, url.fragment == nil else { return nil }
+        let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? ""
+        let canonicalPath = path.hasSuffix("/") ? String(path.dropLast()) : path
+        return "local.vcsexplorer.svn.v2|\(origin.authPrefix)\(canonicalPath)"
     }
 
-    public static func load(server: String, username: String) -> String? {
-        readMap()["\(server)|\(username)"]
+    private static func query(service: String, username: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: username]
     }
 
-    public static func delete(server: String, username: String) {
-        var map = readMap()
-        map.removeValue(forKey: "\(server)|\(username)")
-        try? writeMap(map)
+    private static func read(service: String, username: String) throws -> Data? {
+        var request = query(service: service, username: username)
+        request[kSecReturnData as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw KeychainError.operationFailed(status) }
+        return result as? Data
     }
 
-    /// 列出某服务器已保存的用户名（不含密码）。
-    public static func listAccounts(server: String) -> [String] {
-        var result: [String] = []
-        for key in readMap().keys.sorted() where key.hasPrefix(server + "|") {
-            let u = String(key.dropFirst(server.count + 1))
-            if !result.contains(u) { result.append(u) }
+    static func load(url: URL, username: String) throws -> SavedPassword? {
+        guard let service = service(for: url),
+              let data = try read(service: service, username: username) else { return nil }
+        return try JSONDecoder().decode(SavedPassword.self, from: data)
+    }
+
+    static func loadReference(service: String, username: String, url: URL) throws -> SavedPassword? {
+        if service == self.service(for: url) {
+            return try load(url: url, username: username)
         }
-        return result
+        return nil
     }
 
-    private static func readMap() -> [String: String] {
-        guard let data = try? Data(contentsOf: storeFileURL),
-              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return [:]
+    static func save(url: URL, username: String, password: String, realm: String) throws {
+        guard let service = service(for: url) else { return }
+        let data = try JSONEncoder().encode(SavedPassword(password: password, realm: realm))
+        var request = query(service: service, username: username)
+        let attrs = [kSecValueData as String: data]
+        request[kSecValueData as String] = data
+        var status = SecItemAdd(request as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            status = SecItemUpdate(query(service: service, username: username) as CFDictionary,
+                                   attrs as CFDictionary)
         }
-        return dict
+        guard status == errSecSuccess else { throw KeychainError.operationFailed(status) }
     }
 
-    private static func writeMap(_ map: [String: String]) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(map)
-        let rootDir = TrustStore.shared.root
-        try FileManager.default.createDirectory(
-            at: rootDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: rootDir.path
-        )
-
-        let tempURL = rootDir.appendingPathComponent(".credentials-\(UUID().uuidString).tmp")
-        let created = FileManager.default.createFile(
-            atPath: tempURL.path,
-            contents: data,
-            attributes: [.posixPermissions: 0o600]
-        )
-        guard created else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        do {
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: tempURL.path
-            )
-            _ = try FileManager.default.replaceItemAt(storeFileURL, withItemAt: tempURL)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: storeFileURL.path
-            )
-        } catch {
-            try? FileManager.default.removeItem(at: tempURL)
-            throw error
+    public static func delete(url: URL, username: String) throws {
+        guard let service = service(for: url) else { return }
+        let status = SecItemDelete(query(service: service, username: username) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.operationFailed(status)
         }
     }
 }
 
 public enum KeychainError: Error, LocalizedError {
-    case unableToSave(OSStatus)
+    case operationFailed(OSStatus)
 
     public var errorDescription: String? {
         switch self {
-        case .unableToSave(let s):
-            let msg = SecCopyErrorMessageString(s, nil) as String? ?? "未知错误"
-            return "无法保存到钥匙串：\(msg)"
+        case .operationFailed(let status):
+            let message = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
+            return "无法访问 macOS 钥匙串：\(message)"
         }
     }
 }
@@ -399,7 +343,7 @@ public struct AppSettings: Codable, Sendable {
         repoURL: String = "",
         username: String = "",
         workingCopyPath: String = "",
-        rememberPassword: Bool = true,
+        rememberPassword: Bool = false,
         recentRepos: [String] = []
     ) {
         self.repoURL = repoURL
@@ -418,7 +362,7 @@ public enum AppSettingsStore {
     public static func load() -> AppSettings {
         guard let data = try? Data(contentsOf: settingsURL),
               let s = try? JSONDecoder().decode(AppSettings.self, from: data) else {
-            return AppSettings(repoURL: "", username: "", workingCopyPath: "", rememberPassword: true, recentRepos: [])
+            return AppSettings(repoURL: "", username: "", workingCopyPath: "", rememberPassword: false, recentRepos: [])
         }
         return s
     }

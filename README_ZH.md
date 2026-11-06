@@ -15,7 +15,7 @@
 
 ```text
 SwiftVCS/
-├── Package.swift                 # SwiftPM 包配置（支持 macOS 14+，自动探测 /opt/homebrew 与 /usr/local）
+├── Package.swift                 # SwiftPM 包配置（支持 macOS 14+，通过 pkg-config 加载系统库）
 ├── Sources/
 │   ├── CVCSKit/                  # 与具体 VCS 无关的公共协议 (RepositoryClient) 与值类型模型
 │   ├── CSVNShim/                 # libsvn 1.14+ C11 封装层（APR 子内存池管理、流式限流、线程局部错误）
@@ -26,7 +26,7 @@ SwiftVCS/
 │   └── VCSExplorer/              # GitHub Desktop 风格 SwiftUI 桌面端（15 个源码文件 + 图标与插画资源）
 ├── Tests/
 │   ├── CVCSKitTests/             # 单元测试目录
-│   └── run_e2e.sh                # 42 项完全离线的端到端回归测试脚本（基于本地 file:// 仓库）
+│   └── run_e2e.sh                # 离线端到端回归测试脚本（基于本地 file:// 仓库）
 └── make_app.sh                   # 独立 .app 打包脚本（内置 22 个动态库至 Contents/Frameworks）
 ```
 
@@ -51,8 +51,8 @@ SwiftVCS/
 
 - **配置文件目录**：`~/.config/vcs-explorer/`（目录权限强制设为 `0700`）
   - `settings.json`：保存最近连接的仓库列表、工作副本路径与界面偏好。
-  - `credentials.json`：当开启「记住凭据」时，以 `0600` 权限临时文件 + `replaceItemAt` 原子替换方式安全存储凭据。
-  - `certs/*.crt` 与 `ca-bundle.crt`：保存经用户核对 `SHA-256` 指纹后导入的内部服务器证书，并与系统根证书合并供 `SSL_CERT_FILE` 使用。
+  - HTTPS 密码在认证成功后按仓库与认证域保存至 macOS 钥匙串。
+  - `pinned-certs/*.crt`：按 HTTPS 主机和端口保存经用户核对指纹的叶证书。
 
 ---
 

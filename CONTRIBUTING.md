@@ -11,11 +11,13 @@ Thank you for your interest in contributing to **SwiftVCS & VCS Explorer**!
 1. 确保运行在 **macOS 14.0 (Sonoma)** 或更高版本，已安装 Xcode Command Line Tools。
 2. 安装构建期依赖：
    ```bash
-   brew install subversion apr apr-util
+   brew install subversion apr apr-util pkgconf
+source scripts/svn_build_env.sh
    ```
 3. 克隆仓库并验证构建与测试：
    ```bash
    swift build
+swift run SwiftVCSChecks
    ./Tests/run_e2e.sh
    ```
 
@@ -36,11 +38,13 @@ Thank you for your interest in contributing to **SwiftVCS & VCS Explorer**!
 1. Requires **macOS 14.0 (Sonoma)** or later with Xcode Command Line Tools installed.
 2. Install build-time libraries via Homebrew:
    ```bash
-   brew install subversion apr apr-util
+   brew install subversion apr apr-util pkgconf
+source scripts/svn_build_env.sh
    ```
 3. Build and run the offline end-to-end test suite:
    ```bash
    swift build
+swift run SwiftVCSChecks
    ./Tests/run_e2e.sh
    ```
 

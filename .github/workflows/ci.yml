@@ -2,41 +2,54 @@ name: macOS Build & E2E Tests
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [main, master]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [main, master]
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
-    name: Build, E2E Test & Package (macOS arm64)
-    runs-on: macos-14
+    name: Build, Test & Package (macOS arm64)
+    runs-on: macos-15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Subversion & APR via Homebrew
-        run: |
-          brew install subversion apr apr-util
+      - name: Install build dependencies
+        run: brew install subversion apr apr-util pkgconf
 
-      - name: Build Debug targets
+      - name: Build and run unit checks
         run: |
+          source scripts/svn_build_env.sh
           swift build
+          swift run SwiftVCSChecks
 
-      - name: Run 42-Assertion Offline E2E Suite
+      - name: Run offline SVN and loopback security tests
         run: |
           ./Tests/run_e2e.sh
+          source scripts/svn_build_env.sh
+          python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
 
-      - name: Package Standalone VCSExplorer.app
+      - name: Package standalone VCSExplorer.app
+        run: ./make_app.sh
+
+      - name: Verify package
         run: |
-          ./make_app.sh
+          app=dist/VCSExplorer.app
+          test "$(lipo -archs "$app/Contents/MacOS/VCSExplorer")" = arm64
+          otool -L "$app/Contents/MacOS/VCSExplorer" "$app/Contents/Frameworks/"*.dylib > "$RUNNER_TEMP/swiftvcs-dylibs.txt"
+          if grep -E '/opt/homebrew|/usr/local' "$RUNNER_TEMP/swiftvcs-dylibs.txt"; then
+            exit 1
+          fi
+          codesign --verify --deep --strict "$app"
+          unzip -tq dist/VCSExplorer-arm64.zip
 
-      - name: Verify Zero External Homebrew Dylib Paths
-        run: |
-          ! (otool -L dist/VCSExplorer.app/Contents/MacOS/VCSExplorer dist/VCSExplorer.app/Contents/Frameworks/*.dylib | grep -E "/opt/homebrew|/usr/local")
-
-      - name: Upload VCSExplorer-arm64.zip Artifact
+      - name: Upload VCSExplorer-arm64.zip artifact
         uses: actions/upload-artifact@v4
         with:
           name: VCSExplorer-arm64
           path: dist/VCSExplorer-arm64.zip
+          if-no-files-found: error
