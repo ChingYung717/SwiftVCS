@@ -113,6 +113,8 @@ int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
                     const char *name, int revision, int peg, int inherited,
                     csvn_property **output, int *count);
 void csvn_free_properties(csvn_property *items, int count);
+int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int replaced,
+                              csvn_property **output, int *count);
 int csvn_set_property(csvn_ctx *ctx, const char *root, const char *relative,
                       const char *name, const void *data, size_t length, int remove);
 int csvn_default_ignores(csvn_ctx *ctx, char ***output, int *count);

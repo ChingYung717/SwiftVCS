@@ -254,23 +254,54 @@ struct DiffViewer<TrailingActions: View>: View {
             }
 
         case .loaded(let diff, let isTruncated):
+            if !diff.propertyChanges.isEmpty { propertyDiff(diff.propertyChanges) }
             if !diff.hunks.isEmpty, let notice = diff.statusNotice {
                 Text(notice).font(.caption).foregroundStyle(.secondary)
             }
             if diff.isBinary || (diff.hunks.isEmpty && FileIcon.isKnownBinaryExtension(filePath)) {
                 binaryPlaceholderCard(path: filePath, size: nil)
             } else if diff.hunks.isEmpty {
-                EmptyStateView(
-                    fallbackSymbol: "checkmark.seal",
-                    title: "无文本行差异",
-                    subtitle: diff.statusNotice ?? "该文件在此次变更中无可见正文差异（可能仅包含 SVN 属性或空白变更）。",
-                    maxImageWidth: 120,
-                    maxImageHeight: 90
-                )
+                if diff.propertyChanges.isEmpty {
+                    EmptyStateView(
+                        fallbackSymbol: "checkmark.seal",
+                        title: "无文本行差异",
+                        subtitle: diff.statusNotice ?? "该节点在此次变更中没有可见差异。",
+                        maxImageWidth: 120,
+                        maxImageHeight: 90
+                    )
+                }
             } else {
                 diffCodeScrollArea(diff: diff, isTruncated: isTruncated)
             }
         }
+    }
+
+    private func propertyDiff(_ changes: [PropertyChange]) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("SVN 属性变更").font(.headline)
+                ForEach(changes) { change in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(change.name).font(.subheadline.bold())
+                        Text("− \(propertyValue(change.oldValue))").foregroundStyle(Theme.delFG)
+                        Text("+ \(propertyValue(change.newValue))").foregroundStyle(Theme.addFG)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+        }
+        .frame(maxHeight: 220)
+    }
+
+    private func propertyValue(_ data: Data?) -> String {
+        guard let data else { return "（不存在）" }
+        guard !data.isEmpty else { return "（空值）" }
+        if data.contains(0) { return "二进制（\(data.count) 字节）" }
+        if let text = String(data: data, encoding: .utf8) { return text }
+        return "二进制（\(data.count) 字节）"
     }
 
     // MARK: - 加载骨架态

@@ -80,6 +80,9 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-properties-") as temporary:
     assert "二进制".encode() in vcs("propget", wc, "project:blob", *at_file).stdout
     vcs("propset", wc, "project:empty", "", *at_file)
     assert vcs("propget", wc, "project:empty", *at_file, "--raw").stdout == b""
+    diff = vcs("diff", wc, path).stdout.decode()
+    assert "SVN 属性变更" in diff and "project:blob" in diff and "二进制（9 字节）" in diff, diff
+    assert 'project:empty' in diff and '+ ""' in diff and "（不存在）" in diff, diff
     vcs("propdel", wc, "project:empty", *at_file)
     vcs("propget", wc, "project:empty", *at_file, "--raw", ok=False)
 
@@ -118,6 +121,8 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-properties-") as temporary:
     assert b"*.svnglobalfixture" in listed and b"*.local" not in listed
     vcs("propset", wc, "svn:ignore", "*.local", "--path", "parent/child")
     assert classify(parent)[str(deeper)] == "I"
+    diff = vcs("diff", wc, "parent/child").stdout.decode()
+    assert '=== parent/child ' in diff and 'svn:ignore' in diff and '*.local' in diff, diff
     vcs("propdel", wc, "svn:ignore", "--path", "parent/child")
     assert classify(parent)[str(deeper)] == "?"
     vcs("ignore", wc, *at_file, ok=False)
@@ -155,10 +160,33 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-properties-") as temporary:
     assert path.encode() in pending
     vcs("commit", wc, path, "--exact", "-m", "verified property change")
     assert youngest() == 2
+    history_diff = vcs("show", url, 2, path).stdout.decode()
+    assert 'project:history' in history_diff and '− "old"' in history_diff and '+ "new"' in history_diff, history_diff
+    assert "project:blob" in history_diff and "二进制（9 字节）" in history_diff, history_diff
     fresh = base / "fresh"
     svn("checkout", url, fresh)
     assert vcs("propget", fresh, "project:blob", *at_file, "--raw").stdout == data
     assert vcs("propget", file_url, "project:history", "--raw").stdout == b"new"
+    copy = fresh / "parent" / "child" / "copy.txt"
+    svn("copy", fresh / path, copy)
+    svn("propset", "project:history", "copied value", copy)
+    local_copy = vcs("diff", fresh, "parent/child/copy.txt").stdout.decode()
+    assert '− "new"' in local_copy and '+ "copied value"' in local_copy, local_copy
+    svn("commit", copy, "-m", "copy and modify a property")
+    history_copy = vcs("show", url, 3, "parent/child/copy.txt").stdout.decode()
+    assert '− "new"' in history_copy and '+ "copied value"' in history_copy, history_copy
+
+    replacement = fresh / path
+    svn("delete", replacement)
+    replacement.write_text("replacement\n")
+    svn("add", "--no-ignore", replacement)
+    svn("propset", "project:history", "replacement value", replacement)
+    local_replace = vcs("diff", fresh, path).stdout.decode()
+    assert '− "new"' in local_replace and '+ "replacement value"' in local_replace, local_replace
+    svn("commit", replacement, "-m", "replace file with different attributes")
+    history_replace = vcs("show", url, 4, path).stdout.decode()
+    assert '− "new"' in history_replace and '+ "replacement value"' in history_replace, history_replace
+
     svn("move", file_url, url + "/parent/child/moved.svnglobalfixture", "-m", "rename")
     assert vcs("propget", file_url, "project:history", "--revision", 1, "--peg", 1, "--raw").stdout == b"old"
     vcs("propget", file_url, "project:history", "--raw", ok=False)

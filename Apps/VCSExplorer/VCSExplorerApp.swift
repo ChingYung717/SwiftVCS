@@ -489,7 +489,7 @@ final class AppModel: ObservableObject {
     }
 
     func diffCore(forPaths specificPaths: [String]? = nil) async throws -> [FileDiff] {
-        let c = try ensureClient()
+        let c = try clientForWorkingCopy()
         let paths = specificPaths ?? statuses.filter { $0.kind.isPendingChange }.map(\.path)
         if paths.isEmpty && specificPaths == nil {
             return []
@@ -686,23 +686,9 @@ final class AppModel: ObservableObject {
 
         if isSelfTest { return }
 
-        if item.isDirectory {
-            fileDiffState = .directory(item.path)
-            return
-        }
-
-        if FileIcon.isKnownBinaryExtension(item.path) {
-            fileDiffState = .binary(path: item.path, size: nil)
-            return
-        }
-
         let cacheKey = "\(revision)|\(item.path)"
         if let cached = revisionDiffCache[cacheKey] {
-            if cached.isBinary {
-                fileDiffState = .binary(path: item.path, size: nil)
-            } else {
-                fileDiffState = .loaded(cached, isTruncated: cached.isTruncated)
-            }
+            fileDiffState = .loaded(cached, isTruncated: cached.isTruncated)
             return
         }
 
@@ -724,15 +710,8 @@ final class AppModel: ObservableObject {
                 guard self.selectedRevision == revision,
                       self.selectedChangedItem?.path == item.path else { return }
 
-                if diff.statusNotice == "目录变更" {
-                    self.fileDiffState = .directory(item.path)
-                } else if diff.isBinary {
-                    self.putCache(key: cacheKey, diff: diff)
-                    self.fileDiffState = .binary(path: item.path, size: nil)
-                } else {
-                    self.putCache(key: cacheKey, diff: diff)
-                    self.fileDiffState = .loaded(diff, isTruncated: diff.isTruncated)
-                }
+                self.putCache(key: cacheKey, diff: diff)
+                self.fileDiffState = .loaded(diff, isTruncated: diff.isTruncated)
             } catch {
                 guard !Task.isCancelled else { return }
                 guard self.selectedRevision == revision,
@@ -1163,12 +1142,12 @@ final class AppModel: ObservableObject {
         showAllDiffLines = false
         workingDiffTask?.cancel()
 
-        if status.isDirectory {
+        if status.isDirectory && !status.kind.isPendingChange {
             workingDiffState = .directory(status.path)
             return
         }
 
-        if FileIcon.isKnownBinaryExtension(status.path) {
+        if !status.kind.isPendingChange && FileIcon.isKnownBinaryExtension(status.path) {
             workingDiffState = .binary(path: status.path, size: nil)
             return
         }
@@ -1228,11 +1207,8 @@ final class AppModel: ObservableObject {
                 let d = try await self.diffCore(forPaths: [status.path])
                 guard !Task.isCancelled, self.selectedStatus?.path == status.path else { return }
                 if let first = d.first {
-                    if first.isBinary {
-                        self.workingDiffState = .binary(path: status.path, size: nil)
-                    } else {
-                        self.workingDiffState = .loaded(first, isTruncated: first.isTruncated)
-                    }
+                    let selected = d.first(where: { $0.path == status.path }) ?? first
+                    self.workingDiffState = .loaded(selected, isTruncated: selected.isTruncated)
                 } else {
                     let empty = FileDiff(
                         id: status.path,
@@ -1579,6 +1555,9 @@ extension AppModel {
             self.propertyFeedback = feedback
             self.statusText = feedback
             await self.refreshAfterWrite(path: self.workingCopyPath)
+            if let selected = self.selectedStatus, selected.path == path {
+                self.selectWorkingStatus(selected)
+            }
             do {
                 try await self.loadProperties(inspection)
             } catch {

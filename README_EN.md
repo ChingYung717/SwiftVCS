@@ -104,3 +104,7 @@ vcsctl mkdir ./wc docs/guides --parents
 ```
 
 Working-copy edits support custom properties and `svn:ignore`, `svn:eol-style`, `svn:keywords`, and `svn:mime-type`. Local property paths default to the working-copy root. Omit `--parents` to require an existing versioned parent. See [GUI and CLI integration](docs/FRONTEND_INTEGRATION.md).
+
+### Review SVN property changes
+
+The working-copy diff, commit history, and `vcsctl diff` / `vcsctl show` display each changed direct node property with its old and new values. Empty and absent values are distinct, and binary values show their byte counts. Property review also works for directories and binary files.

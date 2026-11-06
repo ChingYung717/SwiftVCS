@@ -337,7 +337,21 @@ public enum SideBySide {
     }
 }
 
-/// 单个文件的差异
+/// 节点直接属性的前后值。nil 表示该侧不存在，空 Data 表示已设置空值。
+public struct PropertyChange: Sendable, Hashable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let oldValue: Data?
+    public let newValue: Data?
+
+    public init(name: String, oldValue: Data?, newValue: Data?) {
+        self.name = name
+        self.oldValue = oldValue
+        self.newValue = newValue
+    }
+}
+
+/// 单个节点的差异
 public struct FileDiff: Sendable, Hashable, Identifiable {
     public struct Hunk: Sendable, Hashable, Identifiable {
         public struct Line: Sendable, Hashable, Identifiable {
@@ -436,6 +450,7 @@ public struct FileDiff: Sendable, Hashable, Identifiable {
     public let isBinary: Bool
     /// 旧内容为空表示「新增」，新内容为空表示「删除」
     public let hunks: [Hunk]
+    public let propertyChanges: [PropertyChange]
     /// 是否因超出字节上限而被截断
     public let isTruncated: Bool
     /// 特殊状态提示说明（如二进制占位、复制来源未改动、目录等）
@@ -457,13 +472,15 @@ public struct FileDiff: Sendable, Hashable, Identifiable {
         isBinary: Bool,
         hunks: [Hunk],
         isTruncated: Bool = false,
-        statusNotice: String? = nil
+        statusNotice: String? = nil,
+        propertyChanges: [PropertyChange] = []
     ) {
         self.id = id
         self.path = path
         self.localPath = localPath
         self.isBinary = isBinary
         self.hunks = hunks
+        self.propertyChanges = propertyChanges
         self.isTruncated = isTruncated
         self.statusNotice = statusNotice
     }

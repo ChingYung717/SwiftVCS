@@ -2345,6 +2345,91 @@ int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
     return finish_wc_operation(ctx, err, pool);
 }
 
+typedef struct {
+    const char *url;
+    svn_revnum_t revision;
+    apr_pool_t *pool;
+} wc_base_report;
+
+static svn_error_t *report_base_path(void *baton, const char *path, svn_revnum_t revision,
+                                      svn_depth_t depth, svn_boolean_t empty,
+                                      const char *lock_token, apr_pool_t *pool)
+{
+    wc_base_report *base = baton;
+    if (!*path && !empty) base->revision = revision;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *report_base_link(void *baton, const char *path, const char *url,
+                                      svn_revnum_t revision, svn_depth_t depth,
+                                      svn_boolean_t empty, const char *lock_token, apr_pool_t *pool)
+{
+    wc_base_report *base = baton;
+    if (!*path && !empty) {
+        base->url = apr_pstrdup(base->pool, url);
+        base->revision = revision;
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *report_base_delete(void *baton, const char *path, apr_pool_t *pool)
+{
+    wc_base_report *base = baton;
+    if (!*path) base->revision = SVN_INVALID_REVNUM;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *finish_base_report(void *baton, apr_pool_t *pool)
+{
+    return SVN_NO_ERROR;
+}
+
+int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int replaced,
+                              csvn_property **output, int *count)
+{
+    if (!ctx || !path || !output || !count) return -100;
+    *output = NULL;
+    *count = 0;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    if (pristine && replaced) {
+        // 更新报告读取隐藏在替换节点下的 BASE，关闭文件恢复且只收集元数据。
+        wc_base_report base = {NULL, SVN_INVALID_REVNUM, pool};
+        const svn_ra_reporter3_t reporter = {
+            report_base_path, report_base_delete, report_base_link,
+            finish_base_report, finish_base_report
+        };
+        svn_error_t *err = svn_client_url_from_path2(&base.url, path, ctx->client, pool, pool);
+        if (!err) err = svn_wc_crawl_revisions6(ctx->client->wc_ctx, path, &reporter, &base,
+                                               FALSE, svn_depth_empty, TRUE, FALSE, FALSE,
+                                               NULL, NULL, NULL, NULL, pool);
+        if (!err && (!base.url || !SVN_IS_VALID_REVNUM(base.revision)))
+            err = invalid_wc("无法确定替换前的节点及修订号");
+        svn_opt_revision_t rev = csvn_rev_number(base.revision);
+        apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
+        if (!err) err = svn_client_proplist4(base.url, &rev, &rev, svn_depth_empty, NULL, FALSE,
+                                             receive_properties, rows, ctx->client, pool);
+        if (!err) err = export_properties(output, count, rows);
+        return finish_wc_operation(ctx, err, pool);
+    }
+    apr_hash_t *properties = NULL;
+    svn_node_kind_t kind;
+    svn_error_t *err = svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, pristine, FALSE, pool);
+    if (!err && kind != svn_node_none && kind != svn_node_unknown) {
+        if (pristine)
+            err = svn_wc_get_pristine_props(&properties, ctx->client->wc_ctx, path, pool, pool);
+        else
+            err = svn_wc_prop_list2(&properties, ctx->client->wc_ctx, path, pool, pool);
+    }
+    if (!err && properties) {
+        apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
+        collect_properties(rows, properties, NULL, pool);
+        err = export_properties(output, count, rows);
+    }
+    return finish_wc_operation(ctx, err, pool);
+}
+
 static svn_boolean_t editable_property(const char *name)
 {
     if (!svn_prop_name_is_valid(name) || svn_property_kind2(name) != svn_prop_regular_kind)
