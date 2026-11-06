@@ -188,6 +188,21 @@ swift run SwiftVCSChecks
 
 To consume `CSVNKit` from another Swift package, install the Homebrew dependencies and source `scripts/svn_build_env.sh` from a SwiftVCS checkout before building the consumer. SwiftPM uses the exported `PKG_CONFIG_PATH` to find the native libraries.
 
+## 工作副本协作 / Working copy collaboration
+
+在「更改」页开启「含正常项」，右键已纳管文件即可删除、改名、移动或保留历史复制。更新后的文本冲突可采用当前文件、基线、传入版本或冲突前本地版本。工作副本菜单支持同仓库的指定修订合并，先预演再应用。文件操作和合并结果由用户审核后提交。
+
+In Changes, enable normal entries to access delete, rename, move and history-preserving copy. Resolve text conflicts from the file menu. Preview and apply a same-repository revision merge from the working copy menu, then review and commit its files and merge metadata.
+
+```bash
+vcsctl rename /path/to/wc src/old.swift new.swift
+vcsctl copy /path/to/wc src/new.swift src/example.swift
+vcsctl resolve /path/to/wc src/example.swift --strategy current
+vcsctl merge /path/to/wc --source https://svn.example.com/repo/branches/feature --revision 42 --dry-run
+```
+
+[界面与 CLI 集成 / GUI and CLI integration](docs/FRONTEND_INTEGRATION.md)
+
 ## 开源协议与第三方声明 / License & Third-Party Notices
 
 - **SwiftVCS 源码协议 / Source License**：本项目源代码采用 **[MIT License](./LICENSE)** 开源。

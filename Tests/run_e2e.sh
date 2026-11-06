@@ -43,7 +43,7 @@ check() {  # check <描述> <期望包含> <实际输出>
 }
 
 echo "==> 准备本地仓库"
-rm -rf "$T"; mkdir -p "$T"
+mkdir -p "$T" || exit 1
 "$SVN_BIN/svnadmin" create "$T/repo"
 "$SVN_BIN/svn" co "file://$T/repo" "$T/wc" >/dev/null
 cd "$T/wc"
@@ -188,3 +188,4 @@ echo "================================"
 echo "  通过 $PASS 项，失败 $FAIL 项"
 echo "================================"
 [ "$FAIL" -eq 0 ] || exit 1
+python3 "$HERE/run_p0.py" "$VCSCTL" "$SVN_BIN"

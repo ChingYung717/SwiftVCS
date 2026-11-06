@@ -15,6 +15,10 @@ struct WorkingDiffView: View {
                 }
             ) {
                 HStack(spacing: 6) {
+                    if status.kind == .conflicted {
+                        ConflictActions(status: status)
+                    }
+
                     if status.kind == .unversioned {
                         Button {
                             model.add(status)

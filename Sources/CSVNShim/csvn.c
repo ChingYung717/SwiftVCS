@@ -40,6 +40,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 struct csvn_ctx {
     apr_pool_t *pool;
@@ -794,8 +796,40 @@ int csvn_update(csvn_ctx *ctx,
 /* 5. 状态                                                              */
 /* ------------------------------------------------------------------ */
 
+static const svn_client_conflict_option_id_t text_options[] = {
+    svn_client_conflict_option_merged_text, svn_client_conflict_option_base_text,
+    svn_client_conflict_option_incoming_text, svn_client_conflict_option_working_text
+};
+
+static svn_error_t *conflict_info(svn_client_conflict_t **conflict, unsigned int *kinds,
+                                  unsigned int *resolutions, const char *path,
+                                  svn_client_ctx_t *client, apr_pool_t *pool)
+{
+    svn_boolean_t text, tree;
+    apr_array_header_t *props, *options;
+    *kinds = *resolutions = 0;
+    SVN_ERR(svn_client_conflict_get(conflict, path, client, pool, pool));
+    SVN_ERR(svn_client_conflict_get_conflicted(&text, &props, &tree, *conflict, pool, pool));
+    if (tree) *kinds |= 4;
+    if (props->nelts) *kinds |= 2;
+    if (!text) return SVN_NO_ERROR;
+    const char *mime = svn_client_conflict_text_get_mime_type(*conflict);
+    *kinds |= mime && svn_mime_type_is_binary(mime) ? 8 : 1;
+    if (*kinds != 1) return SVN_NO_ERROR;
+    SVN_ERR(svn_client_conflict_text_get_resolution_options(&options, *conflict, client, pool, pool));
+    for (int i = 0; i < options->nelts; ++i) {
+        svn_client_conflict_option_t *option = APR_ARRAY_IDX(options, i, svn_client_conflict_option_t *);
+        for (unsigned int j = 0; j < sizeof(text_options) / sizeof(*text_options); ++j) {
+            if (svn_client_conflict_option_get_id(option) == text_options[j])
+                *resolutions |= 1u << j;
+        }
+    }
+    return SVN_NO_ERROR;
+}
+
 typedef struct {
     csvn_status_item *items;
+    svn_client_ctx_t *client;
     int count;
     int cap;
 } status_baton;
@@ -830,8 +864,6 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
     csvn_status_item *s;
     enum svn_wc_status_kind kind;
 
-    (void)scratch_pool;
-
     if (sb->count == sb->cap) {
         int ncap = sb->cap ? sb->cap * 2 : 64;
         csvn_status_item *n = (csvn_status_item *)realloc(sb->items,
@@ -843,6 +875,8 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
     s = &sb->items[sb->count++];
     memset(s, 0, sizeof(*s));
 
+    if (path && strlen(path) >= sizeof(s->path))
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "状态路径超出支持长度");
     csvn_copy_str(s->path, sizeof(s->path), path ? path : "");
     {
         const char *base = path ? strrchr(path, '/') : NULL;
@@ -859,6 +893,41 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
     s->base_revision = (int)status->revision;
     s->working_revision = (int)status->changed_rev;
     s->is_directory = (status->kind == svn_node_dir);
+    if ((status->moved_from_abspath && strlen(status->moved_from_abspath) >= sizeof(s->moved_from)) ||
+        (status->moved_to_abspath && strlen(status->moved_to_abspath) >= sizeof(s->moved_to)))
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "移动路径超出支持长度");
+    csvn_copy_str(s->moved_from, sizeof(s->moved_from), status->moved_from_abspath);
+    csvn_copy_str(s->moved_to, sizeof(s->moved_to), status->moved_to_abspath);
+    if (status->moved_from_abspath && status->kind == svn_node_file) {
+        svn_boolean_t modified = FALSE;
+        svn_error_t *err = svn_wc_text_modified_p2(&modified, sb->client->wc_ctx,
+                                                      status->local_abspath, FALSE, scratch_pool);
+        s->moved_destination_modified = err != NULL || modified || status->conflicted ||
+            status->prop_status == svn_wc_status_modified;
+        svn_error_clear(err);
+    }
+    if (status->conflicted) {
+        svn_client_conflict_t *conflict;
+        svn_error_t *err = conflict_info(&conflict, &s->conflict_kinds, &s->resolutions,
+                                         status->local_abspath, sb->client, scratch_pool);
+        if (err) {
+            svn_error_clear(err);
+            s->conflict_kinds = 16;
+            s->resolutions = 0;
+        }
+    }
+    if (status->versioned && status->prop_status == svn_wc_status_modified) {
+        apr_hash_t *pristine;
+        const svn_string_t *working;
+        SVN_ERR(svn_wc_get_pristine_props(&pristine, sb->client->wc_ctx, status->local_abspath,
+                                           scratch_pool, scratch_pool));
+        SVN_ERR(svn_wc_prop_get2(&working, sb->client->wc_ctx, status->local_abspath,
+                                  SVN_PROP_MERGEINFO, scratch_pool, scratch_pool));
+        const svn_string_t *base = pristine ? apr_hash_get(pristine, SVN_PROP_MERGEINFO,
+                                                          APR_HASH_KEY_STRING) : NULL;
+        s->mergeinfo_changed = working && base ? !svn_string_compare(working, base)
+                                              : working != base;
+    }
     if (status->lock && status->lock->owner)
         csvn_copy_str(s->lock_owner, sizeof(s->lock_owner), status->lock->owner);
     return SVN_NO_ERROR;
@@ -883,6 +952,7 @@ int csvn_status(csvn_ctx *ctx,
     scratch = svn_pool_create(ctx->pool);
     canon_path = csvn_canon_dirent(path, scratch);
     memset(&sb, 0, sizeof(sb));
+    sb.client = ctx->client;
 
     peg = csvn_rev_kind(svn_opt_revision_base);
     err = svn_client_status6(&rev, ctx->client, canon_path, &peg,
@@ -1224,6 +1294,7 @@ int csvn_commit(csvn_ctx *ctx,
                 const char *const *targets,
                 int target_count,
                 const char *message,
+                int exact,
                 int *out_revision,
                 int *out_committed_count)
 {
@@ -1252,7 +1323,7 @@ int csvn_commit(csvn_ctx *ctx,
     ctx->client->log_msg_func3 = log_msg_cb;
     ctx->client->log_msg_baton3 = &baton;
 
-    err = svn_client_commit6(arr, svn_depth_infinity,
+    err = svn_client_commit6(arr, exact ? svn_depth_empty : svn_depth_infinity,
                               FALSE /* keep_locks */,
                               FALSE /* keep_changelists */,
                               FALSE /* commit_as_operations */,
@@ -1287,7 +1358,7 @@ int csvn_commit(csvn_ctx *ctx,
 
 int csvn_revert(csvn_ctx *ctx,
                 const char *const *paths,
-                int path_count)
+                int path_count, int exact)
 {
     svn_error_t *err;
     apr_pool_t *scratch;
@@ -1304,7 +1375,7 @@ int csvn_revert(csvn_ctx *ctx,
         APR_ARRAY_PUSH(arr, const char *) = csvn_canon_dirent(paths[i], scratch);
     }
 
-    err = svn_client_revert2(arr, svn_depth_infinity, NULL, ctx->client, scratch);
+    err = svn_client_revert2(arr, exact ? svn_depth_empty : svn_depth_infinity, NULL, ctx->client, scratch);
 
     if (err) {
         int rc = csvn_classify(ctx, err);
@@ -1703,4 +1774,331 @@ void csvn_free_string_array(char **arr, int count)
     if (!arr) return;
     for (i = 0; i < count; i++) free(arr[i]);
     free(arr);
+}
+
+/* ---- 工作副本写操作 ---- */
+
+static svn_error_t *invalid_wc(const char *message)
+{
+    return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, message);
+}
+
+static svn_error_t *validate_root(const char **root, csvn_ctx *ctx, const char *path,
+                                  apr_pool_t *pool)
+{
+    const char *actual;
+    SVN_ERR(svn_dirent_get_absolute(root, path, pool));
+    SVN_ERR(svn_client_get_wc_root(&actual, *root, ctx->client, pool, pool));
+    if (strcmp(*root, actual) != 0)
+        return invalid_wc("请选择实际的 SVN 工作副本根目录");
+    return SVN_NO_ERROR;
+}
+
+/* 逐段检查，避免相对路径穿越、管理目录及符号链接跳转。 */
+static svn_error_t *validate_file(const char **absolute, csvn_ctx *ctx, const char *root,
+                                  const char *relative, svn_boolean_t destination,
+                                  apr_pool_t *pool)
+{
+    const char *actual;
+    const char *path = root;
+    struct stat st;
+    const char *start = relative;
+    if (!relative || svn_path_is_url(relative) || strchr(relative, '\\'))
+        return invalid_wc("需要工作副本内的相对文件路径");
+    while (TRUE) {
+        const char *slash = strchr(start, '/');
+        size_t length = slash ? (size_t)(slash - start) : strlen(start);
+        const char *part = apr_pstrndup(pool, start, length);
+        if (!length || !strcmp(part, ".") || !strcmp(part, "..") || !strcasecmp(part, ".svn"))
+            return invalid_wc("路径包含不允许的目录");
+        path = svn_dirent_join(path, part, pool);
+        if (lstat(path, &st) != 0) {
+            if (!slash && destination && errno == ENOENT) break;
+            return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法访问工作副本中的路径");
+        }
+        if (S_ISLNK(st.st_mode)) return invalid_wc("此操作暂不支持符号链接");
+        if (!slash) {
+            if (destination) return invalid_wc("目标已存在，不会覆盖");
+            if (!S_ISREG(st.st_mode)) return invalid_wc("此操作仅支持普通文件");
+            break;
+        }
+        if (!S_ISDIR(st.st_mode)) return invalid_wc("父路径不是目录");
+        start = slash + 1;
+    }
+
+    const char *parent = svn_dirent_dirname(path, pool);
+    SVN_ERR(svn_client_get_wc_root(&actual, parent, ctx->client, pool, pool));
+    if (strcmp(actual, root) != 0) return invalid_wc("路径属于其他工作副本");
+
+    svn_node_kind_t kind;
+    SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, destination ? parent : path,
+                              FALSE, FALSE, pool));
+    if (kind != (destination ? svn_node_dir : svn_node_file))
+        return invalid_wc("文件或目标父目录未纳入版本控制");
+    if (destination) {
+        SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, TRUE, FALSE, pool));
+        if (kind != svn_node_none && kind != svn_node_unknown)
+            return invalid_wc("目标路径已有版本控制记录，不会覆盖");
+    }
+    *absolute = path;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *ordinary_file_status(void *baton, const char *path,
+                                         const svn_client_status_t *status, apr_pool_t *pool)
+{
+    if (status->file_external || status->switched || status->conflicted)
+        return invalid_wc("此操作暂不支持外部文件、已切换文件或冲突文件");
+    if (baton && status->node_status != svn_wc_status_normal)
+        return invalid_wc("文件含本地改动，无法安全删除");
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *validate_ordinary_file(csvn_ctx *ctx, const char *path,
+                                            svn_boolean_t deleting, apr_pool_t *pool)
+{
+    svn_opt_revision_t base = csvn_rev_kind(svn_opt_revision_base);
+    return svn_client_status6(NULL, ctx->client, path, &base, svn_depth_empty,
+                              TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, NULL,
+                              ordinary_file_status, deleting ? &deleting : NULL, pool);
+}
+
+static int finish_wc_operation(csvn_ctx *ctx, svn_error_t *err, apr_pool_t *pool)
+{
+    int rc = err ? csvn_classify(ctx, err) : 0;
+    svn_pool_destroy(pool);
+    apr_thread_mutex_unlock(ctx->mutex);
+    return rc;
+}
+
+int csvn_delete_files(csvn_ctx *ctx, const char *root_path, const char *const *paths, int count)
+{
+    if (!ctx || !root_path || !paths || count < 1) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *root;
+    svn_error_t *err = validate_root(&root, ctx, root_path, pool);
+    apr_array_header_t *targets = apr_array_make(pool, count, sizeof(const char *));
+    for (int i = 0; i < count && !err; ++i) {
+        const char *path;
+        err = validate_file(&path, ctx, root, paths[i], FALSE, pool);
+        if (!err) err = validate_ordinary_file(ctx, path, TRUE, pool);
+        if (!err) APR_ARRAY_PUSH(targets, const char *) = path;
+    }
+    if (!err) err = svn_client_delete4(targets, FALSE, FALSE, NULL, NULL, NULL, ctx->client, pool);
+    return finish_wc_operation(ctx, err, pool);
+}
+
+static int transfer_file(csvn_ctx *ctx, const char *root_path, const char *source,
+                         const char *destination, svn_boolean_t copy)
+{
+    if (!ctx || !root_path || !source || !destination) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *root, *from, *to;
+    svn_error_t *err = validate_root(&root, ctx, root_path, pool);
+    if (!err) err = validate_file(&from, ctx, root, source, FALSE, pool);
+    if (!err) err = validate_ordinary_file(ctx, from, FALSE, pool);
+    if (!err) err = validate_file(&to, ctx, root, destination, TRUE, pool);
+    if (!err && copy) {
+        svn_opt_revision_t working = csvn_rev_kind(svn_opt_revision_working);
+        svn_client_copy_source_t item = {from, &working, &working};
+        apr_array_header_t *sources = apr_array_make(pool, 1, sizeof(svn_client_copy_source_t *));
+        APR_ARRAY_PUSH(sources, svn_client_copy_source_t *) = &item;
+        err = svn_client_copy7(sources, to, FALSE, FALSE, TRUE, FALSE, FALSE,
+                               NULL, NULL, NULL, NULL, ctx->client, pool);
+    } else if (!err) {
+        apr_array_header_t *sources = apr_array_make(pool, 1, sizeof(const char *));
+        APR_ARRAY_PUSH(sources, const char *) = from;
+        err = svn_client_move7(sources, to, FALSE, FALSE, FALSE, FALSE,
+                               NULL, NULL, NULL, ctx->client, pool);
+    }
+    return finish_wc_operation(ctx, err, pool);
+}
+
+int csvn_move_file(csvn_ctx *ctx, const char *root, const char *source, const char *destination)
+{
+    return transfer_file(ctx, root, source, destination, FALSE);
+}
+
+int csvn_copy_file(csvn_ctx *ctx, const char *root, const char *source, const char *destination)
+{
+    return transfer_file(ctx, root, source, destination, TRUE);
+}
+
+int csvn_resolve_text(csvn_ctx *ctx, const char *root_path, const char *path, int strategy)
+{
+    if (!ctx || !root_path || !path || strategy < 0 || strategy > 3) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *root, *absolute;
+    svn_client_conflict_t *conflict;
+    unsigned int kinds, resolutions;
+    svn_error_t *err = validate_root(&root, ctx, root_path, pool);
+    if (!err) err = validate_file(&absolute, ctx, root, path, FALSE, pool);
+    if (!err) {
+        const char *wc_url;
+        err = svn_client_url_from_path2(&wc_url, absolute, ctx->client, pool, pool);
+        if (!err && !wc_url) err = invalid_wc("冲突路径未纳入版本控制");
+    }
+    if (!err) err = conflict_info(&conflict, &kinds, &resolutions, absolute, ctx->client, pool);
+    if (!err && (kinds != 1 || !(resolutions & (1u << strategy))))
+        err = invalid_wc("该路径没有可用此策略处理的纯文本冲突");
+    if (!err) err = svn_client_conflict_text_resolve_by_id(conflict, text_options[strategy],
+                                                            ctx->client, pool);
+    if (!err) err = conflict_info(&conflict, &kinds, &resolutions, absolute, ctx->client, pool);
+    if (!err && kinds) err = invalid_wc("操作已执行，该路径仍有未解决冲突，请刷新状态");
+    return finish_wc_operation(ctx, err, pool);
+}
+
+typedef struct {
+    svn_client_ctx_t *client;
+    svn_revnum_t revision;
+} merge_preflight;
+
+static svn_error_t *validate_merge_status(void *baton, const char *path,
+                                          const svn_client_status_t *status, apr_pool_t *pool)
+{
+    merge_preflight *state = baton;
+    if (status->node_status == svn_wc_status_ignored) return SVN_NO_ERROR;
+    if (status->conflicted || status->node_status != svn_wc_status_normal ||
+        status->switched || status->file_external || status->wc_is_locked)
+        return invalid_wc("合并需要干净、未切换且无外部工作副本的目标");
+    if (!SVN_IS_VALID_REVNUM(state->revision)) state->revision = status->revision;
+    if (state->revision != status->revision)
+        return invalid_wc("目标包含混合修订，请先更新工作副本");
+    if (status->kind == svn_node_dir) {
+        const svn_string_t *externals;
+        if (status->depth != svn_depth_infinity)
+            return invalid_wc("此操作暂不支持稀疏工作副本");
+        SVN_ERR(svn_wc_prop_get2(&externals, state->client->wc_ctx, status->local_abspath,
+                                  SVN_PROP_EXTERNALS, pool, pool));
+        if (externals && externals->len)
+            return invalid_wc("此操作暂不支持含 externals 的工作副本");
+    }
+    return SVN_NO_ERROR;
+}
+
+typedef struct {
+    apr_hash_t *changed;
+    apr_hash_t *conflicts;
+    apr_hash_t *skipped;
+    apr_pool_t *pool;
+    const char *root;
+} merge_notifications;
+
+static void merge_notify(void *baton, const svn_wc_notify_t *notify, apr_pool_t *pool)
+{
+    merge_notifications *notes = baton;
+    if (!notify->path) return;
+    const char *relative = svn_dirent_skip_ancestor(notes->root, notify->path);
+    if (!relative) return;
+    const char *key = *relative ? relative : ".";
+    if (notify->content_state == svn_wc_notify_state_conflicted ||
+        notify->prop_state == svn_wc_notify_state_conflicted ||
+        notify->action == svn_wc_notify_tree_conflict)
+        apr_hash_set(notes->conflicts, apr_pstrdup(notes->pool, key), APR_HASH_KEY_STRING, "1");
+
+    apr_hash_t *table;
+    switch (notify->action) {
+    case svn_wc_notify_skip:
+    case svn_wc_notify_skip_conflicted:
+    case svn_wc_notify_update_skip_obstruction:
+    case svn_wc_notify_update_skip_working_only:
+    case svn_wc_notify_update_skip_access_denied:
+        table = notes->skipped;
+        break;
+    case svn_wc_notify_update_update:
+        if (notify->content_state != svn_wc_notify_state_changed &&
+            notify->content_state != svn_wc_notify_state_merged &&
+            notify->prop_state != svn_wc_notify_state_changed &&
+            notify->prop_state != svn_wc_notify_state_merged) return;
+        table = notes->changed;
+        break;
+    case svn_wc_notify_add:
+    case svn_wc_notify_delete:
+    case svn_wc_notify_update_add:
+    case svn_wc_notify_update_delete:
+    case svn_wc_notify_update_replace:
+    case svn_wc_notify_merge_record_info:
+    case svn_wc_notify_merge_elide_info:
+        table = notes->changed;
+        break;
+    default:
+        return;
+    }
+    apr_hash_set(table, apr_pstrdup(notes->pool, key), APR_HASH_KEY_STRING, "1");
+}
+
+static svn_error_t *copy_merge_paths(char ***output, int *count, apr_hash_t *paths, apr_pool_t *pool)
+{
+    unsigned int size = apr_hash_count(paths);
+    if (!size) return SVN_NO_ERROR;
+    *output = calloc(size, sizeof(**output));
+    if (!*output) return svn_error_create(APR_ENOMEM, NULL, "无法分配合并结果");
+    for (apr_hash_index_t *i = apr_hash_first(pool, paths); i; i = apr_hash_next(i)) {
+        const void *key;
+        apr_hash_this(i, &key, NULL, NULL);
+        (*output)[*count] = strdup(key);
+        if (!(*output)[*count]) return svn_error_create(APR_ENOMEM, NULL, "无法分配合并路径");
+        ++*count;
+    }
+    return SVN_NO_ERROR;
+}
+
+int csvn_merge_range(csvn_ctx *ctx, const char *root_path, const char *source, int from,
+                     int to, int peg, int dry_run, csvn_merge_result *result)
+{
+    if (!ctx || !root_path || !source || !result || from < 0 || to <= from || peg < 1) return -100;
+    memset(result, 0, sizeof(*result));
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *root, *repo_root, *uuid, *source_uuid;
+    svn_error_t *err = validate_root(&root, ctx, root_path, pool);
+    svn_opt_revision_t base = csvn_rev_kind(svn_opt_revision_base);
+    merge_preflight state = {ctx->client, SVN_INVALID_REVNUM};
+    if (!err) err = svn_client_status6(NULL, ctx->client, root, &base, svn_depth_infinity,
+                                       TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, NULL,
+                                       validate_merge_status, &state, pool);
+    if (!err) err = svn_client_get_repos_root(&repo_root, &uuid, root, ctx->client, pool, pool);
+    const char *url = csvn_canon_url(source, pool);
+    if (!err && !svn_uri_skip_ancestor(repo_root, url, pool))
+        err = invalid_wc("合并源必须属于工作副本所在的仓库");
+    if (!err) err = svn_client_get_repos_root(NULL, &source_uuid, url, ctx->client, pool, pool);
+    if (!err && (!source_uuid || !uuid || strcmp(uuid, source_uuid) != 0))
+        err = invalid_wc("合并源仓库 UUID 不匹配");
+
+    if (!err) {
+        svn_opt_revision_range_t range = {csvn_rev_number(from), csvn_rev_number(to)};
+        svn_opt_revision_t source_peg = csvn_rev_number(peg);
+        apr_array_header_t *ranges = apr_array_make(pool, 1, sizeof(svn_opt_revision_range_t *));
+        APR_ARRAY_PUSH(ranges, svn_opt_revision_range_t *) = &range;
+        merge_notifications notes = {apr_hash_make(pool), apr_hash_make(pool), apr_hash_make(pool),
+                                     pool, root};
+        svn_wc_notify_func2_t previous_func = ctx->client->notify_func2;
+        void *previous_baton = ctx->client->notify_baton2;
+        ctx->client->notify_func2 = merge_notify;
+        ctx->client->notify_baton2 = &notes;
+        result->started = 1;
+        err = svn_client_merge_peg5(url, ranges, &source_peg, root, svn_depth_infinity,
+                                    FALSE, FALSE, FALSE, FALSE, dry_run, FALSE,
+                                    NULL, ctx->client, pool);
+        ctx->client->notify_func2 = previous_func;
+        ctx->client->notify_baton2 = previous_baton;
+        if (!err) err = copy_merge_paths(&result->changed, &result->changed_count, notes.changed, pool);
+        if (!err) err = copy_merge_paths(&result->conflicts, &result->conflict_count, notes.conflicts, pool);
+        if (!err) err = copy_merge_paths(&result->skipped, &result->skipped_count, notes.skipped, pool);
+    }
+    return finish_wc_operation(ctx, err, pool);
+}
+
+void csvn_free_merge_result(csvn_merge_result *result)
+{
+    csvn_free_string_array(result->changed, result->changed_count);
+    csvn_free_string_array(result->conflicts, result->conflict_count);
+    csvn_free_string_array(result->skipped, result->skipped_count);
 }

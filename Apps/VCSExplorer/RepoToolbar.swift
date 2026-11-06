@@ -338,6 +338,12 @@ struct RepoToolbar: View {
                     model.showWorkspacePopover = false
                     model.update()
                 }
+                PopoverActionRow(icon: "arrow.triangle.merge", title: "合并指定修订…") {
+                    model.showWorkspacePopover = false
+                    model.requestWorkspaceOperation(.merge)
+                }
+                .disabled(model.isBusy)
+                .help("先预演，再应用到当前工作副本")
                 PopoverActionRow(icon: "folder.badge.minus", iconColor: .red, title: "移除本地工作副本关联", isDestructive: true) {
                     model.showWorkspacePopover = false
                     model.clearWorkingCopy()

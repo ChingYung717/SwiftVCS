@@ -10,12 +10,17 @@ struct Args {
         "user", "password",
         "trust-bundle",
         "revision", "r",
-        "limit",
+        "limit", "source", "from", "to", "peg", "strategy",
         "ca", "fetch-cert", "fingerprint", "server",
     ]
 
     var positional: [String] = []
     var flags: [String: String] = [:]
+    var duplicates: Set<String> = []
+
+    private mutating func setFlag(_ key: String, _ value: String) {
+        if flags.updateValue(value, forKey: key) != nil { duplicates.insert(key) }
+    }
 
     init(_ argv: [String]) {
         var i = 0
@@ -31,21 +36,24 @@ struct Args {
                 if let eqIdx = rawKey.firstIndex(of: "=") {
                     let key = String(rawKey[..<eqIdx])
                     let val = String(rawKey[rawKey.index(after: eqIdx)...])
-                    flags[key] = val
+                    setFlag(key, val)
                     i += 1
                 } else if Self.valueTakingKeys.contains(rawKey) {
                     if i + 1 < argv.count {
-                        flags[rawKey] = argv[i + 1]
+                        setFlag(rawKey, argv[i + 1])
                         i += 2
                     } else {
-                        flags[rawKey] = ""
+                        setFlag(rawKey, "")
                         i += 1
                     }
+                } else if rawKey == "dry-run" || rawKey == "exact" {
+                    setFlag(rawKey, "true")
+                    i += 1
                 } else if i + 1 < argv.count, !argv[i + 1].hasPrefix("-") {
-                    flags[rawKey] = argv[i + 1]
+                    setFlag(rawKey, argv[i + 1])
                     i += 2
                 } else {
-                    flags[rawKey] = "true"
+                    setFlag(rawKey, "true")
                     i += 1
                 }
             } else {
@@ -139,6 +147,14 @@ guard let command = rawArgs.first else {
       vcsctl revert    <工作副本目录> [路径...]      回滚本地改动
       vcsctl log       <工作副本目录|URL> [路径]     查看提交日志
       vcsctl show      <仓库URL> <修订号> [路径]     查看某次修订的变更文件与差异
+      vcsctl delete    <工作副本> <路径> [路径...]    标记删除，待提交
+      vcsctl move      <工作副本> <源> <目标>         移动文件，待提交
+      vcsctl rename    <工作副本> <源> <新文件名>     同目录改名，待提交
+      vcsctl copy      <工作副本> <源> <目标>         保留来源历史复制，待提交
+      vcsctl resolve   <工作副本> <路径> --strategy current|base|incoming|local
+      vcsctl merge     <工作副本> --source <URL> --revision N [--peg N] [--dry-run]
+      vcsctl merge     <工作副本> --source <URL> --from A --to B [--peg N] [--dry-run]
+      commit --exact   仅提交明确列出的路径，目录只提交自身
 
     通用选项:
       --user <用户名>  --password <口令>  --revision <修订号>  --limit <条数>
@@ -246,7 +262,11 @@ do {
         } else {
             out("状态  修订   路径")
             for s in changed.sorted(by: { $0.path < $1.path }) {
-                out("\(s.kind.displayName.padding(toLength: 4, withPad: " ", startingAt: 0))  r\(s.baseRevision)  \(s.path)")
+                let details = s.conflictKinds.map(\.displayName).sorted().joined(separator: "、")
+                let conflict = details.isEmpty ? "" : " [\(details)冲突]"
+                let moved = s.movedTo.map { " → \($0)" } ?? s.movedFrom.map { " ← \($0)" } ?? ""
+                let mergeInfo = s.mergeInfoChanged ? " [svn:mergeinfo]" : ""
+                out("\(s.kind.displayName.padding(toLength: 4, withPad: " ", startingAt: 0))  r\(s.baseRevision)  \(s.path)\(moved)\(conflict)\(mergeInfo)")
             }
         }
         if args.bool("all") {
@@ -294,7 +314,10 @@ do {
         guard let message = args.string("m") ?? args.string("message"), !message.isEmpty else { die("需要 -m \"提交说明\"") }
         let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
-        let r = try await client.commit(workingCopy: URL(fileURLWithPath: wc), paths: paths, message: message, progress: nil)
+        let workingCopy = URL(fileURLWithPath: wc)
+        let r = try await (args.bool("exact")
+            ? client.commitSelection(workingCopy: workingCopy, paths: paths, message: message)
+            : client.commit(workingCopy: workingCopy, paths: paths, message: message, progress: nil))
         if r.revision > 0 {
             out("已提交 r\(r.revision)，共 \(r.committedCount) 个条目。")
         } else {
@@ -307,6 +330,85 @@ do {
         let paths = Array(args.positional.dropFirst())
         let n = try await client.revert(workingCopy: URL(fileURLWithPath: wc), paths: paths)
         out("已回滚 \(n) 个路径。")
+
+    case "delete", "move", "rename", "copy", "resolve", "merge":
+        let common: Set<String> = ["user", "password", "trust-bundle", "ca", "server"]
+        let specific: Set<String>
+        switch command {
+        case "merge": specific = ["source", "revision", "r", "from", "to", "peg", "dry-run"]
+        case "resolve": specific = ["strategy"]
+        default: specific = []
+        }
+        guard args.duplicates.isEmpty, Set(args.flags.keys).isSubset(of: common.union(specific)),
+              args.flags.values.allSatisfy({ !$0.isEmpty }) else {
+            die("存在重复、未知或缺值的选项")
+        }
+        let count = args.positional.count
+        guard let wc = args.positional.first,
+              command == "delete" ? count >= 2 :
+              command == "merge" ? count == 1 :
+              command == "resolve" ? count == 2 : count == 3 else {
+            die("工作副本或文件参数数量不正确，请查看命令帮助")
+        }
+        let workingCopy = URL(fileURLWithPath: wc)
+        let client = try await makeClient(args, workingCopyPath: wc)
+        switch command {
+        case "delete":
+            let paths = try await client.delete(workingCopy: workingCopy, paths: Array(args.positional.dropFirst()))
+            out("已在工作副本标记删除，待提交：\(paths.joined(separator: ", "))")
+        case "move", "rename", "copy":
+            let source = args.positional[1]
+            let target = args.positional[2]
+            let destination: String
+            if command == "rename" {
+                guard !target.contains("/"), !target.contains("\\") else { die("改名只接受同目录的新文件名") }
+                destination = (source.split(separator: "/", omittingEmptySubsequences: false)
+                    .dropLast().map(String.init) + [target]).joined(separator: "/")
+            } else {
+                destination = target
+            }
+            if command == "copy" {
+                _ = try await client.copy(workingCopy: workingCopy, source: source, destination: destination)
+            } else {
+                _ = try await client.move(workingCopy: workingCopy, source: source, destination: destination)
+            }
+            out("工作副本待提交：\(source) → \(destination)")
+        case "resolve":
+            guard let value = args.string("strategy"), let strategy = ConflictResolution(rawValue: value) else {
+                die("请选择 current、base、incoming 或 local")
+            }
+            try await client.resolve(workingCopy: workingCopy, path: args.positional[1], strategy: strategy)
+            out("已解决工作副本中的文本冲突")
+        default:
+            guard let source = args.string("source"),
+                  args.string("dry-run").map({ $0 == "true" || $0 == "false" }) ?? true else {
+                die("需要 --source URL，--dry-run 为布尔选项")
+            }
+            let url = requireURL(source)
+            let peg = args.int("peg")
+            if args.string("peg") != nil && peg == nil { die("无效的 peg 修订") }
+            let request: MergeRequest
+            if let raw = args.string("revision") ?? args.string("r") {
+                guard !(args.string("revision") != nil && args.string("r") != nil),
+                      args.string("from") == nil, args.string("to") == nil,
+                      let revision = Int(raw) else { die("请只指定一个有效的单修订或范围") }
+                request = try MergeRequest(source: url, revision: revision, peg: peg)
+            } else {
+                guard let from = args.int("from"), let to = args.int("to") else {
+                    die("需要 --revision N 或 --from A --to B")
+                }
+                request = try MergeRequest(source: url, from: from, to: to, peg: peg)
+            }
+            let result = try await client.merge(workingCopy: workingCopy, request: request, dryRun: args.bool("dry-run"))
+            out(result.dryRun ? "合并预演，工作副本未写入" : "合并已应用到工作副本，尚未提交")
+            for path in result.changedPaths { out("变更：\(path)") }
+            for path in result.conflictedPaths { out("冲突：\(path)") }
+            for path in result.skippedPaths { out("跳过：\(path)") }
+            if result.changedPaths.isEmpty && result.conflictedPaths.isEmpty &&
+                result.skippedPaths.isEmpty && !result.refreshRequired { out("没有可合并的变更。") }
+            if result.refreshRequired { out("合并已应用，读取实际状态失败，请刷新工作副本状态。") }
+            if !result.conflictedPaths.isEmpty { exit(2) }
+        }
 
     case "log":
         guard let target = args.positional.first else { die("需要工作副本目录或仓库 URL") }
