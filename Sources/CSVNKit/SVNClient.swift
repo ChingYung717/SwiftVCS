@@ -1378,13 +1378,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         throw VCSError.invalidArgument("写入目标必须在指定工作副本内")
     }
 
-    private func validateWriteTargets(_ targets: [String], root: String, recursiveRevert: Bool = false) throws {
+    private func validateWriteTargets(_ targets: [String], root: String,
+                                      recursiveRevert: Bool = false, adding: Bool = false) throws {
         let count = try Self.nativeInteger(targets.count, field: "目标数量", minimum: 1)
         var paths: [UnsafePointer<CChar>?] = targets.map { strdup($0).map { UnsafePointer($0) } }
         defer { paths.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
         guard !paths.contains(where: { $0 == nil }) else { throw VCSError.underlying("无法分配路径") }
         let h = try requireHandle()
-        try check(csvn_validate_write_targets(h, root, &paths, count, recursiveRevert ? 1 : 0))
+        try check(csvn_validate_write_targets(h, root, &paths, count, recursiveRevert ? 1 : 0, adding ? 1 : 0))
     }
 
     private func writeTargets(_ wc: URL, _ paths: [String], exact: Bool, committing: Bool) throws -> [String] {
@@ -1783,7 +1784,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let targets = paths.isEmpty ? [root] : try paths.map {
                 try self.writePath($0, root: root, originalRoot: workingCopy.standardizedFileURL.path)
             }
-            try self.validateWriteTargets(targets, root: root)
+            try self.validateWriteTargets(targets, root: root, adding: true)
             var cStrings: [UnsafeMutablePointer<CChar>] = []
             defer { for s in cStrings { free(s) } }
             cStrings = targets.map { strdup($0) }
