@@ -395,6 +395,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     @discardableResult
     public func checkout(path: String?, to destination: URL, revision: Int?) async throws -> URL {
+        let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
         let target = try url(for: path)
         return try await performWrite {
             let h = try self.requireHandle()
@@ -402,7 +403,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let dest = destination.path
             let rc = target.absoluteString.withCString { u in
                 dest.withCString { d in
-                    csvn_checkout(h, u, d, Int32(revision ?? 0), &rev)
+                    csvn_checkout(h, u, d, nativeRevision, &rev)
                 }
             }
             try self.check(rc)
@@ -417,7 +418,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         revision: Int?,
         progress: (@Sendable (VCSTaskProgress) -> Void)?
     ) async throws -> UpdateResult {
-        try await performWrite {
+        let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
+        return try await performWrite {
             let h = try self.requireHandle()
             let wc = workingCopy.path
             var rev: Int32 = 0
@@ -428,7 +430,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             var conflictCount: Int32 = 0
 
             let rc = wc.withCString { p in
-                csvn_update(h, p, Int32(revision ?? 0), &rev, &updated, &added, &deleted,
+                csvn_update(h, p, nativeRevision, &rev, &updated, &added, &deleted,
                             &conflicts, &conflictCount)
             }
             try self.check(rc)
@@ -738,6 +740,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         repoRootURL: URL? = nil,
         maxBytes: Int = 2 * 1024 * 1024
     ) async throws -> FileDiff {
+        let nativeRevision = try Self.nativeInteger(revision, field: "修订号", minimum: 1)
+        if let copyRevision = change.copyFromRevision {
+            _ = try Self.nativeInteger(copyRevision, field: "复制来源修订号")
+        }
+        guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
         if change.kind == .directory {
             let fallbackURL = (repoRootURL ?? self.rootURL ?? self.baseURL)
                 .map { Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
@@ -845,7 +852,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     var truncated: Int32 = 0
                     let rc = fromURL.absoluteString.withCString { u1 in
                         targetURL.absoluteString.withCString { u2 in
-                            csvn_diff_urls(h, u1, Int32(copyRev), u2, Int32(revision), maxBytes, &textPtr, &len, &truncated)
+                            csvn_diff_urls(h, u1, Int32(copyRev), u2, nativeRevision, maxBytes, &textPtr, &len, &truncated)
                         }
                     }
                     defer { if let textPtr { csvn_free_string(textPtr) } }
@@ -932,7 +939,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 var len: Int = 0
                 var truncated: Int32 = 0
                 let rc = targetURL.absoluteString.withCString { u in
-                    csvn_diff_revision(h, u, Int32(revision), maxBytes, &textPtr, &len, &truncated)
+                    csvn_diff_revision(h, u, nativeRevision, maxBytes, &textPtr, &len, &truncated)
                 }
                 defer { if let textPtr { csvn_free_string(textPtr) } }
                 try self.check(rc)
@@ -952,7 +959,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     var truncated2: Int32 = 0
                     let rc2 = fromURL.absoluteString.withCString { u1 in
                         targetURL.absoluteString.withCString { u2 in
-                            csvn_diff_urls(h, u1, Int32(copyRev), u2, Int32(revision), maxBytes, &textPtr2, &len2, &truncated2)
+                            csvn_diff_urls(h, u1, Int32(copyRev), u2, nativeRevision, maxBytes, &textPtr2, &len2, &truncated2)
                         }
                     }
                     defer { if let textPtr2 { csvn_free_string(textPtr2) } }
@@ -970,7 +977,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     var len2: Int = 0
                     var truncated2: Int32 = 0
                     let rc2 = targetURL.absoluteString.withCString { u in
-                        csvn_diff_urls(h, u, Int32(revision - 1), u, Int32(revision), maxBytes, &textPtr2, &len2, &truncated2)
+                        csvn_diff_urls(h, u, nativeRevision - 1, u, nativeRevision, maxBytes, &textPtr2, &len2, &truncated2)
                     }
                     defer { if let textPtr2 { csvn_free_string(textPtr2) } }
                     if rc2 == 0 {
@@ -987,7 +994,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 var len: Int = 0
                 var truncated: Int32 = 0
                 let rc = targetURL.absoluteString.withCString { u in
-                    csvn_diff_revision(h, u, Int32(revision), maxBytes, &textPtr, &len, &truncated)
+                    csvn_diff_revision(h, u, nativeRevision, maxBytes, &textPtr, &len, &truncated)
                 }
                 defer { if let textPtr { csvn_free_string(textPtr) } }
                 try self.check(rc)
@@ -1007,6 +1014,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         path: String? = nil,
         maxBytes: Int = 2 * 1024 * 1024
     ) async throws -> [FileDiff] {
+        _ = try Self.nativeInteger(revision, field: "修订号", minimum: 1)
+        guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
         let logTarget: URL = try await perform {
             let h = try self.requireHandle()
             return try self.resolveRootURLSync(handle: h, explicit: nil)
@@ -1251,10 +1260,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
             var rev: Int32 = 0
             var committed: Int32 = 0
+            let count = try Self.nativeInteger(cStrings.count, field: "目标数量", minimum: 1)
             let rc = cStrings.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) { p in
                     message.withCString { m in
-                        csvn_commit(h, p, Int32(buf.count), m, exact ? 1 : 0, &rev, &committed)
+                        csvn_commit(h, p, count, m, exact ? 1 : 0, &rev, &committed)
                     }
                 }
             }
@@ -1283,9 +1293,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             defer { for s in cStrings { free(s) } }
             cStrings = targets.map { strdup($0) }
 
+            let count = try Self.nativeInteger(cStrings.count, field: "目标数量", minimum: 1)
             let rc = cStrings.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) { p in
-                    csvn_revert(h, p, Int32(buf.count), exact ? 1 : 0)
+                    csvn_revert(h, p, count, exact ? 1 : 0)
                 }
             }
             try self.check(rc)
@@ -1480,10 +1491,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     private func propertyRevision(_ revision: Int?) throws -> Int32 {
         guard let revision else { return -1 }
-        guard revision >= 0, let value = Int32(exactly: revision) else {
-            throw VCSError.invalidArgument("修订号超出支持范围")
-        }
-        return value
+        return try Self.nativeInteger(revision, field: "修订号")
     }
 
     private func readProperties(at target: PropertyTarget, name: String?, revision: Int?,
@@ -1609,7 +1617,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         limit: Int,
         startRevision: Int?
     ) async throws -> [LogEntry] {
-        try await perform {
+        let nativeLimit = try Self.nativeInteger(limit, field: "日志数量")
+        let nativeStart = try Self.nativeInteger(startRevision ?? 0, field: "起始修订号")
+        return try await perform {
             let h = try self.requireHandle()
             var items: UnsafeMutablePointer<csvn_log_entry>? = nil
             var count: Int32 = 0
@@ -1633,7 +1643,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 target = path.map { self.localPath(workingCopy, $0) } ?? workingCopy.path
             }
             let rc: Int32 = target.withCString { p in
-                csvn_log(h, p, Int32(limit), Int32(startRevision ?? 0), &items, &count)
+                csvn_log(h, p, nativeLimit, nativeStart, &items, &count)
             }
             try self.check(rc)
             defer { csvn_free_log(items, count) }
@@ -1719,9 +1729,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             defer { for s in cStrings { free(s) } }
             cStrings = targets.map { strdup($0) }
 
+            let count = try Self.nativeInteger(cStrings.count, field: "目标数量", minimum: 1)
             let rc = cStrings.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) { p in
-                    csvn_add(h, p, Int32(buf.count))
+                    csvn_add(h, p, count)
                 }
             }
             try self.check(rc)
@@ -1731,13 +1742,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     /// 读取远端仓库中指定路径文件的内容（`svn cat`）。
     public func cat(path: String, revision: Int? = nil) async throws -> Data {
+        let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
         let target = try url(for: path)
         return try await perform {
             let h = try self.requireHandle()
             var buf: UnsafeMutablePointer<CChar>? = nil
             var len: Int = 0
             let rc = target.absoluteString.withCString { u in
-                csvn_cat(h, u, Int32(revision ?? 0), &buf, &len)
+                csvn_cat(h, u, nativeRevision, &buf, &len)
             }
             try self.check(rc)
             defer { if let buf { csvn_free_string(buf) } }
