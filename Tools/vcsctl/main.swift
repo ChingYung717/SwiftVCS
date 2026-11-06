@@ -263,6 +263,11 @@ guard let command = rawArgs.first else {
 let args = parseArgs(Array(rawArgs.dropFirst()))
 
 do {
+    for key in ["revision", "r", "limit", "from", "to", "peg"] where args.string(key) != nil {
+        guard let value = args.int(key), (0...Int(Int32.max)).contains(value) else {
+            throw VCSError.invalidArgument("--\(key) 需要 0...\(Int32.max) 范围内的整数")
+        }
+    }
     if command != "info" &&
         (args.string("fetch-cert") != nil || args.string("fingerprint") != nil) {
         throw VCSError.invalidArgument("--fetch-cert 和 --fingerprint 请用于 info")
@@ -546,7 +551,7 @@ do {
             pathFilter = args.positional.count > 2 ? args.positional[2] : nil
         }
         let cleanRevStr = (revRaw.hasPrefix("r") || revRaw.hasPrefix("R")) ? String(revRaw.dropFirst()) : revRaw
-        guard let rev = Int(cleanRevStr), rev > 0 else {
+        guard let rev = Int(cleanRevStr), (1...Int(Int32.max)).contains(rev) else {
             die("无效的修订号：\(revRaw)")
         }
 
