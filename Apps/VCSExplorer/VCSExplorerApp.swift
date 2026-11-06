@@ -11,13 +11,19 @@ struct VCSExplorerApp: App {
     init() {
         let args = CommandLine.arguments
         // --selftest <仓库URL> [工作副本路径]：走与界面完全相同的模型路径做端到端验证
-        if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
+        if let i = args.firstIndex(of: "--selftest") {
+            guard i + 1 < args.count, !args[i + 1].isEmpty, !args[i + 1].hasPrefix("--") else {
+                FileHandle.standardError.write(Data("需要 --selftest <仓库URL> [工作副本路径]\n".utf8))
+                exit(1)
+            }
             let url = args[i + 1]
             let wc = i + 2 < args.count ? args[i + 2] : ""
             Task { @MainActor in
-                let lines = await AppModel.selfTest(url: url, workingCopy: wc)
-                for l in lines { print(l) }
-                exit(0)
+                let checks = await AppModel.selfTest(url: url, workingCopy: wc)
+                for check in checks {
+                    print("\(check.passed ? "✅" : "❌") \(check.name)：\(check.detail)")
+                }
+                exit(checks.allSatisfy(\.passed) ? 0 : 1)
             }
         }
     }
@@ -1376,8 +1382,14 @@ final class AppModel: ObservableObject {
 
     // MARK: - 命令行自检（与界面共用同一条模型路径，兼容 Tests/run_e2e.sh）
 
-    static func selfTest(url: String, workingCopy: String) async -> [String] {
-        var lines: [String] = []
+    struct SelfTestCheck {
+        let name: String
+        let passed: Bool
+        let detail: String
+    }
+
+    static func selfTest(url: String, workingCopy: String) async -> [SelfTestCheck] {
+        var checks: [SelfTestCheck] = []
         let m = AppModel()
         m.isSelfTest = true
         m.repoURLString = url
@@ -1385,9 +1397,10 @@ final class AppModel: ObservableObject {
 
         func step(_ name: String, _ body: () async throws -> String) async {
             do {
-                lines.append("✅ \(name)：\(try await body())")
+                let detail = try await body()
+                checks.append(SelfTestCheck(name: name, passed: true, detail: detail))
             } catch {
-                lines.append("❌ \(name)：\(error)")
+                checks.append(SelfTestCheck(name: name, passed: false, detail: String(describing: error)))
             }
         }
 
@@ -1474,7 +1487,7 @@ final class AppModel: ObservableObject {
             return "2 删 3 增 + 1 上下文 → \(rows.count) 行并排配对通过"
         }
 
-        return lines
+        return checks
     }
 }
 

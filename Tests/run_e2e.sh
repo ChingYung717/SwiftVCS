@@ -184,7 +184,27 @@ check "日志包含以 - 开头的提交说明" "\\-fix: 支持短横线开头�
 "$SVN_BIN/svn" up "$T/wc2" >/dev/null
 
 echo "==> 图形界面自检（与界面同一条模型路径）"
-OUT=$("$GUI" --selftest "file://$T/repo" "$T/wc2" 2>&1)
+if ! OUT=$("$GUI" --selftest "file://$T/repo" "$T/wc2" 2>&1); then
+    printf '界面自检进程失败：%s\n' "$OUT" >&2
+    exit 1
+fi
+FAILED_SELFTEST=$("$GUI" --selftest "file://$T/absent" 2>&1)
+if [ "$?" -ne 1 ] || [[ "$FAILED_SELFTEST" != *"❌ 连接"* ]]; then
+    printf '无效仓库应使界面自检失败：%s\n' "$FAILED_SELFTEST" >&2
+    exit 1
+fi
+"$GUI" --selftest > /dev/null 2>&1
+if [ "$?" -ne 1 ]; then
+    printf '缺少仓库 URL 应使界面自检失败\n' >&2
+    exit 1
+fi
+for limit in 2147483648 9223372036854775807 -1 invalid ""; do
+    INVALID_LIMIT=$("$VCSCTL" log "$T/wc2" --limit "$limit" 2>&1)
+    if [ "$?" -ne 1 ] || [[ "$INVALID_LIMIT" != *"范围内的整数"* ]]; then
+        printf '非法日志数量未被正常拒绝：%s\n' "$INVALID_LIMIT" >&2
+        exit 1
+    fi
+done
 check "界面自检连接" "✅ 连接" "$OUT"
 check "界面自检浏览" "✅ 浏览子目录" "$OUT"
 check "界面自检状态" "✅ 本地状态" "$OUT"
