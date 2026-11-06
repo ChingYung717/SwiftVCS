@@ -294,6 +294,18 @@ private struct WorkingChangeRowView: View {
                                 .truncationMode(.middle)
                                 .help(rowDetail)
                         }
+                        if let owner = status.lockOwner, !owner.isEmpty {
+                            Label {
+                                Text(verbatim: "锁持有者：\(owner)")
+                            } icon: {
+                                Image(systemName: "lock.fill")
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(isSelected ? .white : .secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(Text(verbatim: "锁持有者：\(owner)"))
+                        }
                     }
 
                     Spacer(minLength: 4)
