@@ -41,8 +41,19 @@ struct VCSExplorerApp: App {
 final class AppModel: ObservableObject {
 
     // MARK: 连接与凭据
-    @Published var repoURLString = ""
-    @Published var username = ""
+    @Published var repoURLString = "" {
+        didSet {
+            if normalizedRepoURL(oldValue) != normalizedRepoURL(repoURLString) {
+                password = ""
+                pendingProbedCertificate = nil
+            }
+        }
+    }
+    @Published var username = "" {
+        didSet {
+            if oldValue != username { password = "" }
+        }
+    }
     @Published var password = ""
     @Published var repoInfo: RepositoryInfo?
     @Published var recentRepos: [String] = []
@@ -84,7 +95,7 @@ final class AppModel: ObservableObject {
     @Published var isLoadingMoreLogs = false
 
     // MARK: 证书与状态提示
-    @Published var rememberPassword = true
+    @Published var rememberPassword = false
     @Published var trustedHosts: [String] = []
     @Published var trustedCertificates: [TrustStore.CertificateInfo] = []
     @Published var pendingProbedCertificate: TrustStore.ProbedCertificate? = nil
@@ -116,7 +127,6 @@ final class AppModel: ObservableObject {
     private var previewTask: Task<Void, Never>?
 
     init() {
-        TrustStore.shared.install()
         refreshTrustedCertificates()
         let saved = AppSettingsStore.load()
         repoURLString = saved.repoURL
@@ -126,11 +136,6 @@ final class AppModel: ObservableObject {
         if !saved.workingCopyPath.isEmpty,
            FileManager.default.fileExists(atPath: saved.workingCopyPath) {
             workingCopyPath = saved.workingCopyPath
-        }
-        if let host = URL(string: repoURLString)?.host, !username.isEmpty {
-            if let p = KeychainStore.load(server: host, username: username) {
-                password = p
-            }
         }
     }
 
@@ -231,7 +236,6 @@ final class AppModel: ObservableObject {
     private func ensureClient() throws -> SVNClient {
         if let c = client { return c }
 
-        TrustStore.shared.install()
         refreshTrustedCertificates()
 
         var resolvedRepoURL = repoInfo?.url
@@ -246,26 +250,25 @@ final class AppModel: ObservableObject {
         if resolvedRepoURL == nil {
             resolvedRepoURL = URL(string: normalizedRepoURL(repoURLString))
         }
-        let host = resolvedRepoURL?.host
-
-        if let h = host {
-            if username.isEmpty, let first = KeychainStore.listAccounts(server: h).first {
-                username = first
-            }
-            if password.isEmpty, !username.isEmpty,
-               let saved = KeychainStore.load(server: h, username: username) {
-                password = saved
-            }
-        }
-
         let c = try SVNClient(
             username: username.isEmpty ? nil : username,
-            password: password.isEmpty ? nil : password,
-            trustBundlePath: TrustStore.shared.caBundleURL.path,
-            baseURL: resolvedRepoURL
+            password: resolvedRepoURL?.absoluteString == normalizedRepoURL(repoURLString) && !password.isEmpty
+                ? password : nil,
+            baseURL: resolvedRepoURL,
+            useSavedCredentials: rememberPassword
         )
         client = c
         return c
+    }
+
+    private func clientForWorkingCopy() throws -> SVNClient {
+        let wc = URL(fileURLWithPath: workingCopyPath)
+        if let url = SVNClient.workingCopyURL(at: wc),
+           url.absoluteString != normalizedRepoURL(repoURLString) {
+            return try SVNClient(username: username.isEmpty ? nil : username, baseURL: url,
+                                 useSavedCredentials: rememberPassword)
+        }
+        return try ensureClient()
     }
 
     private func putCache(key: String, diff: FileDiff) {
@@ -282,31 +285,25 @@ final class AppModel: ObservableObject {
 
     func connectCore() async throws -> RepositoryInfo {
         let cleanURL = normalizedRepoURL(repoURLString)
-        guard let url = URL(string: cleanURL), url.scheme != nil else {
-            throw VCSError.invalidArgument("请输入合法的仓库 URL")
+        guard let url = URL(string: cleanURL), (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+            throw VCSError.invalidArgument("请输入合法的仓库 URL，并在认证栏填写凭据")
         }
 
-        TrustStore.shared.install()
         refreshTrustedCertificates()
-
-        if let host = url.host, password.isEmpty {
-            if !username.isEmpty, let saved = KeychainStore.load(server: host, username: username) {
-                password = saved
-            } else if let account = KeychainStore.listAccounts(server: host).first,
-                      let saved = KeychainStore.load(server: host, username: account) {
-                username = account
-                password = saved
-            }
-        }
-
+        let submittedUser = username
+        let submittedPassword = password
         let c = try SVNClient(
-            username: username.isEmpty ? nil : username,
-            password: password.isEmpty ? nil : password,
-            trustBundlePath: TrustStore.shared.caBundleURL.path,
-            baseURL: url
+            username: submittedUser.isEmpty ? nil : submittedUser,
+            password: submittedPassword.isEmpty ? nil : submittedPassword,
+            baseURL: url,
+            useSavedCredentials: rememberPassword
         )
         do {
             let info = try await c.connect(to: url, credentials: nil)
+            guard normalizedRepoURL(repoURLString) == cleanURL,
+                  username == submittedUser, password == submittedPassword else {
+                throw VCSError.invalidArgument("连接设置已更改，请重新连接")
+            }
             diffTask?.cancel()
             previewTask?.cancel()
             revisionDiffCache.removeAll()
@@ -324,8 +321,12 @@ final class AppModel: ObservableObject {
             certificateIssue = nil
             lastRefresh = Date()
 
-            if rememberPassword, let host = url.host, !username.isEmpty, !password.isEmpty {
-                try? KeychainStore.save(username: username, password: password, server: host)
+            if rememberPassword, !submittedPassword.isEmpty, SVNOrigin(url)?.scheme == "https" {
+                do {
+                    _ = try await c.rememberPassword()
+                } catch {
+                    errorText = error.localizedDescription
+                }
             }
             saveCurrentSettings()
 
@@ -429,7 +430,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateCore() async throws -> UpdateResult {
-        let c = try ensureClient()
+        let c = try clientForWorkingCopy()
         let r = try await c.update(
             workingCopy: URL(fileURLWithPath: workingCopyPath),
             revision: nil,
@@ -494,7 +495,7 @@ final class AppModel: ObservableObject {
     }
 
     func commitCore(message: String, specificPaths: [String]? = nil) async throws -> CommitResult {
-        let c = try ensureClient()
+        let c = try clientForWorkingCopy()
         let paths = specificPaths ?? committableWorkingStatuses.map(\.path)
         let r = try await c.commit(
             workingCopy: URL(fileURLWithPath: workingCopyPath),
@@ -774,29 +775,31 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 第一步：预抓取服务器证书以展示 SHA-256 指纹与主体信息，等待用户人工确认后再写入信任库。
+    /// 第一步：抓取并展示叶证书的指纹，供用户独立核验。
     func probeServerCertificate() {
         let cleanURL = normalizedRepoURL(repoURLString)
-        guard let url = URL(string: cleanURL), let host = url.host else {
-            errorText = "请输入合法的仓库 URL"
+        guard let url = URL(string: cleanURL), let origin = SVNOrigin(url), origin.scheme == "https" else {
+            errorText = "请输入合法的 HTTPS 仓库 URL"
             return
         }
         run {
-            let port = url.port ?? 443
             let probed = try await Task.detached(priority: .userInitiated) {
-                try TrustStore.shared.probeCertificate(host: host, port: port)
+                try TrustStore.shared.probeCertificate(host: origin.host, port: origin.port)
             }.value
+            guard self.normalizedRepoURL(self.repoURLString) == cleanURL else { return }
             self.pendingProbedCertificate = probed
-            self.statusText = "已获取 \(host) 证书指纹，请核对 SHA-256 指纹后确认信任"
+            self.statusText = "已获取 \(origin.endpoint) 证书，请核对 SHA-256 指纹"
         }
     }
 
-    /// 第二步：用户核对 SHA-256 指纹无误后，正式写入本地信任库并连接仓库。
+    /// 第二步：用户核验后，仅为该 HTTPS 端点保存叶证书。
     func confirmPendingCertificateAndConnect(dismissOnSuccess: Bool = false) {
         guard let probed = pendingProbedCertificate else { return }
         run {
-            try TrustStore.shared.addCertificate(pem: probed.pemData, name: probed.host)
-            TrustStore.shared.install()
+            guard let url = URL(string: self.normalizedRepoURL(self.repoURLString)) else {
+                throw VCSError.invalidArgument("仓库地址已更改，请重新获取证书")
+            }
+            try TrustStore.shared.trust(probed, for: url)
             self.pendingProbedCertificate = nil
             self.refreshTrustedCertificates()
             let info = try await self.connectCore()
@@ -804,7 +807,7 @@ final class AppModel: ObservableObject {
             if dismissOnSuccess {
                 self.showConnectSheet = false
             }
-            self.statusText = "已信任 \(probed.host) 的证书并连接 \(info.url)"
+            self.statusText = "已信任 \(probed.host):\(probed.port) 的证书并连接 \(info.url)"
         }
     }
 
@@ -820,7 +823,9 @@ final class AppModel: ObservableObject {
     func removeTrustedCertificate(_ name: String) {
         run {
             try TrustStore.shared.removeCertificate(name: name)
-            TrustStore.shared.install()
+            if (self.repoInfo?.url).flatMap(SVNOrigin.init)?.endpoint == name {
+                self.disconnect()
+            }
             self.refreshTrustedCertificates()
             self.statusText = "已移除证书 \(name)"
         }
@@ -831,6 +836,8 @@ final class AppModel: ObservableObject {
         workingDiffTask?.cancel()
         previewTask?.cancel()
         client = nil
+        password = ""
+        pendingProbedCertificate = nil
         repoInfo = nil
         entries = []
         logs = []
@@ -1276,7 +1283,9 @@ final class AppModel: ObservableObject {
             let targetPaths = selectedItems.map(\.path)
             let r = try await self.commitCore(message: fullMessage, specificPaths: targetPaths)
             _ = try? await self.logCore(customPath: self.customLogPath)
-            self.statusText = "已提交 r\(r.revision)（共 \(r.committedCount) 项）"
+            self.statusText = r.revision > 0
+                ? "已提交 r\(r.revision)（共 \(r.committedCount) 项）"
+                : "没有可提交的改动"
         }
     }
 

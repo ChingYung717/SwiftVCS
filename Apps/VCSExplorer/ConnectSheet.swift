@@ -1,3 +1,4 @@
+import CSVNKit
 import SwiftUI
 
 struct ConnectSheet: View {
@@ -5,7 +6,8 @@ struct ConnectSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private var currentHost: String? {
-        URL(string: model.repoURLString.trimmingCharacters(in: .whitespacesAndNewlines))?.host
+        URL(string: model.repoURLString.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap(SVNOrigin.init).flatMap { $0.scheme == "https" ? $0.endpoint : nil }
     }
 
     private var isCurrentHostTrusted: Bool {
@@ -138,7 +140,7 @@ struct ConnectSheet: View {
                             Divider()
 
                             HStack {
-                                Text("记住凭据（保存至本地安全凭据库）")
+                                Text("记住 HTTPS 凭据（macOS 钥匙串）")
                                     .font(.system(size: 12.5))
                                     .foregroundStyle(.primary)
                                 Spacer()
@@ -164,7 +166,7 @@ struct ConnectSheet: View {
                                              : "尚未导入 \(host) 的自签名证书")
                                             .font(.system(size: 13, weight: .semibold))
                                         Text(isCurrentHostTrusted
-                                             ? "TLS 握手将使用本地合并 CA 证书包验证"
+                                             ? "仅信任此主机和端口上已核验的叶证书"
                                              : "若该仓库使用自签名 HTTPS 证书，请先抓取证书并核对 SHA-256 指纹")
                                             .font(.system(size: 11.5))
                                             .foregroundStyle(.secondary)

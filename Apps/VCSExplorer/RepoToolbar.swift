@@ -1,3 +1,4 @@
+import CSVNKit
 import AppKit
 import Combine
 import SwiftUI
@@ -177,7 +178,7 @@ struct RepoToolbar: View {
 
             // 右侧快捷状态与连接设置按钮
             HStack(spacing: 10) {
-                if let host = URL(string: model.repoURLString)?.host,
+                if let host = URL(string: model.repoURLString).flatMap(SVNOrigin.init)?.endpoint,
                    model.trustedHosts.contains(host) {
                     HStack(spacing: 5) {
                         Image(systemName: "checkmark.shield.fill")
@@ -277,7 +278,7 @@ struct RepoToolbar: View {
                 model.showConnectSheet = true
             }
 
-            if let host = URL(string: model.repoURLString)?.host,
+            if let host = URL(string: model.repoURLString).flatMap(SVNOrigin.init)?.endpoint,
                (!model.trustedHosts.contains(host) || model.certificateIssue != nil) {
                 PopoverActionRow(icon: "checkmark.shield", iconColor: .orange, title: "信任 \(host) 证书并连接") {
                     model.showRepoPopover = false

@@ -15,7 +15,7 @@ public protocol RepositoryClient: AnyObject, Sendable {
     ///
     /// - Parameters:
     ///   - url: 仓库根 URL，例如 `https://svn.example.com/repo`
-    ///   - credentials: 凭据；为 `nil` 时后端尝试使用系统钥匙串缓存
+    ///   - credentials: 凭据；为 `nil` 时后端使用已配置的凭据
     func connect(to url: URL, credentials: Credentials?) async throws -> RepositoryInfo
 
     /// 断开并释放会话资源。

@@ -1,10 +1,30 @@
-import XCTest
-@testable import CVCSKit
-@testable import CSVNKit
+import Foundation
+import CVCSKit
+import CSVNKit
 
-final class CVCSKitTests: XCTestCase {
+@main
+struct CVCSKitTests {
+    static func main() {
+        testParseSingleFileUnifiedDiff()
+        testParseMultiFileDiffDoesNotBleedHeadersIntoPreviousHunk()
+        testWorkingCopyStatusPendingFlag()
+        testKeychainScopeIncludesProtocolPortAndRepository()
+        print("4 unit tests passed")
+    }
 
-    func testParseSingleFileUnifiedDiff() {
+    private static func expect(_ condition: Bool, file: StaticString = #fileID, line: UInt = #line) {
+        guard condition else {
+            FileHandle.standardError.write(Data("Assertion failed at \(file):\(line)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func require<T>(_ value: T?, file: StaticString = #fileID, line: UInt = #line) -> T {
+        expect(value != nil, file: file, line: line)
+        return value!
+    }
+
+    private static func testParseSingleFileUnifiedDiff() {
         let raw = """
         Index: /tmp/wc/src/main.txt
         ===================================================================
@@ -17,19 +37,19 @@ final class CVCSKitTests: XCTestCase {
         +added line3
         """
         let hunks = SVNClient.parseUnifiedDiff(raw)
-        XCTAssertEqual(hunks.count, 1)
-        XCTAssertEqual(hunks[0].oldStart, 1)
-        XCTAssertEqual(hunks[0].oldCount, 2)
-        XCTAssertEqual(hunks[0].newStart, 1)
-        XCTAssertEqual(hunks[0].newCount, 3)
-        XCTAssertEqual(hunks[0].lines.count, 4)
-        XCTAssertEqual(hunks[0].lines[0].kind, .context)
-        XCTAssertEqual(hunks[0].lines[1].kind, .deletion)
-        XCTAssertEqual(hunks[0].lines[2].kind, .addition)
-        XCTAssertEqual(hunks[0].lines[3].kind, .addition)
+        expect(hunks.count == 1)
+        expect(hunks[0].oldStart == 1)
+        expect(hunks[0].oldCount == 2)
+        expect(hunks[0].newStart == 1)
+        expect(hunks[0].newCount == 3)
+        expect(hunks[0].lines.count == 4)
+        expect(hunks[0].lines[0].kind == .context)
+        expect(hunks[0].lines[1].kind == .deletion)
+        expect(hunks[0].lines[2].kind == .addition)
+        expect(hunks[0].lines[3].kind == .addition)
     }
 
-    func testParseMultiFileDiffDoesNotBleedHeadersIntoPreviousHunk() {
+    private static func testParseMultiFileDiffDoesNotBleedHeadersIntoPreviousHunk() {
         let raw = """
         Index: /tmp/wc/src/a.txt
         ===================================================================
@@ -47,20 +67,35 @@ final class CVCSKitTests: XCTestCase {
         +extra b
         """
         let diffs = SVNClient.parseMultiFileDiff(raw, workingCopyPath: "/tmp/wc", fallbackTarget: "/tmp/wc")
-        XCTAssertEqual(diffs.count, 2)
-        XCTAssertEqual(diffs[0].path, "src/a.txt")
-        XCTAssertEqual(diffs[0].addedCount, 1)
-        XCTAssertEqual(diffs[0].removedCount, 1)
-        XCTAssertEqual(diffs[1].path, "docs/b.txt")
-        XCTAssertEqual(diffs[1].addedCount, 1)
-        XCTAssertEqual(diffs[1].removedCount, 0)
+        expect(diffs.count == 2)
+        expect(diffs[0].path == "src/a.txt")
+        expect(diffs[0].addedCount == 1)
+        expect(diffs[0].removedCount == 1)
+        expect(diffs[1].path == "docs/b.txt")
+        expect(diffs[1].addedCount == 1)
+        expect(diffs[1].removedCount == 0)
     }
 
-    func testWorkingCopyStatusPendingFlag() {
-        XCTAssertTrue(WorkingCopyStatus.Kind.modified.isPendingChange)
-        XCTAssertTrue(WorkingCopyStatus.Kind.added.isPendingChange)
-        XCTAssertTrue(WorkingCopyStatus.Kind.deleted.isPendingChange)
-        XCTAssertFalse(WorkingCopyStatus.Kind.normal.isPendingChange)
-        XCTAssertFalse(WorkingCopyStatus.Kind.unversioned.isPendingChange)
+    private static func testWorkingCopyStatusPendingFlag() {
+        expect(WorkingCopyStatus.Kind.modified.isPendingChange)
+        expect(WorkingCopyStatus.Kind.added.isPendingChange)
+        expect(WorkingCopyStatus.Kind.deleted.isPendingChange)
+        expect(!WorkingCopyStatus.Kind.normal.isPendingChange)
+        expect(!WorkingCopyStatus.Kind.unversioned.isPendingChange)
+    }
+
+    private static func testKeychainScopeIncludesProtocolPortAndRepository() {
+        let first = require(URL(string: "https://example.invalid/svn/repo"))
+        let normalized = require(URL(string: "https://EXAMPLE.invalid:443/svn/repo/"))
+        let otherPort = require(URL(string: "https://example.invalid:8443/svn/repo"))
+        let otherRepository = require(URL(string: "https://example.invalid/svn/other"))
+        let insecure = require(URL(string: "http://example.invalid/svn/repo"))
+        let embedded = require(URL(string: "https://user@example.invalid/svn/repo"))
+        let scope = require(KeychainStore.service(for: first))
+        expect(KeychainStore.service(for: normalized) == scope)
+        expect(KeychainStore.service(for: otherPort) != scope)
+        expect(KeychainStore.service(for: otherRepository) != scope)
+        expect(KeychainStore.service(for: insecure) == nil)
+        expect(KeychainStore.service(for: embedded) == nil)
     }
 }

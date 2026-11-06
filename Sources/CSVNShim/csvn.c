@@ -20,6 +20,7 @@
 #include <apr_time.h>
 
 #include <svn_client.h>
+#include <svn_auth.h>
 #include <svn_cmdline.h>
 #include <svn_config.h>
 #include <svn_dirent_uri.h>
@@ -43,7 +44,12 @@
 struct csvn_ctx {
     apr_pool_t *pool;
     svn_client_ctx_t *client;
-    svn_auth_baton_t *auth_baton;
+    const char *username;
+    const char *password;
+    const char *origin;
+    const char *expected_realm;
+    const char *auth_realm;
+    const char *pinned_cert;
     apr_thread_mutex_t *mutex;
     char last_repos_root[2048];
     char errmsg[2048];
@@ -205,9 +211,59 @@ static void csvn_init_apr_once(void)
     csvn_apr_init_status = apr_initialize();
 }
 
+/* Subversion prefixes a password challenge with <scheme://host:port>. */
+static svn_error_t *scoped_password(svn_auth_cred_simple_t **cred, void *baton,
+                                     const char *realm, const char *username,
+                                     svn_boolean_t may_save, apr_pool_t *pool)
+{
+    csvn_ctx *ctx = baton;
+    *cred = NULL;
+    if (!realm || !ctx->origin || !ctx->username || !ctx->password)
+        return SVN_NO_ERROR;
+    size_t n = strlen(ctx->origin);
+    if (realm[0] != '<' || strncasecmp(realm + 1, ctx->origin, n) != 0 ||
+        realm[n + 1] != '>' ||
+        (ctx->expected_realm && strcmp(realm, ctx->expected_realm) != 0))
+        return SVN_NO_ERROR;
+
+    svn_auth_cred_simple_t *value = apr_pcalloc(pool, sizeof(*value));
+    value->username = apr_pstrdup(pool, ctx->username);
+    value->password = apr_pstrdup(pool, ctx->password);
+    *cred = value;
+    if (!ctx->auth_realm)
+        ctx->auth_realm = apr_pstrdup(ctx->pool, realm);
+    else if (strcmp(ctx->auth_realm, realm) != 0)
+        ctx->auth_realm = ""; /* Ambiguous challenge: do not persist credentials. */
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *scoped_server_trust(svn_auth_cred_ssl_server_trust_t **cred,
+                                        void *baton, const char *realm,
+                                        apr_uint32_t failures,
+                                        const svn_auth_ssl_server_cert_info_t *cert,
+                                        svn_boolean_t may_save, apr_pool_t *pool)
+{
+    csvn_ctx *ctx = baton;
+    *cred = NULL;
+    if (failures != SVN_AUTH_SSL_UNKNOWNCA || !realm || !ctx->origin ||
+        strcasecmp(realm, ctx->origin) != 0 || !ctx->pinned_cert ||
+        !cert || !cert->ascii_cert || strcmp(cert->ascii_cert, ctx->pinned_cert) != 0)
+        return SVN_NO_ERROR;
+
+    svn_auth_cred_ssl_server_trust_t *value = apr_pcalloc(pool, sizeof(*value));
+    value->accepted_failures = SVN_AUTH_SSL_UNKNOWNCA;
+    *cred = value;
+    return SVN_NO_ERROR;
+}
+
 csvn_ctx *csvn_context_create(const char *username,
                                const char *password,
                                const char *config_dir,
+                               const char *origin,
+                               const char *expected_realm,
+                               const char *pinned_cert,
+                               const char *ca_path,
+                               const char *host,
                                char *errbuf,
                                int errlen)
 {
@@ -246,7 +302,7 @@ csvn_ctx *csvn_context_create(const char *username,
         return NULL;
     }
 
-    err = svn_client_create_context(&ctx->client, pool);
+    err = svn_client_create_context2(&ctx->client, NULL, pool);
     if (err) {
         svn_err_best_message(err, ctx->errmsg, sizeof(ctx->errmsg));
         if (errbuf && errlen > 0) {
@@ -258,39 +314,54 @@ csvn_ctx *csvn_context_create(const char *username,
         return NULL;
     }
 
-    /*
-     * 加载用户 ~/.subversion 配置（含 servers 代理、超时等），并设置认证 baton。
-     */
-    {
-        svn_config_t *cfg = NULL;
-        svn_error_t *cfg_err = svn_config_get_config(&ctx->client->config, config_dir, pool);
-        if (cfg_err) {
-            svn_error_clear(cfg_err);
-            ctx->client->config = NULL;
+    /* 配置和认证均限定在当前上下文，不修改进程环境。 */
+    ctx->username = apr_pstrdup(pool, username);
+    ctx->password = apr_pstrdup(pool, password);
+    ctx->origin = apr_pstrdup(pool, origin);
+    ctx->expected_realm = apr_pstrdup(pool, expected_realm);
+    ctx->pinned_cert = apr_pstrdup(pool, pinned_cert);
+    err = svn_config_get_config(&ctx->client->config, config_dir, pool);
+    if (!err) {
+        svn_config_t *servers = apr_hash_get(ctx->client->config,
+                                             SVN_CONFIG_CATEGORY_SERVERS,
+                                             APR_HASH_KEY_STRING);
+        if (servers) {
+            const char *configured_ca = NULL;
+            svn_config_get(servers, &configured_ca, SVN_CONFIG_SECTION_GLOBAL,
+                           SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, NULL);
+            if (!configured_ca && access("/etc/ssl/cert.pem", R_OK) == 0)
+                svn_config_set(servers, SVN_CONFIG_SECTION_GLOBAL,
+                               SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, "/etc/ssl/cert.pem");
+            if (ca_path && host) {
+                const char *group = svn_config_find_group(servers, host,
+                                                           SVN_CONFIG_SECTION_GROUPS, pool);
+                const char *section = group ? group : SVN_CONFIG_SECTION_GLOBAL;
+                svn_config_get(servers, &configured_ca, section, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, NULL);
+                svn_config_set(servers, section, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES,
+                               configured_ca ? apr_pstrcat(pool, configured_ca, ";", ca_path, NULL) : ca_path);
+            }
         }
-        if (ctx->client->config) {
-            cfg = (svn_config_t *)apr_hash_get(ctx->client->config,
-                                               SVN_CONFIG_CATEGORY_CONFIG,
-                                               APR_HASH_KEY_STRING);
-        }
-        if (!cfg) {
-            err = svn_config_create2(&cfg, FALSE, FALSE, pool);
-        }
-        if (!err) {
-            /* 证书信任由 OpenSSL 的 SSL_CERT_FILE 完成，
-             * 这里不开启任何 trust_server_cert_* 开关（避免无差别信任）。 */
-            err = svn_cmdline_create_auth_baton2(&ctx->auth_baton,
-                                                 TRUE /* non_interactive */,
-                                                 username,
-                                                 password,
-                                                 config_dir,
-                                                 TRUE /* no_auth_cache */,
-                                                 FALSE, FALSE, FALSE, FALSE, FALSE,
-                                                 cfg,
-                                                 NULL /* cancel_func */,
-                                                 NULL /* cancel_baton */,
-                                                 pool);
-        }
+
+        svn_auth_provider_object_t *provider;
+        apr_array_header_t *providers = apr_array_make(pool, 5, sizeof(provider));
+        svn_auth_get_username_provider(&provider, pool);
+        APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+        svn_auth_get_simple_prompt_provider(&provider, scoped_password, ctx, 0, pool);
+        APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+        svn_auth_get_ssl_server_trust_prompt_provider(&provider, scoped_server_trust, ctx, pool);
+        APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+        svn_auth_get_ssl_client_cert_file_provider(&provider, pool);
+        APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+        svn_auth_get_ssl_client_cert_pw_file_provider2(&provider, NULL, NULL, pool);
+        APR_ARRAY_PUSH(providers, svn_auth_provider_object_t *) = provider;
+        svn_auth_open(&ctx->client->auth_baton, providers, pool);
+        svn_auth_set_parameter(ctx->client->auth_baton, SVN_AUTH_PARAM_NON_INTERACTIVE, "");
+        svn_auth_set_parameter(ctx->client->auth_baton, SVN_AUTH_PARAM_NO_AUTH_CACHE, "");
+        svn_auth_set_parameter(ctx->client->auth_baton, SVN_AUTH_PARAM_CONFIG_DIR,
+                               apr_pstrdup(pool, config_dir));
+        if (username)
+            svn_auth_set_parameter(ctx->client->auth_baton, SVN_AUTH_PARAM_DEFAULT_USERNAME,
+                                   ctx->username);
     }
     if (err) {
         svn_err_best_message(err, ctx->errmsg, sizeof(ctx->errmsg));
@@ -302,10 +373,14 @@ csvn_ctx *csvn_context_create(const char *username,
         apr_pool_destroy(pool);
         return NULL;
     }
-    ctx->client->auth_baton = ctx->auth_baton;
 
     csvn_clear_error(ctx);
     return ctx;
+}
+
+const char *csvn_auth_realm(csvn_ctx *ctx)
+{
+    return ctx ? ctx->auth_realm : NULL;
 }
 
 void csvn_context_destroy(csvn_ctx *ctx)
@@ -1166,7 +1241,6 @@ int csvn_commit(csvn_ctx *ctx,
     scratch = svn_pool_create(ctx->pool);
     memset(&baton, 0, sizeof(baton));
     baton.message = message ? message : "";
-    baton.count = target_count;
 
     arr = apr_array_make(scratch, target_count, sizeof(const char *));
     for (i = 0; i < target_count; i++) {
@@ -1200,7 +1274,7 @@ int csvn_commit(csvn_ctx *ctx,
     }
 
     if (out_revision) *out_revision = baton.revision;
-    if (out_committed_count) *out_committed_count = baton.count;
+    if (out_committed_count) *out_committed_count = baton.revision > 0 ? baton.count : 0;
 
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);

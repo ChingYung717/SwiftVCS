@@ -57,15 +57,22 @@ typedef struct csvn_ctx csvn_ctx;
 
 /*
  * 创建上下文。
- * username/password 可为 NULL（尝试使用系统钥匙串缓存）。
+ * username/password 可为 NULL。口令仅用于匹配 origin 和可选认证域的质询。
  * config_dir 为 svn 配置目录，NULL 表示默认。
  * 失败返回 NULL，错误信息写入 errbuf。
  */
 csvn_ctx *csvn_context_create(const char *username,
                                const char *password,
                                const char *config_dir,
+                               const char *origin,
+                               const char *expected_realm,
+                               const char *pinned_cert,
+                               const char *ca_path,
+                               const char *host,
                                char *errbuf,
                                int errlen);
+
+const char *csvn_auth_realm(csvn_ctx *ctx);
 
 void csvn_context_destroy(csvn_ctx *ctx);
 

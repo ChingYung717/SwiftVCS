@@ -5,6 +5,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+source "$ROOT/scripts/svn_build_env.sh" || exit 1
 if command -v brew >/dev/null 2>&1 && [ -d "$(brew --prefix subversion 2>/dev/null)/bin" ]; then
     SVN_BIN="$(brew --prefix subversion 2>/dev/null)/bin"
 elif [ -d "/opt/homebrew/opt/subversion/bin" ]; then
@@ -14,7 +15,10 @@ elif [ -d "/usr/local/opt/subversion/bin" ]; then
 else
     SVN_BIN="$(dirname "$(command -v svn)")"
 fi
-BASE="$(mktemp -d)"
+BASE="$(mktemp -d)" || exit 1
+trap 'rm -rf "$BASE"' EXIT
+export CFFIXED_USER_HOME="$BASE/home" HOME="$BASE/home"
+mkdir -p "$HOME"
 T="$BASE/swiftvcs-e2e"   # 注意：URL 里不能有双斜杠，路径必须规范
 VCSCTL="$ROOT/.build/out/Products/Debug/vcsctl"
 GUI="$ROOT/.build/out/Products/Debug/VCSExplorer"
@@ -111,6 +115,15 @@ check "日志有修订号" "r3" "$OUT"
 check "日志有作者" "$(id -un)" "$OUT"
 check "日志有说明" "提交" "$OUT"
 
+echo "==> 工作副本子目录与空提交"
+SUB_LOG=$("$VCSCTL" log "$T/wc2/src" --limit 5 2>&1)
+check "工作副本子目录返回历史" "r3" "$SUB_LOG"
+BEFORE=$("$SVN_BIN/svnlook" youngest "$T/repo")
+EMPTY=$("$VCSCTL" commit "$T/wc2" -m "不应产生修订" 2>&1)
+AFTER=$("$SVN_BIN/svnlook" youngest "$T/repo")
+check "空提交明确提示没有改动" "没有可提交的改动" "$EMPTY"
+check "空提交未创建修订" "^$BEFORE$" "$AFTER"
+
 echo "==> 4 同步"
 OUT=$("$VCSCTL" update "$T/wc2" 2>&1)
 check "同步成功" "已同步到" "$OUT"
@@ -170,7 +183,6 @@ check "界面自检历史" "✅ 历史" "$OUT"
 check "界面自检提交文件比对" "✅ 提交文件比对" "$OUT"
 check "界面自检并排差异配对" "✅ 并排差异配对" "$OUT"
 
-rm -rf "$BASE"
 echo
 echo "================================"
 echo "  通过 $PASS 项，失败 $FAIL 项"

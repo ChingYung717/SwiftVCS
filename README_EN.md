@@ -15,7 +15,7 @@
 
 ```text
 SwiftVCS/
-├── Package.swift                 # SwiftPM manifest (macOS 14+, auto-detects /opt/homebrew & /usr/local)
+├── Package.swift                 # SwiftPM manifest (macOS 14+, uses pkg-config)
 ├── Sources/
 │   ├── CVCSKit/                  # VCS-agnostic domain types & async RepositoryClient protocol
 │   ├── CSVNShim/                 # C11 bridge over libsvn_client / ra / wc / diff with APR subpools
@@ -26,7 +26,7 @@ SwiftVCS/
 │   └── VCSExplorer/              # GitHub Desktop-style SwiftUI macOS application (15 view/model files)
 ├── Tests/
 │   ├── CVCSKitTests/             # Unit test target
-│   └── run_e2e.sh                # 42-assertion offline end-to-end test suite (file:// repository)
+│   └── run_e2e.sh                # offline end-to-end test suite (file:// repository)
 └── make_app.sh                   # Standalone .app bundler (rewrites 22 dylibs into Contents/Frameworks)
 ```
 
@@ -57,13 +57,15 @@ SwiftVCS/
 - Homebrew `subversion` and `apr` (required on the build machine only):
 
 ```bash
-brew install subversion apr apr-util
+brew install subversion apr apr-util pkgconf
+source scripts/svn_build_env.sh
 ```
 
 ### Build & Run Tests
 
 ```bash
 swift build
+swift run SwiftVCSChecks
 ./Tests/run_e2e.sh
 ```
 
@@ -73,7 +75,7 @@ swift build
 ./make_app.sh
 ```
 
-`make_app.sh` builds the Release executable, copies all required `libsvn_*`, `libapr*`, `libserf`, and `libssl` dynamic libraries into `dist/VCSExplorer.app/Contents/Frameworks/`, rewrites load paths to `@rpath`, normalizes `LC_BUILD_VERSION` to `macOS 14.0`, signs the app bundle, and produces `dist/VCSExplorer-arm64.zip`.
+`make_app.sh` builds the Release executable, copies all required `libsvn_*`, `libapr*`, `libserf`, and `libssl` dynamic libraries into `dist/VCSExplorer.app/Contents/Frameworks/`, rewrites load paths to `@rpath`, preserves each library’s deployment target, includes the licenses and gettext source, and produces `dist/VCSExplorer-<arch>.zip`. The default ad-hoc signature is for local testing. For distribution, set `SWIFTVCS_SIGN_IDENTITY` and `SWIFTVCS_NOTARY_PROFILE` to use Developer ID and notarization.
 
 ---
 

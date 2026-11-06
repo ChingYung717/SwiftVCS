@@ -1,29 +1,17 @@
 # Security Policy / 安全策略
 
-## 简体中文
+## 凭据与 TLS
 
-### 安全架构说明
-1. **TLS / SSL 证书校验**：
-   - `SwiftVCS` 默认使用系统根证书包（`/etc/ssl/cert.pem`）验证 HTTPS 服务器证书。
-   - 对于使用自签名证书或企业内部私有 CA 的 SVN 服务器，`VCS Explorer` 采用「两步指纹核验机制」：先通过 [`TrustStore.probeCertificate`](Sources/CSVNKit/TrustStore.swift) 提取证书主体（Subject）与 `SHA-256` 指纹展示给用户，仅在用户人工核对确认后才将证书合并至 `~/.config/vcs-explorer/ca-bundle.crt`（权限 `0600`）。
-2. **本地凭据保护**：
-   - 配置目录 `~/.config/vcs-explorer` 权限强制设为 `0700`。
-   - 凭据文件 `~/.config/vcs-explorer/credentials.json` 采用 `0600` 权限临时文件创建并通过原子替换（`replaceItemAt`）写入，仅当前登录的 macOS 用户可读。
+- 选择「记住 HTTPS 凭据」或使用 `vcsctl info --remember` 时，SwiftVCS 仅在 HTTPS 仓库连接和口令认证成功后，把密码和认证域存入 macOS 钥匙串。复用凭据时，协议、主机、端口、仓库路径、用户名和服务器认证域均须匹配。命令行复用时传入 `--user`。
+- 从旧版升级后，请重新输入凭据。旧的 `credentials.json`、`certs/` 和 `ca-bundle.crt` 已停用。请在核对用途后自行清理旧文件。macOS 可能会在重新构建或从另一个可执行文件访问时要求授权钥匙串。
+- 自签名 HTTPS 服务须先抓取叶证书，并使用管理员通过独立渠道提供的 SHA-256 指纹核验。GUI 由用户确认，CLI 通过 `--fetch-cert` 与 `--fingerprint` 精确匹配。信任只适用于核验过的主机和端口，证书有效期和主机名仍由 TLS 后端检查。
+- 如需使用内部 CA，可传 `--ca /path/to/ca.pem` 给当前 SVN 会话，或按 Subversion 文档在 `~/.subversion/servers` 中配置。
 
-### 报告安全漏洞
-如发现任何安全隐患（如命令注入、证书绕过、内存越界或凭据泄露风险），请勿在公开 Issue 中直接披露攻击细节，请通过 GitHub Security Advisories 私密提交报告。
+## Credentials and TLS
 
----
+- Remembering a password stores it and its authentication realm in the macOS Keychain after successful HTTPS password authentication. Reuse requires the same scheme, host, port, repository path, user, and authentication realm. CLI users specify the user with `--user`.
+- After upgrading, enter credentials again and verify any previously trusted certificates. The old `credentials.json`, `certs/`, and `ca-bundle.crt` are no longer used. macOS may ask for Keychain approval when using a rebuilt app or a different executable.
+- For self-signed HTTPS servers, compare the leaf certificate's SHA-256 fingerprint with a value from your administrator through a separate channel. Confirm it in the GUI or pass the expected value with `--fetch-cert` and `--fingerprint` in the CLI. The exception applies to the verified host and port. TLS hostname and validity checks still apply.
+- Use `--ca /path/to/ca.pem` to supply a private CA for the current SVN client context, or configure it in `~/.subversion/servers`.
 
-## English
-
-### Security Architecture
-1. **TLS / SSL Certificate Verification**:
-   - By default, `SwiftVCS` validates HTTPS connections against the system root CA bundle (`/etc/ssl/cert.pem`).
-   - For enterprise SVN servers with self-signed certificates or internal CAs, `VCS Explorer` enforces a **two-step SHA-256 fingerprint verification flow**: the certificate is probed first via [`TrustStore.probeCertificate`](Sources/CSVNKit/TrustStore.swift), displaying the Subject and `SHA-256` fingerprint in the UI, and is only written to `~/.config/vcs-explorer/ca-bundle.crt` (`0600`) after explicit user confirmation.
-2. **Local Credential Storage**:
-   - The configuration directory `~/.config/vcs-explorer` is created with `0700` permissions.
-   - `~/.config/vcs-explorer/credentials.json` is written atomically via a temporary file created with `0600` permissions (`-rw-------`).
-
-### Reporting a Vulnerability
-If you discover a security vulnerability, please report it privately via **GitHub Security Advisories** rather than opening a public issue.
+请通过 GitHub 仓库的私密漏洞报告渠道提交安全问题。/ Please report vulnerabilities through GitHub's private vulnerability reporting channel.
