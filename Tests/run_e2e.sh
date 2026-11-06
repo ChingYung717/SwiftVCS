@@ -150,8 +150,13 @@ check "新增文件 (A) 修订级差异展示全文新增" "^+hello v1" "$SHOW_A
 "$SVN_BIN/svn" cp "$T/wc2/docs/README.md" "$T/wc2/docs/README_copy.md" >/dev/null
 echo "拷贝后新增一行" >> "$T/wc2/docs/README_copy.md"
 echo "中文内容第一行" > "$T/wc2/docs/中文说明.txt"
+printf 'hello\xe4' > "$T/wc2/docs/invalid-encoding.txt"
+printf 'hello\xd6\xd0' > "$T/wc2/docs/gb18030.txt"
+touch "$T/wc2/docs/empty.txt"
 printf '\x50\x4b\x03\x04\x00\x00\x80\xff' > "$T/wc2/src/lib.jar"
-"$SVN_BIN/svn" add "$T/wc2/docs/中文说明.txt" "$T/wc2/src/lib.jar" >/dev/null
+"$SVN_BIN/svn" add "$T/wc2/docs/中文说明.txt" "$T/wc2/docs/invalid-encoding.txt" \
+    "$T/wc2/docs/gb18030.txt" "$T/wc2/docs/empty.txt" "$T/wc2/src/lib.jar" >/dev/null
+"$SVN_BIN/svn" propset svn:mime-type text/plain "$T/wc2/docs/invalid-encoding.txt" "$T/wc2/docs/gb18030.txt" >/dev/null
 "$SVN_BIN/svn" rm "$T/wc2/src/main.txt" >/dev/null
 "$SVN_BIN/svn" commit "$T/wc2" -m "r4: 测试删除、拷贝、中文与二进制" >/dev/null
 "$SVN_BIN/svn" up "$T/wc2" >/dev/null
@@ -164,6 +169,20 @@ check "拷贝并修改文件 (A+) 差异展示增量" "^+拷贝后新增一行" 
 
 SHOW_ZH=$("$VCSCTL" show "file://$T/repo" 4 "docs/中文说明.txt" 2>&1)
 check "中文 UTF-8 新增文件差异正常解码" "中文内容第一行" "$SHOW_ZH"
+
+SHOW_INVALID=$("$VCSCTL" show "file://$T/repo" 4 docs/invalid-encoding.txt 2>&1)
+check "历史新增文件解码失败会显示提示" "文件内容无法完整解码" "$SHOW_INVALID"
+check "历史新增文件保留替换字符" "hello�" "$SHOW_INVALID"
+
+SHOW_GB=$("$VCSCTL" show "file://$T/repo" 4 docs/gb18030.txt 2>&1)
+check "GB18030 新增文件保留末尾中文" "hello中" "$SHOW_GB"
+if [[ "$SHOW_GB$SHOW_ZH" == *"无法完整解码"* ]]; then
+    printf '有效文本不应显示解码失败：%s\n' "$SHOW_GB$SHOW_ZH" >&2
+    exit 1
+fi
+
+SHOW_EMPTY=$("$VCSCTL" show "file://$T/repo" 4 docs/empty.txt 2>&1)
+check "新增空文件仍显示空文件提示" "新增空文件" "$SHOW_EMPTY"
 
 SHOW_BIN=$("$VCSCTL" show "file://$T/repo" 4 src/lib.jar 2>&1)
 check "二进制文件返回跳过比对提示" "二进制文件" "$SHOW_BIN"

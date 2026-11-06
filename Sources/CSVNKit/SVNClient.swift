@@ -943,7 +943,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                         isBinary: false,
                         hunks: hunks,
                         isTruncated: truncated,
-                        statusNotice: hunks.isEmpty ? "新增空文件" : nil
+                        statusNotice: decoded == nil ? "文件内容无法完整解码" : (hunks.isEmpty ? "新增空文件" : nil)
                     )
                 }
                 return FileDiff(

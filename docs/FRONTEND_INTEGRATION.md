@@ -46,3 +46,5 @@ GUI 和 CLI 通过 `RepositoryClient` 调用 libsvn。文件操作、解决冲�
 沿用 `RepositoryClient.diff(workingCopy:paths:)` 和 `diffFile(revision:change:repoRootURL:maxBytes:)`。返回的 `FileDiff.propertyChanges` 默认为空数组，每项包含 `name`、`oldValue` 和 `newValue`，两个值均为 `Data?`。空数据是已设置的空值，`nil` 表示该侧不存在。
 
 工作副本写入属性后，先刷新状态，再重新读取当前差异。二进制文件和目录也需检查 `propertyChanges` 后决定是否显示占位视图。文本及属性均为空时才展示无差异。遇到属性读取失败时沿用差异加载失败或错误提示。原 BASE 被替换覆盖时，后端通过原节点的仓库修订获取其属性。
+
+历史新增文件无法完整解码时，`FileDiff.statusNotice` 说明原因，差异行仍可包含替换字符。CLI 在文本差异前打印提示；GUI 在属性区之后、文本差异上方显示提示，即使存在差异行也不会隐藏。调用顺序和返回结构无需调整。
