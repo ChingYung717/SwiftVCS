@@ -36,6 +36,8 @@
 #include <svn_wc.h>
 
 #include <pthread.h>
+#include <locale.h>
+#include <langinfo.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,10 +209,16 @@ static long long csvn_parse_svn_date(const char *s)
 
 static pthread_once_t csvn_apr_once = PTHREAD_ONCE_INIT;
 static apr_status_t csvn_apr_init_status = APR_SUCCESS;
+static int csvn_utf8_locale_ready;
 
 static void csvn_init_apr_once(void)
 {
-    csvn_apr_init_status = apr_initialize();
+    /* GUI 启动环境可能没有 LANG。libsvn 在 APR 初始化后会使用本地编码。 */
+    const char *encoding = nl_langinfo(CODESET);
+    csvn_utf8_locale_ready = (encoding && strcasecmp(encoding, "UTF-8") == 0) ||
+        setlocale(LC_CTYPE, "en_US.UTF-8") != NULL;
+    if (csvn_utf8_locale_ready)
+        csvn_apr_init_status = apr_initialize();
 }
 
 /* Subversion prefixes a password challenge with <scheme://host:port>. */
@@ -275,9 +283,10 @@ csvn_ctx *csvn_context_create(const char *username,
     apr_status_t st;
 
     pthread_once(&csvn_apr_once, csvn_init_apr_once);
-    if (csvn_apr_init_status != APR_SUCCESS) {
+    if (!csvn_utf8_locale_ready || csvn_apr_init_status != APR_SUCCESS) {
         if (errbuf && errlen > 0) {
-            strncpy(errbuf, "APR 初始化失败", (size_t)(errlen - 1));
+            strncpy(errbuf, csvn_utf8_locale_ready ? "APR 初始化失败" : "无法初始化 UTF-8 字符编码",
+                    (size_t)(errlen - 1));
             errbuf[errlen - 1] = '\0';
         }
         return NULL;
