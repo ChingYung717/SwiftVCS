@@ -66,6 +66,28 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-p0-") as temp:
         svn("checkout", source, path)
         return path
 
+    # 路径预检必须在整批写操作之前完成。
+    sibling = checkout(trunk, "sibling")
+    nested = checkout(trunk, "wc/nested")
+    (wc / "escape").symlink_to(sibling, target_is_directory=True)
+    target = sibling / "prop.txt"
+    target.write_text("do not revert\n")
+    for path in ("../sibling/prop.txt", str(target), "escape/prop.txt", "nested/prop.txt", ".svn/wc.db"):
+        vcs("revert", wc, path, code=1)
+    assert target.read_text() == "do not revert\n"
+    vcs("commit", wc, str(target), "-m", "wrong copy", code=1)
+    (wc / "pending.txt").write_text("unversioned\n")
+    outside = sibling / "outside.txt"
+    outside.write_text("unversioned elsewhere\n")
+    vcs("add", wc, "pending.txt", str(outside), code=1)
+    assert svn("status", wc / "pending.txt").startswith("?")
+    assert svn("status", outside).startswith("?")
+    (wc / "pending.txt").unlink()
+    (wc / "escape").unlink()
+    # 嵌套工作副本独立清理，后续夹具要验证干净副本合并。
+    import shutil
+    shutil.rmtree(nested)
+
     initial = head()
     vcs("delete", wc, "delete.txt")
     vcs("rename", wc, "move.txt", "改名.txt")

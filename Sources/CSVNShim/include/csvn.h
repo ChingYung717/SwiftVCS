@@ -197,6 +197,9 @@ int csvn_diff_urls(csvn_ctx *ctx,
                    long *out_len,
                    int *out_truncated);
 
+int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
+                                const char *const *targets, int count);
+
 /* 7. 提交 */
 int csvn_commit(csvn_ctx *ctx,
                 const char *const *targets,

@@ -1880,6 +1880,65 @@ static int finish_wc_operation(csvn_ctx *ctx, svn_error_t *err, apr_pool_t *pool
     return rc;
 }
 
+static svn_error_t *reject_file_external(void *baton, const char *path,
+                                         const svn_client_status_t *status, apr_pool_t *pool)
+{
+    return status->file_external ? invalid_wc("不能直接修改外部工作副本中的文件") : SVN_NO_ERROR;
+}
+
+static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
+                                          const char *root, const char *target, apr_pool_t *pool)
+{
+    const char *relative = svn_dirent_skip_ancestor(anchor, target);
+    if (!relative) return invalid_wc("目标超出指定的工作副本范围");
+    const char *path = anchor;
+    while (*relative) {
+        const char *slash = strchr(relative, '/');
+        const char *part = slash ? apr_pstrndup(pool, relative, slash - relative) : relative;
+        if (!*part || !strcmp(part, ".") || !strcmp(part, "..") || !strcasecmp(part, ".svn"))
+            return invalid_wc("路径包含不允许的目录");
+        path = svn_dirent_join(path, part, pool);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (slash && !S_ISDIR(st.st_mode))
+                return invalid_wc("父路径必须为真实目录，不能通过符号链接写入");
+            if (S_ISDIR(st.st_mode)) {
+                const char *actual;
+                SVN_ERR(svn_client_get_wc_root(&actual, path, ctx->client, pool, pool));
+                if (strcmp(actual, root)) return invalid_wc("路径属于其他工作副本");
+            }
+        } else {
+            if (errno != ENOENT)
+                return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法访问工作副本路径");
+            svn_node_kind_t kind;
+            SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, TRUE, FALSE, pool));
+            if (slash ? kind != svn_node_dir : (kind != svn_node_dir && kind != svn_node_file && kind != svn_node_symlink))
+                return invalid_wc("找不到工作副本中的目标");
+        }
+        if (!slash) break;
+        relative = slash + 1;
+    }
+    svn_opt_revision_t base = csvn_rev_kind(svn_opt_revision_base);
+    return svn_client_status6(NULL, ctx->client, path, &base, svn_depth_empty,
+                              TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, NULL,
+                              reject_file_external, NULL, pool);
+}
+
+int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
+                                const char *const *targets, int count)
+{
+    if (!ctx || !root_path || !targets || count < 1) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+    apr_pool_t *pool = svn_pool_create(ctx->pool);
+    const char *anchor, *root;
+    svn_error_t *err = svn_dirent_get_absolute(&anchor, root_path, pool);
+    if (!err) err = svn_client_get_wc_root(&root, anchor, ctx->client, pool, pool);
+    for (int i = 0; !err && i < count; ++i)
+        err = validate_write_target(ctx, anchor, root, targets[i], pool);
+    return finish_wc_operation(ctx, err, pool);
+}
+
 int csvn_delete_files(csvn_ctx *ctx, const char *root_path, const char *const *paths, int count)
 {
     if (!ctx || !root_path || !paths || count < 1) return -100;
