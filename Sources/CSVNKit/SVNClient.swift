@@ -537,66 +537,32 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         data.prefix(8192).contains(0)
     }
 
-    /// 支持 UTF-8 与 GB18030 解码（兼容被截断的多字节尾部与混合编码的 diff 头/正文）。
-    public static func decodeText(_ data: Data) -> String? {
-        if data.isEmpty { return "" }
+    /// 只有明确截断的读取才允许丢弃末尾不完整的字符。
+    public static func decodeText(_ data: Data, isTruncated: Bool = false) -> String? {
         if looksBinaryData(data) { return nil }
-
-        if let s = String(data: data, encoding: .utf8) {
-            return s
-        }
-        if data.count > 4 {
-            for trim in 1...3 {
-                if let s = String(data: data.dropLast(trim), encoding: .utf8) {
-                    return s
-                }
-            }
-        }
-
-        let gbEnc = CFStringConvertEncodingToNSStringEncoding(
+        let gbEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
             CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)
-        )
-        let gbEncoding = String.Encoding(rawValue: gbEnc)
-        if let s = String(data: data, encoding: gbEncoding) {
-            return s
+        ))
+        func decode(_ bytes: Data) -> String? {
+            String(data: bytes, encoding: .utf8) ?? String(data: bytes, encoding: gbEncoding)
         }
-        if data.count > 4 {
-            for trim in 1...3 {
-                if let s = String(data: data.dropLast(trim), encoding: gbEncoding) {
-                    return s
-                }
-            }
-        }
+        if let text = decode(data) { return text }
 
-        // 逐行回退解码（应对 UTF-8 头部 + GB18030 正文混合的 diff 输出）
-        let lineSlices = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        var decodedLines: [String] = []
-        decodedLines.reserveCapacity(lineSlices.count)
-        for (idx, slice) in lineSlices.enumerated() {
-            let lineData = Data(slice)
-            if let u = String(data: lineData, encoding: .utf8) {
-                decodedLines.append(u)
-            } else if let g = String(data: lineData, encoding: gbEncoding) {
-                decodedLines.append(g)
-            } else if idx == lineSlices.count - 1, lineData.count > 4 {
-                var recovered: String? = nil
-                for trim in 1...3 {
-                    if let u = String(data: lineData.dropLast(trim), encoding: .utf8) {
-                        recovered = u
-                        break
-                    }
-                    if let g = String(data: lineData.dropLast(trim), encoding: gbEncoding) {
-                        recovered = g
-                        break
-                    }
-                }
-                guard let recovered else { return nil }
-                decodedLines.append(recovered)
+        // 差异的 UTF-8 标头与正文有时来自不同的编码。
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        var decoded: [String] = []
+        for (index, line) in lines.enumerated() {
+            if let text = decode(Data(line)) {
+                decoded.append(text)
+            } else if isTruncated, index == lines.count - 1,
+                      let recovered = (1...3).lazy.filter({ $0 <= line.count })
+                          .compactMap({ decode(Data(line.dropLast($0))) }).first {
+                decoded.append(recovered)
             } else {
                 return nil
             }
         }
-        return decodedLines.joined(separator: "\n")
+        return decoded.joined(separator: "\n")
     }
 
     private static func normalizeLineEndings(_ s: String) -> String {
@@ -656,9 +622,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     /// 解码多文件 unified diff 字节流（严禁回退到 `String(cString:)`，防止遇到 NUL 字节截断后续所有文件）。
     /// 若整体 `decodeText` 失败，则按 `Index: ` 段切分逐段解码，单段失败时回退为 `String(decoding: as: UTF8.self)`。
     public static func decodeMultiFileDiffData(_ rawData: Data) -> String {
-        if rawData.isEmpty { return "" }
+        decodeDiffSections(rawData).text
+    }
+
+    private static func decodeDiffSections(_ rawData: Data) -> (text: String, lossy: Bool) {
+        if rawData.isEmpty { return ("", false) }
         if let whole = decodeText(rawData) {
-            return whole
+            return (whole, false)
         }
         let lineSlices = rawData.split(separator: 0x0A, omittingEmptySubsequences: false)
         let indexPrefix = Array("Index: ".utf8)
@@ -684,10 +654,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
         flushSection()
 
-        let decodedSections = sectionsData.map { secData in
-            decodeText(secData) ?? String(decoding: secData, as: UTF8.self)
+        var lossy = false
+        let decodedSections = sectionsData.map { section in
+            if let decoded = decodeText(section) { return decoded }
+            lossy = true
+            return String(decoding: section, as: UTF8.self)
         }
-        return decodedSections.joined(separator: "\n")
+        return (decodedSections.joined(separator: "\n"), lossy)
     }
 
     /// 仅在进入首个 `@@` hunk 之前的 diff 头部行中检查固定格式的二进制标记，避免把包含 `"Binary file"` 的源码改动行误判为二进制。
@@ -723,11 +696,16 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 defer { if let text { csvn_free_string(text) } }
                 guard let text, len > 0 else { continue }
                 let data = Data(bytes: text, count: len)
-                let raw = Self.decodeMultiFileDiffData(data)
+                let (raw, lossy) = Self.decodeDiffSections(data)
                 if raw.isEmpty { continue }
 
                 let parsed = Self.parseMultiFileDiff(raw, workingCopyPath: wcPath, fallbackTarget: t)
-                out.append(contentsOf: parsed)
+                out.append(contentsOf: parsed.map { diff in
+                    guard lossy, !diff.isBinary else { return diff }
+                    return FileDiff(id: diff.id, path: diff.path, localPath: diff.localPath,
+                                    isBinary: diff.isBinary, hunks: diff.hunks,
+                                    isTruncated: diff.isTruncated, statusNotice: "部分差异无法完整解码")
+                })
             }
             return out
         }
@@ -818,7 +796,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                         statusNotice: "二进制文件，不支持文本差异预览"
                     )
                 }
-                let text = Self.decodeText(data) ?? String(decoding: data, as: UTF8.self)
+                let decoded = Self.decodeText(data, isTruncated: truncated)
+                let text = decoded ?? String(decoding: data, as: UTF8.self)
                 if Self.hasBinaryDiffHeader(text) {
                     return FileDiff(
                         id: change.path,
@@ -838,7 +817,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     isBinary: false,
                     hunks: hunks,
                     isTruncated: truncated,
-                    statusNotice: hunks.isEmpty ? emptyNotice : nil
+                    statusNotice: decoded == nil ? "部分差异无法完整解码" : (hunks.isEmpty ? emptyNotice : nil)
                 )
             }
 
@@ -876,7 +855,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                             statusNotice: "二进制文件，不支持文本差异预览"
                         )
                     }
-                    let text = Self.decodeText(data) ?? String(decoding: data, as: UTF8.self)
+                    let decoded = Self.decodeText(data, isTruncated: truncated)
+                    let text = decoded ?? String(decoding: data, as: UTF8.self)
                     let hunks = Self.synthesizeAdded(text)
                     return FileDiff(
                         id: change.path,
@@ -912,7 +892,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                             statusNotice: "已删除二进制文件"
                         )
                     }
-                    let text = Self.decodeText(data) ?? String(decoding: data, as: UTF8.self)
+                    let decoded = Self.decodeText(data, isTruncated: truncated)
+                    let text = decoded ?? String(decoding: data, as: UTF8.self)
                     let hunks = Self.synthesizeDeleted(text)
                     return FileDiff(
                         id: change.path,
@@ -921,7 +902,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                         isBinary: false,
                         hunks: hunks,
                         isTruncated: truncated,
-                        statusNotice: hunks.isEmpty ? "已删除空文件" : nil
+                        statusNotice: decoded == nil ? "文件内容无法完整解码" : (hunks.isEmpty ? "已删除空文件" : nil)
                     )
                 }
                 return FileDiff(

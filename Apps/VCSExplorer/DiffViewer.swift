@@ -254,6 +254,9 @@ struct DiffViewer<TrailingActions: View>: View {
             }
 
         case .loaded(let diff, let isTruncated):
+            if !diff.hunks.isEmpty, let notice = diff.statusNotice {
+                Text(notice).font(.caption).foregroundStyle(.secondary)
+            }
             if diff.isBinary || (diff.hunks.isEmpty && FileIcon.isKnownBinaryExtension(filePath)) {
                 binaryPlaceholderCard(path: filePath, size: nil)
             } else if diff.hunks.isEmpty {

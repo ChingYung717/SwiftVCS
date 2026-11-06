@@ -393,6 +393,7 @@ do {
                 out("[二进制文件] \(d.statusNotice ?? "无法显示文本差异")")
                 continue
             }
+            if let notice = d.statusNotice { out("[\(notice)]") }
             for h in d.hunks {
                 out(h.header)
                 for l in h.lines {
@@ -601,7 +602,7 @@ do {
                 out("[二进制文件] \(d.statusNotice ?? "无法显示文本差异")")
                 continue
             }
-            if let notice = d.statusNotice, d.hunks.isEmpty {
+            if let notice = d.statusNotice {
                 out("[\(notice)]")
             }
             if d.isTruncated {
