@@ -1293,31 +1293,45 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
     }
 
-    private func writeTargets(_ wc: URL, _ paths: [String], exact: Bool, committing: Bool) throws -> [String] {
-        let root = wc.standardizedFileURL.resolvingSymlinksInPath()
-        if paths.isEmpty && committing { return [root.path] }
-        if exact {
-            for path in paths {
-                try validateCString(path)
-                guard path == "." || (!path.isEmpty && !path.hasPrefix("/") &&
-                      !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: {
-                          $0.isEmpty || $0 == ".." || $0 == "." || $0.lowercased() == ".svn"
-                      })) else {
-                    throw VCSError.invalidArgument("精确操作需要工作副本内的相对路径")
-                }
-            }
+    private func writePath(_ path: String, root: String, originalRoot: String) throws -> String {
+        try validateCString(path)
+        let parts = path.split(separator: "/").filter { $0 != "." }
+        guard !path.contains("://"), !parts.contains(where: { $0 == ".." || $0.lowercased() == ".svn" }) else {
+            throw VCSError.invalidArgument("写入目标必须在指定工作副本内")
         }
-        var targets = paths.isEmpty ? [root.path] : Set(paths.map {
-            URL(fileURLWithPath: self.localPath(root, $0)).standardizedFileURL.path
+        let normalized = parts.joined(separator: "/")
+        if !path.hasPrefix("/") { return normalized.isEmpty ? root : root + "/" + normalized }
+        let absolute = "/" + normalized
+        for anchor in [root, originalRoot] {
+            if absolute == anchor { return root }
+            if absolute.hasPrefix(anchor + "/") { return root + absolute.dropFirst(anchor.count) }
+        }
+        throw VCSError.invalidArgument("写入目标必须在指定工作副本内")
+    }
+
+    private func validateWriteTargets(_ targets: [String], root: String) throws {
+        let count = try Self.nativeInteger(targets.count, field: "目标数量", minimum: 1)
+        var paths: [UnsafePointer<CChar>?] = targets.map { strdup($0).map { UnsafePointer($0) } }
+        defer { paths.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
+        guard !paths.contains(where: { $0 == nil }) else { throw VCSError.underlying("无法分配路径") }
+        let h = try requireHandle()
+        try check(csvn_validate_write_targets(h, root, &paths, count))
+    }
+
+    private func writeTargets(_ wc: URL, _ paths: [String], exact: Bool, committing: Bool) throws -> [String] {
+        let root = try writeRoot(wc)
+        func absolute(_ relative: String) -> String { relative == "." ? root : root + "/" + relative }
+        var targets = paths.isEmpty ? [root] : Set(try paths.map {
+            try writePath($0, root: root, originalRoot: wc.standardizedFileURL.path)
         })
-        let statuses = try readStatus(root.path)
+        try validateWriteTargets(targets.sorted(), root: root)
+        let statuses = try readStatus(root)
         if exact {
-            let available = Set(statuses.map(\.path))
-            guard paths.allSatisfy({ available.contains($0) }) else {
+            let available = Set(statuses.map { absolute($0.path) })
+            guard targets.isSubset(of: available) else {
                 throw VCSError.invalidArgument("所选路径状态已改变，请刷新工作副本")
             }
         }
-        func absolute(_ relative: String) -> String { localPath(root, relative) }
         func includes(_ path: String) -> Bool {
             targets.contains(path) || (!exact && targets.contains { path.hasPrefix($0 + "/") })
         }
@@ -1326,7 +1340,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             changed = false
             for item in statuses where includes(absolute(item.path)) {
                 for partner in [item.movedFrom, item.movedTo].compactMap({ $0 }) where !includes(absolute(partner)) {
-                    targets.insert(absolute(partner))
+                    let target = try writePath(partner, root: root, originalRoot: root)
+                    try validateWriteTargets([target], root: root)
+                    targets.insert(target)
                     changed = true
                 }
             }
@@ -1351,7 +1367,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     private func writeRoot(_ url: URL) throws -> String {
         guard url.isFileURL else { throw VCSError.invalidArgument("需要本地 SVN 工作副本") }
-        return url.standardizedFileURL.resolvingSymlinksInPath().path
+        let root = url.standardizedFileURL.resolvingSymlinksInPath().path
+        try validateCString(root)
+        return root
     }
 
     private func validateCString(_ value: String) throws {
@@ -1452,6 +1470,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     // MARK: - 节点属性与目录
+
+    private static func nativeInteger(_ value: Int, field: String, minimum: Int = 0) throws -> Int32 {
+        guard value >= minimum, let result = Int32(exactly: value) else {
+            throw VCSError.invalidArgument("\(field)须在 \(minimum)...\(Int32.max) 范围内")
+        }
+        return result
+    }
 
     private func propertyRevision(_ revision: Int?) throws -> Int32 {
         guard let revision else { return -1 }
@@ -1685,7 +1710,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     public func add(workingCopy: URL, paths: [String]) async throws -> Int {
         try await performWrite {
             let h = try self.requireHandle()
-            let targets = paths.isEmpty ? [workingCopy.path] : paths.map { self.localPath(workingCopy, $0) }
+            let root = try self.writeRoot(workingCopy)
+            let targets = paths.isEmpty ? [root] : try paths.map {
+                try self.writePath($0, root: root, originalRoot: workingCopy.standardizedFileURL.path)
+            }
+            try self.validateWriteTargets(targets, root: root)
             var cStrings: [UnsafeMutablePointer<CChar>] = []
             defer { for s in cStrings { free(s) } }
             cStrings = targets.map { strdup($0) }
