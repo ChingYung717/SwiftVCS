@@ -117,7 +117,8 @@ brew install subversion apr apr-util pkgconf
 
 ```bash
 # 使用 GitHub CLI 下载最新预编译包与校验文件（也可直接在网页端 Releases 页面下载）
-gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+TAG=$(gh release list --repo ChingYung717/SwiftVCS -L 1 --json tagName -q '.[0].tagName')
+gh release download "$TAG" --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
 shasum -a 256 --check SHA256SUMS
 
 # 解压并移入 /Applications
@@ -299,7 +300,8 @@ Every push to `main` publishes a verified preview bundle on GitHub Releases:
 
 ```bash
 # Download the latest preview bundle and checksums via GitHub CLI (or from the Releases page)
-gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+TAG=$(gh release list --repo ChingYung717/SwiftVCS -L 1 --json tagName -q '.[0].tagName')
+gh release download "$TAG" --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
 shasum -a 256 --check SHA256SUMS
 
 unzip -q VCSExplorer-arm64.zip

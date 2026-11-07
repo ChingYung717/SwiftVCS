@@ -238,9 +238,17 @@ int csvn_add(csvn_ctx *ctx,
 /* 12. 读取仓库或工作副本中某文件的内容（svn cat），out_data 由 csvn_free_string 释放 */
 int csvn_cat(csvn_ctx *ctx,
              const char *path_or_url,
-             int revision,         /* <=0 表示 HEAD/WORKING */
+             int revision,         /* <=0 表示HEAD/WORKING */
              char **out_data,
              long *out_len);
+
+int csvn_cat_capped(csvn_ctx *ctx,
+                    const char *path_or_url,
+                    int revision,
+                    long max_bytes,
+                    char **out_data,
+                    long *out_len,
+                    int *out_truncated);
 
 /* ---- 访问器（避免 Swift 侧处理定长字符数组）---- */
 static inline const char *csvn_entry_path_p(const csvn_entry *e) { return e->path; }

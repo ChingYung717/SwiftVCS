@@ -305,9 +305,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                let value = csvn_auth_realm(h), value.pointee != 0 {
                 self.rememberedConnection = (url, username, password, String(cString: value))
             }
-            if self.credentialURL == nil {
-                self.credentialURL = url
-            }
+            self.credentialURL = url
             connected = true
             return RepositoryInfo(
                 url: url,
@@ -422,6 +420,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return try await performWrite {
             let h = try self.requireHandle()
             let wc = workingCopy.path
+            progress?(VCSTaskProgress(phase: "正在同步工作副本", completed: 0, total: 1, currentPath: wc))
             var rev: Int32 = 0
             var updated: Int32 = 0
             var added: Int32 = 0
@@ -435,6 +434,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             }
             try self.check(rc)
             defer { if let conflicts { csvn_free_string(conflicts) } }
+            progress?(VCSTaskProgress(phase: "同步完成", completed: 1, total: 1, currentPath: wc))
 
             let list = conflicts.map { String(cString: $0) }?
                 .split(separator: "\n", omittingEmptySubsequences: true)
@@ -840,15 +840,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             func catContent(url: URL, rev: Int) -> (data: Data, truncated: Bool)? {
                 var buf: UnsafeMutablePointer<CChar>? = nil
                 var len: Int = 0
+                var truncated: Int32 = 0
                 let rc = url.absoluteString.withCString { u in
-                    csvn_cat(h, u, Int32(rev), &buf, &len)
+                    csvn_cat_capped(h, u, Int32(rev), maxBytes, &buf, &len, &truncated)
                 }
                 defer { if let buf { csvn_free_string(buf) } }
                 guard rc == 0, let buf else { return nil }
-                if maxBytes > 0 && len > maxBytes {
-                    return (Data(bytes: buf, count: maxBytes), true)
-                }
-                return (Data(bytes: buf, count: max(0, len)), false)
+                return (Data(bytes: buf, count: max(0, len)), truncated != 0)
             }
 
             func makeDiffFromUnified(data: Data, truncated: Bool, emptyNotice: String?) -> FileDiff {
@@ -1089,20 +1087,36 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             return []
         }
 
-        let normalizedFilter: String? = {
-            guard var p = path?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty else { return nil }
+        let candidateFilters: [String] = {
+            guard var p = path?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty else { return [] }
             while p.count > 1 && p.hasSuffix("/") {
                 p.removeLast()
             }
-            return p.hasPrefix("/") ? p : "/" + p
+            let norm = p.hasPrefix("/") ? p : "/" + p
+            var filters = [norm]
+            if let base = self.baseURL {
+                var basePath = Self.trimTrailingSlash(base).path
+                var rootPath = Self.trimTrailingSlash(logTarget).path
+                while basePath.count > 1 && basePath.hasSuffix("/") { basePath.removeLast() }
+                while rootPath.count > 1 && rootPath.hasSuffix("/") { rootPath.removeLast() }
+                if rootPath == "/" && basePath.count > 1 && basePath.hasPrefix("/") {
+                    let subFilter = basePath + norm
+                    if !filters.contains(subFilter) { filters.append(subFilter) }
+                } else if basePath.count > rootPath.count && basePath.hasPrefix(rootPath + "/") {
+                    let subPrefix = String(basePath.dropFirst(rootPath.count))
+                    let subFilter = subPrefix + norm
+                    if !filters.contains(subFilter) { filters.append(subFilter) }
+                }
+            }
+            return filters
         }()
 
         var results: [FileDiff] = []
         for change in entry.changes {
-            if let filter = normalizedFilter {
-                let matches = change.path == filter
-                    || change.path.hasPrefix(filter + "/")
-                    || change.path.hasSuffix(filter)
+            if !candidateFilters.isEmpty {
+                let matches = candidateFilters.contains { filter in
+                    change.path == filter || change.path.hasPrefix(filter + "/")
+                }
                 if !matches { continue }
             }
             do {
@@ -1298,19 +1312,26 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         message: String,
         progress: (@Sendable (VCSTaskProgress) -> Void)?
     ) async throws -> CommitResult {
-        try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: false)
+        try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: false, progress: progress)
     }
 
     /// 提交已逐项审核的路径。目录项仅提交自身属性，子路径须明确列出。
     public func commitSelection(workingCopy: URL, paths: [String], message: String) async throws -> CommitResult {
         guard !paths.isEmpty else { throw VCSError.invalidArgument("请选择要提交的路径") }
-        return try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: true)
+        return try await commitPaths(workingCopy: workingCopy, paths: paths, message: message, exact: true, progress: nil)
     }
 
-    private func commitPaths(workingCopy: URL, paths: [String], message: String, exact: Bool) async throws -> CommitResult {
+    private func commitPaths(
+        workingCopy: URL,
+        paths: [String],
+        message: String,
+        exact: Bool,
+        progress: (@Sendable (VCSTaskProgress) -> Void)?
+    ) async throws -> CommitResult {
         try await performWrite {
             let h = try self.requireHandle()
             let targets = try self.writeTargets(workingCopy, paths, exact: exact, committing: true)
+            progress?(VCSTaskProgress(phase: "正在提交改动", completed: 0, total: targets.count, currentPath: targets.first))
 
             var cStrings: [UnsafeMutablePointer<CChar>] = []
             defer { for s in cStrings { free(s) } }
@@ -1327,6 +1348,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 }
             }
             try self.check(rc)
+            progress?(VCSTaskProgress(phase: "提交完成", completed: Int(committed), total: targets.count, currentPath: nil))
             return CommitResult(revision: Int(rev), committedCount: Int(committed), message: message)
         }
     }
@@ -1802,19 +1824,26 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     /// 读取远端仓库中指定路径文件的内容（`svn cat`）。
     public func cat(path: String, revision: Int? = nil) async throws -> Data {
+        try await cat(path: path, revision: revision, maxBytes: 0).data
+    }
+
+    /// 读取远端仓库中指定路径文件的内容（支持 `maxBytes` C 层流式截断保护）。
+    public func cat(path: String, revision: Int? = nil, maxBytes: Int) async throws -> (data: Data, isTruncated: Bool) {
         let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
+        guard maxBytes >= 0 else { throw VCSError.invalidArgument("读取字节上限不能为负数") }
         let target = try url(for: path)
         return try await perform {
             let h = try self.requireHandle()
             var buf: UnsafeMutablePointer<CChar>? = nil
             var len: Int = 0
+            var truncated: Int32 = 0
             let rc = target.absoluteString.withCString { u in
-                csvn_cat(h, u, nativeRevision, &buf, &len)
+                csvn_cat_capped(h, u, nativeRevision, maxBytes, &buf, &len, &truncated)
             }
             try self.check(rc)
             defer { if let buf { csvn_free_string(buf) } }
-            guard let buf, len > 0 else { return Data() }
-            return Data(bytes: buf, count: len)
+            guard let buf, len > 0 else { return (Data(), truncated != 0) }
+            return (Data(bytes: buf, count: len), truncated != 0)
         }
     }
 }

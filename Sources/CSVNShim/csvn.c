@@ -53,6 +53,7 @@ struct csvn_ctx {
     const char *origin;
     const char *expected_realm;
     const char *auth_realm;
+    int auth_realm_ambiguous;
     const char *pinned_cert;
     apr_thread_mutex_t *mutex;
     char last_repos_root[2048];
@@ -243,7 +244,7 @@ static svn_error_t *scoped_password(svn_auth_cred_simple_t **cred, void *baton,
     if (!ctx->auth_realm)
         ctx->auth_realm = apr_pstrdup(ctx->pool, realm);
     else if (strcmp(ctx->auth_realm, realm) != 0)
-        ctx->auth_realm = ""; /* Ambiguous challenge: do not persist credentials. */
+        ctx->auth_realm_ambiguous = 1; /* Ambiguous challenge: do not persist credentials. */
     return SVN_NO_ERROR;
 }
 
@@ -254,14 +255,15 @@ static svn_error_t *scoped_server_trust(svn_auth_cred_ssl_server_trust_t **cred,
                                         svn_boolean_t may_save, apr_pool_t *pool)
 {
     csvn_ctx *ctx = baton;
+    apr_uint32_t allowed = SVN_AUTH_SSL_UNKNOWNCA | SVN_AUTH_SSL_CNMISMATCH;
     *cred = NULL;
-    if (failures != SVN_AUTH_SSL_UNKNOWNCA || !realm || !ctx->origin ||
+    if (!failures || (failures & ~allowed) != 0 || !realm || !ctx->origin ||
         strcasecmp(realm, ctx->origin) != 0 || !ctx->pinned_cert ||
         !cert || !cert->ascii_cert || strcmp(cert->ascii_cert, ctx->pinned_cert) != 0)
         return SVN_NO_ERROR;
 
     svn_auth_cred_ssl_server_trust_t *value = apr_pcalloc(pool, sizeof(*value));
-    value->accepted_failures = SVN_AUTH_SSL_UNKNOWNCA;
+    value->accepted_failures = failures & allowed;
     *cred = value;
     return SVN_NO_ERROR;
 }
@@ -391,7 +393,16 @@ csvn_ctx *csvn_context_create(const char *username,
 
 const char *csvn_auth_realm(csvn_ctx *ctx)
 {
-    return ctx ? ctx->auth_realm : NULL;
+    static __thread char tls_realmbuf[2048];
+    const char *result = NULL;
+    if (!ctx) return NULL;
+    apr_thread_mutex_lock(ctx->mutex);
+    if (ctx->auth_realm && !ctx->auth_realm_ambiguous && ctx->auth_realm[0] != '\0') {
+        csvn_copy_str(tls_realmbuf, sizeof(tls_realmbuf), ctx->auth_realm);
+        result = tls_realmbuf;
+    }
+    apr_thread_mutex_unlock(ctx->mutex);
+    return result;
 }
 
 void csvn_context_destroy(csvn_ctx *ctx)
@@ -510,6 +521,12 @@ int csvn_get_repos_root(csvn_ctx *ctx,
         size_t rlen = strlen(ctx->last_repos_root);
         if (strcmp(canon_url, ctx->last_repos_root) == 0 ||
             (strncmp(canon_url, ctx->last_repos_root, rlen) == 0 && canon_url[rlen] == '/')) {
+            if (rlen >= (size_t)out_root_len) {
+                int rc = csvn_classify(ctx, svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库根 URL 超出缓冲区长度"));
+                svn_pool_destroy(scratch);
+                apr_thread_mutex_unlock(ctx->mutex);
+                return rc;
+            }
             csvn_copy_str(out_root, (size_t)out_root_len, ctx->last_repos_root);
             svn_pool_destroy(scratch);
             apr_thread_mutex_unlock(ctx->mutex);
@@ -528,6 +545,12 @@ int csvn_get_repos_root(csvn_ctx *ctx,
         return rc;
     }
 
+    if (strlen(root) >= (size_t)out_root_len) {
+        int rc = csvn_classify(ctx, svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库根 URL 超出缓冲区长度"));
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
     csvn_copy_str(ctx->last_repos_root, sizeof(ctx->last_repos_root), root);
     csvn_copy_str(out_root, (size_t)out_root_len, root);
     svn_pool_destroy(scratch);
@@ -575,9 +598,14 @@ list_cb(void *baton,
     e = &lb->entries[lb->count++];
     memset(e, 0, sizeof(*e));
 
-    csvn_copy_str(e->path, sizeof(e->path), path ? path : "");
     base = path ? strrchr(path, '/') : NULL;
-    csvn_copy_str(e->name, sizeof(e->name), base ? base + 1 : (path ? path : ""));
+    {
+        const char *entry_name = base ? base + 1 : (path ? path : "");
+        if ((path && strlen(path) >= sizeof(e->path)) || strlen(entry_name) >= sizeof(e->name))
+            return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库条目路径超出支持长度");
+        csvn_copy_str(e->path, sizeof(e->path), path ? path : "");
+        csvn_copy_str(e->name, sizeof(e->name), entry_name);
+    }
     e->kind = (dirent->kind == svn_node_dir) ? 'd'
            : (dirent->kind == svn_node_file) ? 'f' : 'l';
     e->revision = (int)dirent->created_rev;
@@ -1098,7 +1126,7 @@ int csvn_diff(csvn_ctx *ctx,
         return rc;
     }
 
-    text = read_whole_file(templ, out_len);
+    text = read_file_capped(templ, 32 * 1024 * 1024, out_len, NULL);
     remove(templ);
     *out_text = text;
     svn_pool_destroy(scratch);
@@ -1463,6 +1491,7 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
     csvn_copy_str(e->author, sizeof(e->author), author);
     e->timestamp = csvn_parse_svn_date(date);
     e->message = strdup(msg ? msg : "");
+    if (!e->message) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
 
     changed = log_entry->changed_paths2 ? log_entry->changed_paths2 : log_entry->changed_paths;
     if (changed) {
@@ -1477,7 +1506,11 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
         e->copyfrom_paths = (char **)calloc(alloc_n, sizeof(char *));
         e->changed_count = 0;
 
-        if (temp && e->changed_paths && e->changed_kinds && e->copyfrom_paths) {
+        if (!temp || !e->changed_paths || !e->changed_kinds || !e->copyfrom_paths) {
+            free(temp);
+            return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        }
+        {
             for (hi = apr_hash_first(NULL, changed); hi; hi = apr_hash_next(hi)) {
                 const void *k = NULL;
                 void *val = NULL;
@@ -1497,9 +1530,15 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
                         if (cp->copyfrom_path && cp->copyfrom_path[0] != '\0' && SVN_IS_VALID_REVNUM(cp->copyfrom_rev)) {
                             size_t cflen = strlen(cp->copyfrom_path) + 32;
                             copyfrom = (char *)malloc(cflen);
-                            if (copyfrom) {
-                                snprintf(copyfrom, cflen, "%s@%ld", cp->copyfrom_path, (long)cp->copyfrom_rev);
+                            if (!copyfrom) {
+                                for (i = 0; i < count; i++) {
+                                    free(temp[i].formatted_path);
+                                    free(temp[i].copyfrom);
+                                }
+                                free(temp);
+                                return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
                             }
+                            snprintf(copyfrom, cflen, "%s@%ld", cp->copyfrom_path, (long)cp->copyfrom_rev);
                         }
 
                         if (cp->action) {
@@ -1512,6 +1551,15 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
                     }
                     if (!formatted) {
                         formatted = strdup(p);
+                    }
+                    if (!formatted) {
+                        free(copyfrom);
+                        for (i = 0; i < count; i++) {
+                            free(temp[i].formatted_path);
+                            free(temp[i].copyfrom);
+                        }
+                        free(temp);
+                        return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
                     }
                     temp[count].raw_path = p;
                     temp[count].formatted_path = formatted;
@@ -1536,6 +1584,8 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
         e->changed_kinds = (char *)calloc(1, sizeof(char));
         e->copyfrom_paths = (char **)calloc(1, sizeof(char *));
         e->changed_count = 0;
+        if (!e->changed_paths || !e->changed_kinds || !e->copyfrom_paths)
+            return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
     }
     return SVN_NO_ERROR;
 }
@@ -1636,6 +1686,12 @@ int csvn_wc_url(csvn_ctx *ctx,
         return rc;
     }
 
+    if (strlen(url) >= (size_t)out_url_len) {
+        int rc = csvn_classify(ctx, svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库 URL 超出缓冲区长度"));
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
     csvn_copy_str(out_url, (size_t)out_url_len, url);
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);
@@ -1679,21 +1735,81 @@ int csvn_add(csvn_ctx *ctx,
     return 0;
 }
 
-int csvn_cat(csvn_ctx *ctx,
-             const char *path_or_url,
-             int revision,
-             char **out_data,
-             long *out_len)
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+    size_t max_bytes;
+    int truncated;
+} cat_stream_baton;
+
+static svn_error_t *cat_stream_write(void *baton, const char *data, apr_size_t *len)
+{
+    cat_stream_baton *cb = (cat_stream_baton *)baton;
+    size_t incoming = *len;
+    size_t allowed = incoming;
+
+    if (cb->max_bytes > 0) {
+        if (cb->len >= cb->max_bytes) {
+            cb->truncated = 1;
+            return svn_error_create(SVN_ERR_CEASE_INVOCATION, NULL, "已达到读取上限");
+        }
+        if (cb->len + incoming > cb->max_bytes) {
+            allowed = cb->max_bytes - cb->len;
+            cb->truncated = 1;
+        }
+    }
+
+    if (cb->len + allowed + 1 > cb->cap) {
+        size_t ncap = cb->cap ? cb->cap * 2 : 4096;
+        while (ncap < cb->len + allowed + 1) {
+            if (ncap > ((size_t)-1) / 2) {
+                ncap = cb->len + allowed + 1;
+                break;
+            }
+            ncap *= 2;
+        }
+        if (cb->max_bytes > 0 && ncap > cb->max_bytes + 1) {
+            ncap = cb->max_bytes + 1;
+        }
+        char *nbuf = (char *)realloc(cb->buf, ncap);
+        if (!nbuf) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        cb->buf = nbuf;
+        cb->cap = ncap;
+    }
+
+    if (allowed > 0) {
+        memcpy(cb->buf + cb->len, data, allowed);
+        cb->len += allowed;
+        cb->buf[cb->len] = '\0';
+    }
+
+    if (cb->truncated) {
+        return svn_error_create(SVN_ERR_CEASE_INVOCATION, NULL, "已达到读取上限");
+    }
+    return SVN_NO_ERROR;
+}
+
+int csvn_cat_capped(csvn_ctx *ctx,
+                    const char *path_or_url,
+                    int revision,
+                    long max_bytes,
+                    char **out_data,
+                    long *out_len,
+                    int *out_truncated)
 {
     svn_error_t *err;
     apr_pool_t *scratch;
     const char *canon_target;
     svn_opt_revision_t peg, rev_opt;
-    svn_stringbuf_t *strbuf;
     svn_stream_t *stream;
-    char *copy = NULL;
+    cat_stream_baton cb;
 
-    if (!ctx || !path_or_url || !out_data) return -100;
+    if (!ctx || !path_or_url || !out_data || max_bytes < 0) return -100;
+    *out_data = NULL;
+    if (out_len) *out_len = 0;
+    if (out_truncated) *out_truncated = 0;
+
     apr_thread_mutex_lock(ctx->mutex);
     csvn_clear_error(ctx);
 
@@ -1708,39 +1824,54 @@ int csvn_cat(csvn_ctx *ctx,
         rev_opt = (revision > 0) ? csvn_rev_number(revision) : csvn_rev_kind(svn_opt_revision_working);
     }
 
-    strbuf = svn_stringbuf_create_empty(scratch);
-    stream = svn_stream_from_stringbuf(strbuf, scratch);
+    memset(&cb, 0, sizeof(cb));
+    cb.max_bytes = (size_t)max_bytes;
+    stream = svn_stream_create(&cb, scratch);
+    svn_stream_set_write(stream, cat_stream_write);
 
     err = svn_client_cat3(NULL, stream, canon_target, &peg, &rev_opt,
                           TRUE /* expand_keywords */,
                           ctx->client, scratch, scratch);
+    if (err && cb.truncated && svn_error_find_cause(err, SVN_ERR_CEASE_INVOCATION)) {
+        svn_error_clear(err);
+        err = SVN_NO_ERROR;
+    }
     if (!err) {
         err = svn_stream_close(stream);
     }
 
     if (err) {
         int rc = csvn_classify(ctx, err);
+        free(cb.buf);
         svn_pool_destroy(scratch);
         apr_thread_mutex_unlock(ctx->mutex);
         return rc;
     }
 
-    copy = (char *)malloc(strbuf->len + 1);
-    if (!copy) {
-        svn_pool_destroy(scratch);
-        apr_thread_mutex_unlock(ctx->mutex);
-        return -100;
+    if (!cb.buf) {
+        cb.buf = (char *)calloc(1, 1);
+        if (!cb.buf) {
+            svn_pool_destroy(scratch);
+            apr_thread_mutex_unlock(ctx->mutex);
+            return -100;
+        }
     }
-    if (strbuf->len > 0) {
-        memcpy(copy, strbuf->data, strbuf->len);
-    }
-    copy[strbuf->len] = '\0';
-    *out_data = copy;
-    if (out_len) *out_len = (long)strbuf->len;
+    *out_data = cb.buf;
+    if (out_len) *out_len = (long)cb.len;
+    if (out_truncated) *out_truncated = cb.truncated;
 
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);
     return 0;
+}
+
+int csvn_cat(csvn_ctx *ctx,
+             const char *path_or_url,
+             int revision,
+             char **out_data,
+             long *out_len)
+{
+    return csvn_cat_capped(ctx, path_or_url, revision, 0, out_data, out_len, NULL);
 }
 
 /* ------------------------------------------------------------------ */

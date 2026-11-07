@@ -190,9 +190,14 @@ public final class TrustStore: Sendable {
             throw TrustStoreError.cannotFetchCertificate
         }
         let address = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
-        let pem = try runOpenssl([
-            "s_client", "-connect", address, "-servername", host, "-showcerts",
-        ])
+        let ipv4Parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        let isIPLiteral = host.contains(":") || (ipv4Parts.count == 4 && ipv4Parts.allSatisfy { UInt8($0) != nil })
+        var args = ["s_client", "-connect", address]
+        if !isIPLiteral {
+            args.append(contentsOf: ["-servername", host])
+        }
+        args.append("-showcerts")
+        let pem = try runOpenssl(args)
         let blocks = Self.extractPEMBlocks(from: pem)
         guard let targetCertBlock = blocks.first,
               let der = Self.derData(fromPEMBlock: targetCertBlock),
@@ -298,8 +303,12 @@ public enum KeychainStore {
         guard let service = service(for: url) else { return }
         let data = try JSONEncoder().encode(SavedPassword(password: password, realm: realm))
         var request = query(service: service, username: username)
-        let attrs = [kSecValueData as String: data]
+        let attrs: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
         request[kSecValueData as String] = data
+        request[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         var status = SecItemAdd(request as CFDictionary, nil)
         if status == errSecDuplicateItem {
             status = SecItemUpdate(query(service: service, username: username) as CFDictionary,

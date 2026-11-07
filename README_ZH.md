@@ -77,7 +77,8 @@ flowchart TD
 每次推送 `main` 分支，CI 会自动构建并发布经过校验的 Preview Release。预编译包的最低系统版本以 Release 附带的 `build-info.txt` 为准（当前 `arm64` 预编译包要求 **macOS 15.0+**）：
 
 ```bash
-gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+TAG=$(gh release list --repo ChingYung717/SwiftVCS -L 1 --json tagName -q '.[0].tagName')
+gh release download "$TAG" --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
 shasum -a 256 --check SHA256SUMS
 
 unzip -q VCSExplorer-arm64.zip

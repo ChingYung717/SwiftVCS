@@ -46,7 +46,7 @@ struct Args {
                         setFlag(rawKey, "")
                         i += 1
                     }
-                } else if ["dry-run", "exact", "raw", "inherited", "parents"].contains(rawKey) {
+                } else if ["dry-run", "exact", "raw", "inherited", "parents", "all", "remember"].contains(rawKey) {
                     setFlag(rawKey, "true")
                     i += 1
                 } else if i + 1 < argv.count, !argv[i + 1].hasPrefix("-") {

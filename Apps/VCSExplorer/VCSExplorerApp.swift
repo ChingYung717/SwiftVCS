@@ -25,6 +25,12 @@ struct VCSExplorerApp: App {
                 }
                 exit(checks.allSatisfy(\.passed) ? 0 : 1)
             }
+        } else if !Bundle.main.bundlePath.hasSuffix(".app") {
+            // 直接通过 swift run VCSExplorer 启动裸二进制时，显式升级为常规前台应用以获取 Dock 图标与键盘焦点
+            NSApplication.shared.setActivationPolicy(.regular)
+            DispatchQueue.main.async {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
         }
     }
 
@@ -150,6 +156,7 @@ final class AppModel: ObservableObject {
     private var client: SVNClient?
     private var isSelfTest = false
     private var busyCount = 0
+    private var logGeneration = 0
 
     /// 提交级文件比对内存缓存（key = "rev|path"，LRU 上限 200）
     private var revisionDiffCache: [String: FileDiff] = [:]
@@ -363,7 +370,9 @@ final class AppModel: ObservableObject {
             client = c
             repoInfo = info
             certificateIssue = nil
-            lastRefresh = Date()
+            logGeneration += 1
+            now = Date()
+            lastRefresh = now
 
             if rememberPassword, !submittedPassword.isEmpty, SVNOrigin(url)?.scheme == "https" {
                 do {
@@ -410,7 +419,8 @@ final class AppModel: ObservableObject {
         selectedEntry = nil
         previewText = nil
         previewTitle = nil
-        lastRefresh = Date()
+        now = Date()
+        lastRefresh = now
         return entries
     }
 
@@ -453,7 +463,8 @@ final class AppModel: ObservableObject {
         guard workingCopyPath == path else { return }
         statuses = newStatuses
         updateConflicts = newStatuses.filter { $0.kind == .conflicted }.map(\.path).sorted()
-        lastRefresh = Date()
+        now = Date()
+        lastRefresh = now
 
         let newCommittablePaths = Set(newStatuses.filter { $0.kind != .normal && $0.kind != .ignored }.map(\.path))
         if !previousChecked.isEmpty {
@@ -530,9 +541,11 @@ final class AppModel: ObservableObject {
             limit: limit,
             startRevision: startRevision
         )
-        lastRefresh = Date()
+        now = Date()
+        lastRefresh = now
 
         if startRevision == nil {
+            logGeneration += 1
             logs = fetched
             hasMoreLogs = fetched.count >= limit && (fetched.last?.revision ?? 0) > 1
             if let currentRev = selectedRevision, fetched.contains(where: { $0.revision == currentRev }) {
@@ -614,10 +627,14 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            let data = try await c.cat(path: entry.path, revision: nil)
+            let maxPreviewBytes = 2 * 1024 * 1024
+            let (data, truncated) = try await c.cat(path: entry.path, revision: nil, maxBytes: maxPreviewBytes)
             guard !Task.isCancelled else { return }
             guard selectedEntry == nil || selectedEntry?.path == entry.path else { return }
-            if SVNClient.looksBinaryData(data) {
+            if truncated {
+                isPreviewBinary = true
+                previewText = "文件较大（超过 \(ByteCountFormatter.string(fromByteCount: Int64(maxPreviewBytes), countStyle: .file))），为避免卡顿已跳过在线文本预览。可检出工作副本后在本地打开。"
+            } else if SVNClient.looksBinaryData(data) {
                 isPreviewBinary = true
                 previewText = "二进制文件（\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))），不支持纯文本预览。"
             } else if let text = SVNClient.decodeText(data) {
@@ -877,6 +894,7 @@ final class AppModel: ObservableObject {
         pendingProbedCertificate = nil
         repoInfo = nil
         propertyInspection = nil
+        logGeneration += 1
         entries = []
         logs = []
         currentPath = ""
@@ -923,7 +941,8 @@ final class AppModel: ObservableObject {
                FileManager.default.fileExists(atPath: self.workingCopyPath) {
                 try await self.refreshStatusCore()
             }
-            self.lastRefresh = Date()
+            self.now = Date()
+            self.lastRefresh = self.now
             self.statusText = "已刷新最新仓库历史与状态"
         }
     }
@@ -1152,20 +1171,29 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // 未纳入版本控制的新文件：先检查大小（超过 2 MB 直接按二进制/大文件处理），再读取本地文件内容合成新增预览
+        // 未纳入版本控制的新文件：在后台任务中检查大小（超过 2 MB 直接按二进制/大文件处理）并读取本地文件内容合成新增预览
         if status.kind == .unversioned {
             let fileURL = URL(fileURLWithPath: workingCopyPath).appendingPathComponent(status.path)
-            let maxPreviewBytes: Int64 = 2 * 1024 * 1024
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-               let fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? (attrs[.size] as? Int64),
-               fileSize > maxPreviewBytes {
-                workingDiffState = .binary(path: status.path, size: fileSize)
-                return
-            }
-            if let data = try? Data(contentsOf: fileURL) {
-                if SVNClient.looksBinaryData(data) {
-                    workingDiffState = .binary(path: status.path, size: Int64(data.count))
-                } else if let text = SVNClient.decodeText(data) {
+            let statusPath = status.path
+            workingDiffState = .loading
+            workingDiffTask = Task { [weak self] in
+                guard let self else { return }
+                let loadedState: FileDiffLoadState = await Task.detached(priority: .userInitiated) {
+                    let maxPreviewBytes: Int64 = 2 * 1024 * 1024
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                       let fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? (attrs[.size] as? Int64),
+                       fileSize > maxPreviewBytes {
+                        return .binary(path: statusPath, size: fileSize)
+                    }
+                    guard let data = try? Data(contentsOf: fileURL) else {
+                        return .idle
+                    }
+                    if Int64(data.count) > maxPreviewBytes || SVNClient.looksBinaryData(data) {
+                        return .binary(path: statusPath, size: Int64(data.count))
+                    }
+                    guard let text = SVNClient.decodeText(data) else {
+                        return .binary(path: statusPath, size: Int64(data.count))
+                    }
                     let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
                     let lines = rawLines.enumerated().map { idx, lineText in
                         FileDiff.Hunk.Line(kind: .addition, text: lineText, oldLine: nil, newLine: idx + 1)
@@ -1179,18 +1207,16 @@ final class AppModel: ObservableObject {
                         lines: lines
                     )
                     let diff = FileDiff(
-                        id: status.path,
-                        path: status.path,
+                        id: statusPath,
+                        path: statusPath,
                         localPath: fileURL,
                         isBinary: false,
                         hunks: [hunk]
                     )
-                    workingDiffState = .loaded(diff, isTruncated: false)
-                } else {
-                    workingDiffState = .binary(path: status.path, size: Int64(data.count))
-                }
-            } else {
-                workingDiffState = .idle
+                    return .loaded(diff, isTruncated: false)
+                }.value
+                guard !Task.isCancelled, self.selectedStatus?.path == statusPath else { return }
+                self.workingDiffState = loadedState
             }
             return
         }
@@ -1255,6 +1281,7 @@ final class AppModel: ObservableObject {
         }
         let targetRepo = repoInfo?.url
         let targetCustomPath = customLogPath
+        let expectedGeneration = logGeneration
         isLoadingMoreLogs = true
         Task {
             defer { isLoadingMoreLogs = false }
@@ -1265,7 +1292,8 @@ final class AppModel: ObservableObject {
                     limit: pageSize,
                     startRevision: lastRev - 1
                 )
-                guard self.repoInfo?.url == targetRepo,
+                guard self.logGeneration == expectedGeneration,
+                      self.repoInfo?.url == targetRepo,
                       self.customLogPath == targetCustomPath else {
                     return
                 }
@@ -1275,7 +1303,8 @@ final class AppModel: ObservableObject {
                 self.hasMoreLogs = older.count >= pageSize && (self.logs.last?.revision ?? 0) > 1
                 self.statusText = "已加载共 \(self.logs.count) 条提交历史"
             } catch {
-                guard self.repoInfo?.url == targetRepo,
+                guard self.logGeneration == expectedGeneration,
+                      self.repoInfo?.url == targetRepo,
                       self.customLogPath == targetCustomPath else {
                     return
                 }

@@ -101,7 +101,8 @@ brew install subversion apr apr-util pkgconf
 ### Option A: Download Prebuilt App Bundle (Apple Silicon `arm64`)
 
 ```bash
-gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+TAG=$(gh release list --repo ChingYung717/SwiftVCS -L 1 --json tagName -q '.[0].tagName')
+gh release download "$TAG" --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
 shasum -a 256 --check SHA256SUMS
 
 unzip -q VCSExplorer-arm64.zip
