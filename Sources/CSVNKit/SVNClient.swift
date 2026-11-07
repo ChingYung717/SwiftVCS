@@ -86,11 +86,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         if let h = swapActiveHandle(nil) { csvn_context_destroy(h) }
     }
 
-    /// 请求取消当前实例上**正在执行**的底层 SVN 操作。
+    /// 请求取消当前实例上**正在执行**的活动操作。
     ///
-    /// - Note: 该方法仅作用于调用时刻处于活动状态的单个操作；若当前无运行中操作，
-    ///   或当前操作结束后启动新的排队操作，新操作会在开始时重置底层取消标志而不会受影响。
-    ///   若需取消排队中或跨实例等待写锁的特定异步调用，请直接取消对应的 Swift `Task`。
+    /// - Note: 该方法仅作用于调用时刻已进入此实例串行队列并处于活动状态的单个操作（包括正在轮询等待写锁或正在执行底层 C 调用的活动操作）；
+    ///   若当前无活动操作，或当前活动操作结束后启动后续排队操作，新操作会在 `beginOperation` 时重置底层取消标志而不会受影响。
+    ///   若需精确取消尚未进入执行阶段的排队操作或特定异步调用，请直接取消对应的 Swift `Task`。
     public func requestCancel() {
         stateLock.withLock {
             activeOperation?.isCancelled = true
@@ -1869,6 +1869,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }) {
             throw VCSError.invalidArgument("移动目标含本地改动或是目录，请先备份后再处理，防止丢失数据")
         }
+        try checkActiveCancellation()
         return targets.sorted()
     }
 

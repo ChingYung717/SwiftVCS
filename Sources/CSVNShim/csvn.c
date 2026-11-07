@@ -966,6 +966,8 @@ int csvn_update(csvn_ctx *ctx,
     update_baton ub;
 
     if (!ctx || !path) return -100;
+    if (out_conflicts) *out_conflicts = NULL;
+    if (out_conflict_count) *out_conflict_count = 0;
     apr_thread_mutex_lock(ctx->mutex);
     csvn_clear_error(ctx);
 
@@ -1148,6 +1150,9 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
         svn_boolean_t modified = FALSE;
         svn_error_t *err = svn_wc_text_modified_p2(&modified, sb->client->wc_ctx,
                                                       status->local_abspath, FALSE, scratch_pool);
+        if (err && svn_error_find_cause(err, SVN_ERR_CANCELLED)) {
+            return err;
+        }
         s->moved_destination_modified = err != NULL || modified || status->conflicted ||
             status->prop_status == svn_wc_status_modified;
         svn_error_clear(err);
@@ -1157,6 +1162,9 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
         svn_error_t *err = conflict_info(&conflict, &s->conflict_kinds, &s->resolutions,
                                          status->local_abspath, sb->client, scratch_pool);
         if (err) {
+            if (svn_error_find_cause(err, SVN_ERR_CANCELLED)) {
+                return err;
+            }
             svn_error_clear(err);
             s->conflict_kinds = 16;
             s->resolutions = 0;
@@ -1393,25 +1401,28 @@ int csvn_diff_capped(csvn_ctx *ctx,
     svn_stream_set_write(outstream, bounded_diff_stream_write);
     errstream = svn_stream_empty(scratch);
 
-    err = svn_client_diff7(NULL,
-                           canon_path, &rev1,
-                           canon_path, &rev2,
-                           NULL,
-                           svn_depth_infinity,
-                           FALSE /* ignore_ancestry */,
-                           FALSE /* no_diff_added */,
-                           FALSE /* no_diff_deleted */,
-                           TRUE  /* show_copies_as_adds */,
-                           FALSE /* ignore_content_type */,
-                           TRUE  /* ignore_properties */,
-                           FALSE /* properties_only */,
-                           FALSE /* use_git_diff_format */,
-                           FALSE /* pretty_print_mergeinfo */,
-                           "UTF-8",
-                           outstream, errstream,
-                           NULL,
-                           ctx->client,
-                           scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_diff7(NULL,
+                               canon_path, &rev1,
+                               canon_path, &rev2,
+                               NULL,
+                               svn_depth_infinity,
+                               FALSE /* ignore_ancestry */,
+                               FALSE /* no_diff_added */,
+                               FALSE /* no_diff_deleted */,
+                               TRUE  /* show_copies_as_adds */,
+                               FALSE /* ignore_content_type */,
+                               TRUE  /* ignore_properties */,
+                               FALSE /* properties_only */,
+                               FALSE /* use_git_diff_format */,
+                               FALSE /* pretty_print_mergeinfo */,
+                               "UTF-8",
+                               outstream, errstream,
+                               NULL,
+                               ctx->client,
+                               scratch);
+    }
 
     return finish_bounded_diff_stream(ctx, scratch, outstream, err, &bs,
                                       max_bytes, out_text, out_len, out_truncated);
@@ -1812,25 +1823,28 @@ int csvn_diff_sections_ex(csvn_ctx *ctx,
     svn_stream_set_close(outstream, diff_stream_close);
     errstream = svn_stream_empty(scratch);
 
-    err = svn_client_diff7(NULL,
-                           canon_path, &rev1,
-                           canon_path, &rev2,
-                           canon_rel,
-                           svn_depth_infinity,
-                           FALSE /* ignore_ancestry */,
-                           FALSE /* no_diff_added */,
-                           FALSE /* no_diff_deleted */,
-                           TRUE  /* show_copies_as_adds */,
-                           FALSE /* ignore_content_type */,
-                           TRUE  /* ignore_properties */,
-                           FALSE /* properties_only */,
-                           FALSE /* use_git_diff_format */,
-                           FALSE /* pretty_print_mergeinfo */,
-                           "UTF-8",
-                           outstream, errstream,
-                           NULL,
-                           ctx->client,
-                           scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_diff7(NULL,
+                               canon_path, &rev1,
+                               canon_path, &rev2,
+                               canon_rel,
+                               svn_depth_infinity,
+                               FALSE /* ignore_ancestry */,
+                               FALSE /* no_diff_added */,
+                               FALSE /* no_diff_deleted */,
+                               TRUE  /* show_copies_as_adds */,
+                               FALSE /* ignore_content_type */,
+                               TRUE  /* ignore_properties */,
+                               FALSE /* properties_only */,
+                               FALSE /* use_git_diff_format */,
+                               FALSE /* pretty_print_mergeinfo */,
+                               "UTF-8",
+                               outstream, errstream,
+                               NULL,
+                               ctx->client,
+                               scratch);
+    }
     if (err && db.total_truncated && svn_error_find_cause(err, SVN_ERR_CEASE_INVOCATION)) {
         svn_error_clear(err);
         err = SVN_NO_ERROR;
@@ -1921,27 +1935,30 @@ int csvn_diff_revision(csvn_ctx *ctx,
     svn_stream_set_write(outstream, bounded_diff_stream_write);
     errstream = svn_stream_empty(scratch);
 
-    err = svn_client_diff_peg7(NULL,
-                               canon_url,
-                               &peg,
-                               &start,
-                               &end,
-                               NULL,
-                               svn_depth_empty,
-                               FALSE /* ignore_ancestry */,
-                               FALSE /* no_diff_added */,
-                               FALSE /* no_diff_deleted */,
-                               TRUE  /* show_copies_as_adds */,
-                               FALSE /* ignore_content_type */,
-                               TRUE  /* ignore_properties */,
-                               FALSE /* properties_only */,
-                               FALSE /* use_git_diff_format */,
-                               FALSE /* pretty_print_mergeinfo */,
-                               "UTF-8",
-                               outstream, errstream,
-                               NULL,
-                               ctx->client,
-                               scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_diff_peg7(NULL,
+                                   canon_url,
+                                   &peg,
+                                   &start,
+                                   &end,
+                                   NULL,
+                                   svn_depth_empty,
+                                   FALSE /* ignore_ancestry */,
+                                   FALSE /* no_diff_added */,
+                                   FALSE /* no_diff_deleted */,
+                                   TRUE  /* show_copies_as_adds */,
+                                   FALSE /* ignore_content_type */,
+                                   TRUE  /* ignore_properties */,
+                                   FALSE /* properties_only */,
+                                   FALSE /* use_git_diff_format */,
+                                   FALSE /* pretty_print_mergeinfo */,
+                                   "UTF-8",
+                                   outstream, errstream,
+                                   NULL,
+                                   ctx->client,
+                                   scratch);
+    }
 
     return finish_bounded_diff_stream(ctx, scratch, outstream, err, &bs,
                                       max_bytes, out_text, out_len, out_truncated);
@@ -1988,25 +2005,28 @@ int csvn_diff_urls(csvn_ctx *ctx,
     svn_stream_set_write(outstream, bounded_diff_stream_write);
     errstream = svn_stream_empty(scratch);
 
-    err = svn_client_diff7(NULL,
-                           canon_url1, &r1,
-                           canon_url2, &r2,
-                           NULL,
-                           svn_depth_empty,
-                           TRUE  /* ignore_ancestry */,
-                           FALSE /* no_diff_added */,
-                           FALSE /* no_diff_deleted */,
-                           FALSE /* show_copies_as_adds */,
-                           FALSE /* ignore_content_type */,
-                           TRUE  /* ignore_properties */,
-                           FALSE /* properties_only */,
-                           FALSE /* use_git_diff_format */,
-                           FALSE /* pretty_print_mergeinfo */,
-                           "UTF-8",
-                           outstream, errstream,
-                           NULL,
-                           ctx->client,
-                           scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_diff7(NULL,
+                               canon_url1, &r1,
+                               canon_url2, &r2,
+                               NULL,
+                               svn_depth_empty,
+                               TRUE  /* ignore_ancestry */,
+                               FALSE /* no_diff_added */,
+                               FALSE /* no_diff_deleted */,
+                               FALSE /* show_copies_as_adds */,
+                               FALSE /* ignore_content_type */,
+                               TRUE  /* ignore_properties */,
+                               FALSE /* properties_only */,
+                               FALSE /* use_git_diff_format */,
+                               FALSE /* pretty_print_mergeinfo */,
+                               "UTF-8",
+                               outstream, errstream,
+                               NULL,
+                               ctx->client,
+                               scratch);
+    }
 
     return finish_bounded_diff_stream(ctx, scratch, outstream, err, &bs,
                                       max_bytes, out_text, out_len, out_truncated);
@@ -2592,15 +2612,18 @@ int csvn_cat_capped(csvn_ctx *ctx,
     stream = svn_stream_create(&cb, scratch);
     svn_stream_set_write(stream, cat_stream_write);
 
-    err = svn_client_cat3(NULL, stream, canon_target, &peg, &rev_opt,
-                          TRUE /* expand_keywords */,
-                          ctx->client, scratch, scratch);
-    if (err && cb.truncated && svn_error_find_cause(err, SVN_ERR_CEASE_INVOCATION)) {
-        svn_error_clear(err);
-        err = SVN_NO_ERROR;
-    }
+    err = csvn_cancel_check(ctx);
     if (!err) {
-        err = svn_stream_close(stream);
+        err = svn_client_cat3(NULL, stream, canon_target, &peg, &rev_opt,
+                              TRUE /* expand_keywords */,
+                              ctx->client, scratch, scratch);
+        if (err && cb.truncated && svn_error_find_cause(err, SVN_ERR_CEASE_INVOCATION)) {
+            svn_error_clear(err);
+            err = SVN_NO_ERROR;
+        }
+        if (!err) {
+            err = svn_stream_close(stream);
+        }
     }
     if (!err && csvn_is_cancelled(ctx)) {
         err = csvn_cancel_check(ctx);
@@ -2709,6 +2732,7 @@ static svn_error_t *validate_file(const char **absolute, csvn_ctx *ctx, const ch
     const char *path = root;
     struct stat st;
     const char *start = relative;
+    SVN_ERR(csvn_cancel_check(ctx));
     if (!relative || svn_path_is_url(relative) || strchr(relative, '\\'))
         return invalid_wc("需要工作副本内的相对文件路径");
     while (TRUE) {
@@ -2788,6 +2812,7 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
                                           const char *root, const char *target,
                                           svn_depth_t depth, svn_boolean_t adding, apr_pool_t *pool)
 {
+    SVN_ERR(csvn_cancel_check(ctx));
     const char *relative = svn_dirent_skip_ancestor(anchor, target);
     if (!relative) return invalid_wc("目标超出指定的工作副本范围");
     const char *path = anchor;
@@ -3057,6 +3082,7 @@ int csvn_merge_range(csvn_ctx *ctx, const char *root_path, const char *source, i
     if (!err && (!source_uuid || !uuid || strcmp(uuid, source_uuid) != 0))
         err = invalid_wc("合并源仓库 UUID 不匹配");
 
+    if (!err) err = csvn_cancel_check(ctx);
     if (!err) {
         svn_opt_revision_range_t range = {csvn_rev_number(from), csvn_rev_number(to)};
         svn_opt_revision_t source_peg = csvn_rev_number(peg);
@@ -3324,7 +3350,9 @@ int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int
         err = svn_client_url_from_path2(&base.url, path, ctx->client, pool, pool);
         if (!err) err = svn_wc_crawl_revisions6(ctx->client->wc_ctx, path, &reporter, &base,
                                                FALSE, svn_depth_empty, TRUE, FALSE, FALSE,
-                                               NULL, NULL, NULL, NULL, pool);
+                                               ctx->client->cancel_func, ctx->client->cancel_baton,
+                                               NULL, NULL, pool);
+        if (!err) err = csvn_cancel_check(ctx);
         if (!err && base.url && SVN_IS_VALID_REVNUM(base.revision)) {
             svn_opt_revision_t rev = csvn_rev_number(base.revision);
             apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
@@ -3343,7 +3371,8 @@ int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int
     }
     apr_hash_t *properties = NULL;
     svn_node_kind_t kind;
-    err = svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, pristine, FALSE, pool);
+    err = csvn_cancel_check(ctx);
+    if (!err) err = svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, pristine, FALSE, pool);
     if (!err && kind != svn_node_none && kind != svn_node_unknown) {
         if (pristine)
             err = svn_wc_get_pristine_props(&properties, ctx->client->wc_ctx, path, pool, pool);

@@ -212,6 +212,50 @@ struct CVCSKitTests {
         while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
     }
 
+    private static func assertBackgroundProcessAlive(
+        _ pid: pid_t,
+        stderrFile: URL,
+        label: String,
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) {
+        var status: Int32 = 0
+        let waited = waitpid(pid, &status, WNOHANG)
+        if waited != 0 {
+            let stderrText = (try? String(contentsOf: stderrFile, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            FileHandle.standardError.write(
+                Data("Background process '\(label)' (pid=\(pid)) exited prematurely (waited=\(waited), status=\(status)): stderr=\(stderrText)\n".utf8)
+            )
+            expect(false, file: file, line: line)
+        }
+    }
+
+    private static func waitForBackgroundPort(
+        _ pid: pid_t,
+        portFile: URL,
+        stderrFile: URL,
+        label: String,
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) async throws -> Int {
+        for _ in 0..<50 {
+            if let s = try? String(contentsOf: portFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let port = Int(s), port > 0 {
+                return port
+            }
+            assertBackgroundProcessAlive(pid, stderrFile: stderrFile, label: label, file: file, line: line)
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let stderrText = (try? String(contentsOf: stderrFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        FileHandle.standardError.write(
+            Data("Timed out waiting for background process '\(label)' (pid=\(pid)) port file (\(portFile.path)): stderr=\(stderrText)\n".utf8)
+        )
+        expect(false, file: file, line: line)
+        return 0
+    }
+
     private static func runProcess(
         _ executable: String,
         _ arguments: [String],
@@ -309,17 +353,19 @@ struct CVCSKitTests {
         close(sock)
 
         let logFile = tempRoot.appendingPathComponent("svnserve.log")
+        let errFile = tempRoot.appendingPathComponent("svnserve.err")
         let serverPID = try spawnBackgroundProcess(svnserve, [
             "-d", "--foreground",
             "--listen-host", "127.0.0.1",
             "--listen-port", "\(port)",
             "-r", tempRoot.path,
             "--log-file", logFile.path
-        ])
+        ], stderrPath: errFile.path)
         defer {
             stopBackgroundProcess(serverPID)
         }
         try await Task.sleep(nanoseconds: 200_000_000)
+        assertBackgroundProcessAlive(serverPID, stderrFile: errFile, label: "svnserve")
 
         let urlA = require(URL(string: "svn://127.0.0.1:\(port)/repoA"))
         let urlB = require(URL(string: "svn://127.0.0.1:\(port)/repoB"))
@@ -450,23 +496,20 @@ struct CVCSKitTests {
         srv.serve_forever()
         """.write(to: scriptFile, atomically: true, encoding: .utf8)
 
+        let serverErrFile = tempRoot.appendingPathComponent("tls-server.err")
         let serverPID = try spawnBackgroundProcess("/usr/bin/python3", [
             scriptFile.path, certFile.path, keyFile.path, realmFile.path, hitsFile.path, portFile.path
-        ])
+        ], stderrPath: serverErrFile.path)
         defer {
             stopBackgroundProcess(serverPID)
         }
 
-        var portString = ""
-        for _ in 0..<50 {
-            if let s = try? String(contentsOf: portFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-               !s.isEmpty {
-                portString = s
-                break
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        let port = require(Int(portString))
+        let port = try await waitForBackgroundPort(
+            serverPID,
+            portFile: portFile,
+            stderrFile: serverErrFile,
+            label: "tls-server"
+        )
         let url = require(URL(string: "https://127.0.0.1:\(port)/repo"))
         let otherURL = require(URL(string: "https://127.0.0.1:\(port)/other"))
         let service = require(KeychainStore.service(for: url))
@@ -1189,32 +1232,73 @@ struct CVCSKitTests {
         var errBuf = [CChar](repeating: 0, count: 256)
         if let cCtx = csvn_context_create(nil, nil, nil, nil, nil, nil, nil, nil, &errBuf, 256) {
             defer { csvn_context_destroy(cCtx) }
+
+            var probeAddr = sockaddr_in()
+            probeAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            probeAddr.sin_family = sa_family_t(AF_INET)
+            probeAddr.sin_port = 0
+            probeAddr.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let probeSock = socket(AF_INET, SOCK_STREAM, 0)
+            expect(probeSock >= 0)
+            defer { close(probeSock) }
+            let probeBindRC = withUnsafePointer(to: &probeAddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(probeSock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            expect(probeBindRC == 0)
+            expect(listen(probeSock, 4) == 0)
+            var probeLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            _ = withUnsafeMutablePointer(to: &probeAddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getsockname(probeSock, $0, &probeLen)
+                }
+            }
+            let probePort = Int(UInt16(bigEndian: probeAddr.sin_port))
+            let probeURLStr = "http://127.0.0.1:\(probePort)/repo/dir1/f1.txt"
+
             csvn_request_cancel(cCtx)
             var outText: UnsafeMutablePointer<CChar>? = nil
             var outLen: Int = 0
             var outTrunc: Int32 = 0
+            var outSections: UnsafeMutablePointer<csvn_diff_section>? = nil
+            var outSecCount: Int32 = 0
+            var outTotalTrunc: Int32 = 0
             let fileURLStr = URL(fileURLWithPath: repo.path).appendingPathComponent("dir1/f1.txt").absoluteString
-            let rcCancelRev = fileURLStr.withCString { u in
+
+            let rcCancelDiffCapped = wc.path.withCString { p in
+                csvn_diff_capped(cCtx, p, 4096, &outText, &outLen, &outTrunc)
+            }
+            expect(rcCancelDiffCapped == -7 && outText == nil && outLen == 0)
+
+            let rcCancelDiffSections = wc.path.withCString { p in
+                csvn_diff_sections_ex(cCtx, p, p, 4096, 65536, 16, &outSections, &outSecCount, &outTotalTrunc)
+            }
+            expect(rcCancelDiffSections == -7 && outSections == nil && outSecCount == 0)
+
+            let rcCancelRev = probeURLStr.withCString { u in
                 csvn_diff_revision(cCtx, u, 2, 4096, &outText, &outLen, &outTrunc)
             }
-            expect(rcCancelRev == -7)
-            expect(outText == nil)
+            expect(rcCancelRev == -7 && outText == nil && outLen == 0)
 
-            let rcCancelCat = fileURLStr.withCString { u in
+            let rcCancelUrls = probeURLStr.withCString { u in
+                csvn_diff_urls(cCtx, u, 1, u, 2, 4096, &outText, &outLen, &outTrunc)
+            }
+            expect(rcCancelUrls == -7 && outText == nil && outLen == 0)
+
+            let rcCancelCat = probeURLStr.withCString { u in
                 csvn_cat_capped(cCtx, u, 2, 4096, &outText, &outLen, &outTrunc)
             }
-            expect(rcCancelCat == -7)
-            expect(outText == nil)
+            expect(rcCancelCat == -7 && outText == nil && outLen == 0)
 
             var outRev: Int32 = 0
             var outUpd: Int32 = 0
             var outAdd: Int32 = 0
             var outDel: Int32 = 0
-            var outConf: UnsafeMutablePointer<CChar>? = nil
-            var outConfCnt: Int32 = 0
+            var outConf: UnsafeMutablePointer<CChar>? = UnsafeMutablePointer(bitPattern: 0x1)
+            var outConfCnt: Int32 = 99
             var outComm: Int32 = 0
-            let repoURLStr = URL(fileURLWithPath: repo.path).absoluteString
-            let rcCancelCheckout = repoURLStr.withCString { u in
+            let rcCancelCheckout = probeURLStr.withCString { u in
                 wc.path.withCString { d in
                     csvn_checkout(cCtx, u, d, 0, &outRev)
                 }
@@ -1224,7 +1308,7 @@ struct CVCSKitTests {
             let rcCancelUpdate = wc.path.withCString { p in
                 csvn_update(cCtx, p, 0, &outRev, &outUpd, &outAdd, &outDel, &outConf, &outConfCnt)
             }
-            expect(rcCancelUpdate == -7)
+            expect(rcCancelUpdate == -7 && outConf == nil && outConfCnt == 0)
 
             var wcTargetPtr: UnsafePointer<CChar>? = UnsafePointer(strdup(wc.path))
             defer { if let wcTargetPtr { free(UnsafeMutablePointer(mutating: wcTargetPtr)) } }
@@ -1234,12 +1318,54 @@ struct CVCSKitTests {
             expect(rcCancelCommit == -7)
             expect(csvn_revert(cCtx, &wcTargetPtr, 1, 0) == -7)
             expect(csvn_add(cCtx, &wcTargetPtr, 1) == -7)
+            let rcCancelValidate = wc.path.withCString { r in
+                csvn_validate_write_targets(cCtx, r, &wcTargetPtr, 1, 0, 0)
+            }
+            expect(rcCancelValidate == -7)
+            var relTargetPtr: UnsafePointer<CChar>? = UnsafePointer(strdup("z_tail.txt"))
+            defer { if let relTargetPtr { free(UnsafeMutablePointer(mutating: relTargetPtr)) } }
+            let rcCancelDelete = wc.path.withCString { r in
+                csvn_delete_files(cCtx, r, &relTargetPtr, 1)
+            }
+            expect(rcCancelDelete == -7)
+            let rcCancelMove = wc.path.withCString { r in
+                "z_tail.txt".withCString { s in
+                    "z_moved.txt".withCString { d in
+                        csvn_move_file(cCtx, r, s, d)
+                    }
+                }
+            }
+            expect(rcCancelMove == -7)
+            let rcCancelCopy = wc.path.withCString { r in
+                "z_tail.txt".withCString { s in
+                    "z_copied.txt".withCString { d in
+                        csvn_copy_file(cCtx, r, s, d)
+                    }
+                }
+            }
+            expect(rcCancelCopy == -7)
+            let rcCancelResolve = wc.path.withCString { r in
+                "z_tail.txt".withCString { p in
+                    csvn_resolve_text(cCtx, r, p, 0)
+                }
+            }
+            expect(rcCancelResolve == -7)
+            var mergeRes = csvn_merge_result()
+            let rcCancelMerge = wc.path.withCString { r in
+                probeURLStr.withCString { u in
+                    csvn_merge_range(cCtx, r, u, 1, 2, 2, 1, &mergeRes)
+                }
+            }
+            expect(rcCancelMerge == -7 && mergeRes.started == 0)
+
+            var pfd = pollfd(fd: probeSock, events: Int16(POLLIN), revents: 0)
+            expect(poll(&pfd, 1, 0) == 0)
 
             csvn_clear_cancel(cCtx)
             let rcAfterClear = fileURLStr.withCString { u in
                 csvn_diff_revision(cCtx, u, 2, 4096, &outText, &outLen, &outTrunc)
             }
-            expect(rcAfterClear == 0)
+            expect(rcAfterClear == 0 && outText != nil && outLen > 0)
             if let outText {
                 csvn_free_string(outText)
             }
@@ -1328,23 +1454,20 @@ struct CVCSKitTests {
         srv.serve_forever()
         """.write(to: cancelServerScript, atomically: true, encoding: .utf8)
 
+        let cancelErrFile = cancelStateDir.appendingPathComponent("cancel-server.err")
         let cancelServerPID = try spawnBackgroundProcess("/usr/bin/python3", [
             cancelServerScript.path, cancelStateDir.path, cancelPortFile.path
-        ])
+        ], stderrPath: cancelErrFile.path)
         defer {
             stopBackgroundProcess(cancelServerPID)
         }
 
-        var cancelPortString = ""
-        for _ in 0..<50 {
-            if let s = try? String(contentsOf: cancelPortFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-               !s.isEmpty {
-                cancelPortString = s
-                break
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        let cancelPort = require(Int(cancelPortString))
+        let cancelPort = try await waitForBackgroundPort(
+            cancelServerPID,
+            portFile: cancelPortFile,
+            stderrFile: cancelErrFile,
+            label: "cancel-http-server"
+        )
         try "small tail modified after r2\n".write(to: wc.appendingPathComponent("z_tail.txt"), atomically: true, encoding: .utf8)
 
         // Case 1: Run A (in-flight HTTP OPTIONS), queue B on same client, cancel ONLY B -> B throws CancellationError, A is unaffected
@@ -1520,10 +1643,34 @@ struct CVCSKitTests {
         expect(r2Statuses.contains { $0.path == "z_tail.txt" })
         expect(!fm.fileExists(atPath: case4Release.path))
 
+        // Now queue W3 on writer2 (waiting on workingCopyWriteLock held by W1) and cancel the lock-holding W1
+        // via writer1.requestCancel() WITHOUT releasing the server -> W1 must abort in C (< 2.0s) and release
+        // workingCopyWriteLock so W3 acquires the lock and succeeds while case4.release still does not exist
+        let taskW3 = Task {
+            try await writer2.setProperty("user:after-w1-cancel", value: Data("ok".utf8), workingCopy: wc, path: "z_tail.txt")
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let w1CancelStart = ContinuousClock.now
+        writer1.requestCancel()
+
+        var w1Cancelled = false
+        do {
+            _ = try await taskW1.value
+        } catch is CancellationError {
+            w1Cancelled = true
+        }
+        try await taskW3.value
+        let w1AndW3Elapsed = ContinuousClock.now - w1CancelStart
+        expect(w1Cancelled)
+        expect(w1AndW3Elapsed < .seconds(2))
+        expect(!fm.fileExists(atPath: case4Release.path))
         try "403".write(to: case4Release, atomically: true, encoding: .utf8)
-        _ = try? await taskW1.value
+
         let propAfterCancel = try await client.property("user:cancelled-prop", at: .workingCopy(root: wc, path: "z_tail.txt"))
         expect(propAfterCancel == nil)
+        let propAfterW3 = try await client.property("user:after-w1-cancel", at: .workingCopy(root: wc, path: "z_tail.txt"))
+        expect(propAfterW3 == Data("ok".utf8))
+        try await writer2.setProperty("user:after-w1-cancel", value: nil, workingCopy: wc, path: "z_tail.txt")
 
         // Case 5: disconnect() called from an already-cancelled Task must still clean up handle and rootURL
         let disconnectTask = Task {

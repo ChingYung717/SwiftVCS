@@ -87,7 +87,6 @@ static void test_connect_and_output_pointer_contracts(const char *repo_url, cons
     pfd.events = POLLIN;
     pfd.revents = 0;
     assert(poll(&pfd, 1, 0) == 0);
-    close(listen_fd);
 
     /* out_uuid_len == 1 succeeds and writes only '\0' at index 0 */
     assert(csvn_connect(ctx, repo_url, uuid, 1, &rev) == 0);
@@ -110,31 +109,69 @@ static void test_connect_and_output_pointer_contracts(const char *repo_url, cons
     assert(full_uuid[63] == '\0');
     assert((unsigned char)full_uuid[64] == 0x5A);
 
-    /* Cancellation contract (SV-05) */
+    /* Cancellation contract (SV-05): all C entry points must return -7 before touching WC or network */
     csvn_request_cancel(ctx);
     csvn_diff_section *sections = NULL;
     int sec_count = 0;
     int total_trunc = 0;
     assert(csvn_diff_sections_ex(ctx, wc_path, wc_path, 4096, 65536, 16, &sections, &sec_count, &total_trunc) == -7);
     assert(sections == NULL && sec_count == 0);
+    char *diff_out = NULL, *cat_out = NULL;
+    long diff_len = 0, cat_len = 0;
+    int diff_trunc = 0, cat_trunc = 0;
+    assert(csvn_diff_capped(ctx, wc_path, 4096, &diff_out, &diff_len, &diff_trunc) == -7);
+    assert(diff_out == NULL && diff_len == 0 && diff_trunc == 0);
+    assert(csvn_diff_revision(ctx, probe_url, 1, 4096, &diff_out, &diff_len, &diff_trunc) == -7);
+    assert(csvn_diff_urls(ctx, probe_url, 1, probe_url, 2, 4096, &diff_out, &diff_len, &diff_trunc) == -7);
+    assert(csvn_cat_capped(ctx, probe_url, 1, 4096, &cat_out, &cat_len, &cat_trunc) == -7);
+    assert(cat_out == NULL && cat_len == 0 && cat_trunc == 0);
     char root_buf[512];
-    assert(csvn_get_repos_root(ctx, repo_url, root_buf, (int)sizeof(root_buf)) == -7);
+    assert(csvn_connect(ctx, probe_url, full_uuid, 64, &rev) == -7);
+    assert(csvn_get_repos_root(ctx, probe_url, root_buf, (int)sizeof(root_buf)) == -7);
+    csvn_entry *cancel_entries = NULL;
+    int cancel_count = 0;
+    assert(csvn_list(ctx, probe_url, &cancel_entries, &cancel_count) == -7);
+    csvn_log_entry *cancel_logs = NULL;
+    assert(csvn_log(ctx, probe_url, 10, -1, &cancel_logs, &cancel_count) == -7);
     csvn_property *props = NULL;
     int prop_count = 0;
+    assert(csvn_properties(ctx, NULL, probe_url, NULL, 1, 1, 0, &props, &prop_count) == -7);
     assert(csvn_wc_property_snapshot(ctx, wc_path, 0, 0, &props, &prop_count) == -7);
+    assert(csvn_wc_property_snapshot(ctx, wc_path, 1, 1, &props, &prop_count) == -7);
     assert(csvn_properties(ctx, wc_path, ".", NULL, -1, -1, 0, &props, &prop_count) == -7);
     assert(csvn_set_property(ctx, wc_path, ".", "user:test", "v", 1, 0) == -7);
     char **mkdir_out = NULL;
     int mkdir_count = 0;
     assert(csvn_mkdir_working(ctx, wc_path, "cancelled_dir", 0, 1, -1, &mkdir_out, &mkdir_count) == -7);
-    int out_rev = 0, out_upd = 0, out_add = 0, out_del = 0, out_conf_cnt = 0, out_comm = 0;
-    char *out_conf = NULL;
+    char **ignores_out = NULL;
+    int ignores_count = 0;
+    assert(csvn_default_ignores(ctx, &ignores_out, &ignores_count) == -7);
+    csvn_status_item *cancel_status = NULL;
+    assert(csvn_status(ctx, wc_path, &cancel_status, &cancel_count) == -7);
+    assert(csvn_wc_url(ctx, wc_path, root_buf, (int)sizeof(root_buf)) == -7);
+    int out_rev = 0, out_upd = 0, out_add = 0, out_del = 0, out_conf_cnt = 99, out_comm = 0;
+    char *out_conf = (char *)0x1;
     const char *wc_targets[1] = { wc_path };
-    assert(csvn_checkout(ctx, repo_url, wc_path, 0, &out_rev) == -7);
+    assert(csvn_checkout(ctx, probe_url, wc_path, 0, &out_rev) == -7);
     assert(csvn_update(ctx, wc_path, 0, &out_rev, &out_upd, &out_add, &out_del, &out_conf, &out_conf_cnt) == -7);
+    assert(out_conf == NULL && out_conf_cnt == 0);
     assert(csvn_commit(ctx, wc_targets, 1, "should not commit", 0, &out_rev, &out_comm) == -7);
     assert(csvn_revert(ctx, wc_targets, 1, 0) == -7);
     assert(csvn_add(ctx, wc_targets, 1) == -7);
+    assert(csvn_validate_write_targets(ctx, wc_path, wc_targets, 1, 0, 0) == -7);
+    const char *rel_targets[1] = { "a.txt" };
+    assert(csvn_delete_files(ctx, wc_path, rel_targets, 1) == -7);
+    assert(csvn_move_file(ctx, wc_path, "a.txt", "b.txt") == -7);
+    assert(csvn_copy_file(ctx, wc_path, "a.txt", "b.txt") == -7);
+    assert(csvn_resolve_text(ctx, wc_path, "a.txt", 0) == -7);
+    csvn_merge_result merge_res;
+    assert(csvn_merge_range(ctx, wc_path, probe_url, 1, 2, 2, 1, &merge_res) == -7);
+    assert(merge_res.started == 0);
+    /* Verify zero TCP connections were initiated to probe_url while pre-cancelled */
+    pfd.revents = 0;
+    assert(poll(&pfd, 1, 0) == 0);
+    close(listen_fd);
+
     csvn_clear_cancel(ctx);
     assert(csvn_get_repos_root(ctx, repo_url, root_buf, (int)sizeof(root_buf)) == 0);
     assert(csvn_diff_sections_ex(ctx, wc_path, wc_path, 4096, 65536, 16, &sections, &sec_count, &total_trunc) == 0);
