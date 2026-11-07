@@ -33,7 +33,10 @@ mkdir -p "$HOME"
 T="$BASE/swiftvcs-e2e"   # 注意：URL 里不能有双斜杠，路径必须规范
 VCSCTL="$ROOT/.build/out/Products/Debug/vcsctl"
 GUI="$ROOT/.build/out/Products/Debug/VCSExplorer"
-if [ -x "$ROOT/.build/debug/vcsctl" ] && [ -x "$ROOT/.build/debug/VCSExplorer" ] &&
+if [ -n "${SWIFTVCS_BIN_DIR:-}" ] && [ -x "$SWIFTVCS_BIN_DIR/vcsctl" ] && [ -x "$SWIFTVCS_BIN_DIR/VCSExplorer" ]; then
+    VCSCTL="$SWIFTVCS_BIN_DIR/vcsctl"
+    GUI="$SWIFTVCS_BIN_DIR/VCSExplorer"
+elif [ -x "$ROOT/.build/debug/vcsctl" ] && [ -x "$ROOT/.build/debug/VCSExplorer" ] &&
    { [ ! -x "$VCSCTL" ] || [ "$ROOT/.build/debug/vcsctl" -nt "$VCSCTL" ]; }; then
     VCSCTL="$ROOT/.build/debug/vcsctl"
     GUI="$ROOT/.build/debug/VCSExplorer"

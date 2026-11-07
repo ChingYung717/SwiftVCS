@@ -642,8 +642,9 @@ int csvn_connect(csvn_ctx *ctx,
      * 后者调用 provider->open 时 parent_session 为 NULL，导致 RA 会话拿不到
      * ctx->auth_baton，认证时就会报 "No authentication providers registered"。
      */
-    err = svn_client_open_ra_session2(&session, canon_url, NULL,
-                                       ctx->client, scratch, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) err = svn_client_open_ra_session2(&session, canon_url, NULL,
+                                                ctx->client, scratch, scratch);
     if (!err) err = svn_ra_get_uuid(session, &uuid, scratch);
     if (!err) err = svn_ra_get_latest_revnum(session, &youngest, scratch);
     if (!err && !csvn_revnum_fits_int(youngest)) {
@@ -820,17 +821,20 @@ int csvn_list(csvn_ctx *ctx,
     memset(&lb, 0, sizeof(lb));
 
     peg = csvn_rev_kind(svn_opt_revision_head);
-    err = svn_client_list3(canon_url,
-                           &peg,
-                           &peg,
-                           svn_depth_immediates,
-                           SVN_DIRENT_ALL,
-                           FALSE /* fetch_locks */,
-                           FALSE /* include_externals */,
-                           list_cb,
-                           &lb,
-                           ctx->client,
-                           scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_list3(canon_url,
+                               &peg,
+                               &peg,
+                               svn_depth_immediates,
+                               SVN_DIRENT_ALL,
+                               FALSE /* fetch_locks */,
+                               FALSE /* include_externals */,
+                               list_cb,
+                               &lb,
+                               ctx->client,
+                               scratch);
+    }
 
     if (err) {
         int rc = csvn_classify(ctx, err);
@@ -879,9 +883,12 @@ int csvn_checkout(csvn_ctx *ctx,
         peg = rev_opt;
     }
 
-    err = svn_client_checkout3(&rev, canon_url, canon_dest, &peg, &rev_opt,
-                                svn_depth_infinity, TRUE, FALSE,
-                                ctx->client, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_checkout3(&rev, canon_url, canon_dest, &peg, &rev_opt,
+                                    svn_depth_infinity, TRUE, FALSE,
+                                    ctx->client, scratch);
+    }
     if (!err && !csvn_revnum_fits_int(rev)) {
         err = svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "修订号超出 32 位整数支持范围");
     }
@@ -977,9 +984,12 @@ int csvn_update(csvn_ctx *ctx,
     ctx->client->notify_func2 = update_notify_cb;
     ctx->client->notify_baton2 = &ub;
 
-    err = svn_client_update3(&result_revs, paths, &rev_opt,
-                              svn_depth_infinity, FALSE, TRUE, FALSE,
-                              ctx->client, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_update3(&result_revs, paths, &rev_opt,
+                                  svn_depth_infinity, FALSE, TRUE, FALSE,
+                                  ctx->client, scratch);
+    }
 
     ctx->client->notify_func2 = NULL;
     ctx->client->notify_baton2 = NULL;
@@ -1193,17 +1203,20 @@ int csvn_status(csvn_ctx *ctx,
     sb.client = ctx->client;
 
     peg = csvn_rev_kind(svn_opt_revision_base);
-    err = svn_client_status6(&rev, ctx->client, canon_path, &peg,
-                              svn_depth_infinity,
-                              TRUE /* get_all */,
-                              FALSE /* check_out_of_date：只查本地工作副本，避免无谓的远程连接 */,
-                              TRUE /* check_working_copy */,
-                              TRUE /* no_ignore */,
-                              TRUE /* ignore_externals */,
-                              FALSE /* depth_as_sticky */,
-                              NULL /* changelists */,
-                              status_cb, &sb,
-                              scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_status6(&rev, ctx->client, canon_path, &peg,
+                                  svn_depth_infinity,
+                                  TRUE /* get_all */,
+                                  FALSE /* check_out_of_date：只查本地工作副本，避免无谓的远程连接 */,
+                                  TRUE /* check_working_copy */,
+                                  TRUE /* no_ignore */,
+                                  TRUE /* ignore_externals */,
+                                  FALSE /* depth_as_sticky */,
+                                  NULL /* changelists */,
+                                  status_cb, &sb,
+                                  scratch);
+    }
 
     if (err) {
         int rc = csvn_classify(ctx, err);
@@ -2072,16 +2085,19 @@ int csvn_commit(csvn_ctx *ctx,
     ctx->client->log_msg_func3 = log_msg_cb;
     ctx->client->log_msg_baton3 = &baton;
 
-    err = svn_client_commit6(arr, exact ? svn_depth_empty : svn_depth_infinity,
-                              FALSE /* keep_locks */,
-                              FALSE /* keep_changelists */,
-                              FALSE /* commit_as_operations */,
-                              FALSE /* include_file_externals */,
-                              FALSE /* include_dir_externals */,
-                              NULL /* changelists */,
-                              revprops,
-                              commit_cb, &baton,
-                              ctx->client, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_commit6(arr, exact ? svn_depth_empty : svn_depth_infinity,
+                                  FALSE /* keep_locks */,
+                                  FALSE /* keep_changelists */,
+                                  FALSE /* commit_as_operations */,
+                                  FALSE /* include_file_externals */,
+                                  FALSE /* include_dir_externals */,
+                                  NULL /* changelists */,
+                                  revprops,
+                                  commit_cb, &baton,
+                                  ctx->client, scratch);
+    }
 
     ctx->client->log_msg_func3 = NULL;
     ctx->client->log_msg_baton3 = NULL;
@@ -2124,7 +2140,10 @@ int csvn_revert(csvn_ctx *ctx,
         APR_ARRAY_PUSH(arr, const char *) = csvn_canon_dirent(paths[i], scratch);
     }
 
-    err = svn_client_revert2(arr, exact ? svn_depth_empty : svn_depth_infinity, NULL, ctx->client, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_revert2(arr, exact ? svn_depth_empty : svn_depth_infinity, NULL, ctx->client, scratch);
+    }
 
     if (err) {
         int rc = csvn_classify(ctx, err);
@@ -2359,13 +2378,16 @@ int csvn_log(csvn_ctx *ctx,
         end = csvn_rev_number(0);
     }
 
-    err = svn_client_log4(targets, &peg, &start, &end,
-                          limit > 0 ? limit : 100,
-                          TRUE /* discover_changed_paths */,
-                          FALSE, FALSE,
-                          revprops,
-                          log_cb, &lb,
-                          ctx->client, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_log4(targets, &peg, &start, &end,
+                              limit > 0 ? limit : 100,
+                              TRUE /* discover_changed_paths */,
+                              FALSE, FALSE,
+                              revprops,
+                              log_cb, &lb,
+                              ctx->client, scratch);
+    }
 
     if (err) {
         int rc = csvn_classify(ctx, err);
@@ -2403,7 +2425,10 @@ int csvn_wc_url(csvn_ctx *ctx,
     scratch = svn_pool_create(ctx->pool);
     canon_path = csvn_canon_dirent(wc_path, scratch);
 
-    err = svn_client_url_from_path2(&url, canon_path, ctx->client, scratch, scratch);
+    err = csvn_cancel_check(ctx);
+    if (!err) {
+        err = svn_client_url_from_path2(&url, canon_path, ctx->client, scratch, scratch);
+    }
     if (err || !url) {
         int rc = err ? csvn_classify(ctx, err) : -5;
         svn_pool_destroy(scratch);
@@ -2436,17 +2461,20 @@ int csvn_add(csvn_ctx *ctx,
     csvn_clear_error(ctx);
 
     scratch = svn_pool_create(ctx->pool);
-    for (i = 0; i < path_count; i++) {
+    err = csvn_cancel_check(ctx);
+    for (i = 0; !err && i < path_count; i++) {
         const char *canon = csvn_canon_dirent(paths[i], scratch);
-        err = svn_client_add5(canon,
-                              svn_depth_infinity,
-                              TRUE /* force */,
-                              FALSE /* no_ignore */,
-                              FALSE /* no_autoprops */,
-                              TRUE /* add_parents */,
-                              ctx->client,
-                              scratch);
-        if (err) break;
+        err = csvn_cancel_check(ctx);
+        if (!err) {
+            err = svn_client_add5(canon,
+                                  svn_depth_infinity,
+                                  TRUE /* force */,
+                                  FALSE /* no_ignore */,
+                                  FALSE /* no_autoprops */,
+                                  TRUE /* add_parents */,
+                                  ctx->client,
+                                  scratch);
+        }
     }
 
     if (err) {
@@ -3202,12 +3230,14 @@ int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
     apr_thread_mutex_lock(ctx->mutex);
     csvn_clear_error(ctx);
     apr_pool_t *pool = svn_pool_create(ctx->pool);
-    const char *target;
-    svn_error_t *err = NULL;
-    if (root)
-        err = inspect_node(&target, NULL, ctx, root, path_or_url, pool);
-    else
-        target = csvn_canon_url(path_or_url, pool);
+    const char *target = "";
+    svn_error_t *err = csvn_cancel_check(ctx);
+    if (!err) {
+        if (root)
+            err = inspect_node(&target, NULL, ctx, root, path_or_url, pool);
+        else
+            target = csvn_canon_url(path_or_url, pool);
+    }
     if (!err && name && !svn_prop_name_is_valid(name))
         err = invalid_wc("属性名称无效");
 

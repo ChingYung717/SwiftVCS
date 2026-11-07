@@ -131,25 +131,49 @@ struct CVCSKitTests {
         expect((try? MergeRequest(source: source, from: 2, to: 7, peg: 0)) == nil)
     }
 
-    private static func findSVNTool(_ name: String) -> String {
-        let candidates = [
+    private static func findSVNTool(_ name: String, file: StaticString = #fileID, line: UInt = #line) -> String {
+        var candidates = [
             "/opt/homebrew/opt/subversion/bin/\(name)",
             "/usr/local/opt/subversion/bin/\(name)",
             "/usr/bin/\(name)"
         ]
+        if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+            for dir in pathEnv.split(separator: ":") where dir.hasPrefix("/") {
+                let candidate = "\(dir)/\(name)"
+                if !candidates.contains(candidate) {
+                    candidates.append(candidate)
+                }
+            }
+        }
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
-        return name
+        FileHandle.standardError.write(
+            Data("Required SVN tool '\(name)' not found in candidates: \(candidates.joined(separator: ", "))\n".utf8)
+        )
+        expect(false, file: file, line: line)
+        return ""
     }
 
-    private static func spawnBackgroundProcess(_ executable: String, _ arguments: [String]) throws -> pid_t {
+    private static func spawnBackgroundProcess(
+        _ executable: String,
+        _ arguments: [String],
+        stderrPath: String = "/dev/null",
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) throws -> pid_t {
+        expect(executable.hasPrefix("/"), file: file, line: line)
         var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
+        expect(posix_spawn_file_actions_init(&fileActions) == 0, file: file, line: line)
         defer { posix_spawn_file_actions_destroy(&fileActions) }
-        _ = posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-        _ = posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-        _ = posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+        expect(posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0, file: file, line: line)
+        expect(posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) == 0, file: file, line: line)
+        let errFlags = stderrPath == "/dev/null" ? O_WRONLY : (O_WRONLY | O_CREAT | O_TRUNC)
+        expect(
+            posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, stderrPath, errFlags, 0o600) == 0,
+            file: file,
+            line: line
+        )
 
         let argvStrings = [executable] + arguments
         let cArgs = argvStrings.map { strdup($0) } + [nil]
@@ -158,11 +182,18 @@ struct CVCSKitTests {
                 free(ptr)
             }
         }
+        expect(cArgs.dropLast().allSatisfy { $0 != nil }, file: file, line: line)
         var pid: pid_t = 0
         let rc = cArgs.withUnsafeBufferPointer { buf in
             posix_spawn(&pid, executable, &fileActions, nil, buf.baseAddress, environ)
         }
-        expect(rc == 0)
+        if rc != 0 {
+            let errMsg = String(cString: strerror(rc))
+            FileHandle.standardError.write(
+                Data("posix_spawn failed for \(executable) \(arguments.joined(separator: " ")): rc=\(rc) (\(errMsg))\n".utf8)
+            )
+        }
+        expect(rc == 0, file: file, line: line)
         return pid
     }
 
@@ -181,13 +212,28 @@ struct CVCSKitTests {
         while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
     }
 
-    private static func runProcess(_ executable: String, _ arguments: [String]) throws {
-        let pid = try spawnBackgroundProcess(executable, arguments)
+    private static func runProcess(
+        _ executable: String,
+        _ arguments: [String],
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) throws {
+        let errFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swiftvcs-proc-\(UUID().uuidString).err")
+        defer { try? FileManager.default.removeItem(at: errFile) }
+        let pid = try spawnBackgroundProcess(executable, arguments, stderrPath: errFile.path, file: file, line: line)
         var status: Int32 = 0
         while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
-        let exitedNormally = (status & 0x7f) == 0
+        let signal = status & 0x7f
+        let exitedNormally = signal == 0
         let exitCode = (status >> 8) & 0xff
-        expect(exitedNormally && exitCode == 0)
+        if !exitedNormally || exitCode != 0 {
+            let stderrText = (try? String(contentsOf: errFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            FileHandle.standardError.write(
+                Data("Command failed (\(executable) \(arguments.joined(separator: " "))): exitedNormally=\(exitedNormally) exitCode=\(exitCode) signal=\(signal) stderr=\(stderrText)\n".utf8)
+            )
+        }
+        expect(exitedNormally && exitCode == 0, file: file, line: line)
     }
 
     private static func testSequentialReconnectCredentialIsolation() async throws {
@@ -1160,6 +1206,35 @@ struct CVCSKitTests {
             expect(rcCancelCat == -7)
             expect(outText == nil)
 
+            var outRev: Int32 = 0
+            var outUpd: Int32 = 0
+            var outAdd: Int32 = 0
+            var outDel: Int32 = 0
+            var outConf: UnsafeMutablePointer<CChar>? = nil
+            var outConfCnt: Int32 = 0
+            var outComm: Int32 = 0
+            let repoURLStr = URL(fileURLWithPath: repo.path).absoluteString
+            let rcCancelCheckout = repoURLStr.withCString { u in
+                wc.path.withCString { d in
+                    csvn_checkout(cCtx, u, d, 0, &outRev)
+                }
+            }
+            expect(rcCancelCheckout == -7)
+
+            let rcCancelUpdate = wc.path.withCString { p in
+                csvn_update(cCtx, p, 0, &outRev, &outUpd, &outAdd, &outDel, &outConf, &outConfCnt)
+            }
+            expect(rcCancelUpdate == -7)
+
+            var wcTargetPtr: UnsafePointer<CChar>? = UnsafePointer(strdup(wc.path))
+            defer { if let wcTargetPtr { free(UnsafeMutablePointer(mutating: wcTargetPtr)) } }
+            let rcCancelCommit = "cancelled".withCString { m in
+                csvn_commit(cCtx, &wcTargetPtr, 1, m, 0, &outRev, &outComm)
+            }
+            expect(rcCancelCommit == -7)
+            expect(csvn_revert(cCtx, &wcTargetPtr, 1, 0) == -7)
+            expect(csvn_add(cCtx, &wcTargetPtr, 1) == -7)
+
             csvn_clear_cancel(cCtx)
             let rcAfterClear = fileURLStr.withCString { u in
                 csvn_diff_revision(cCtx, u, 2, 4096, &outText, &outLen, &outTrunc)
@@ -1209,7 +1284,7 @@ struct CVCSKitTests {
                 arrived = root / f"{tag}.arrived"
                 release = root / f"{tag}.release"
                 arrived.write_text("1")
-                deadline = time.monotonic() + 3.0
+                deadline = time.monotonic() + 5.0
                 while time.monotonic() < deadline and not release.exists():
                     time.sleep(0.01)
                 mode = release.read_text().strip() if release.exists() else "403"
@@ -1308,7 +1383,9 @@ struct CVCSKitTests {
         let a1Info = try await taskA1.value
         expect(a1Info.youngestRevision == 7)
 
-        // Case 2: Run A (in-flight HTTP OPTIONS), queue B on same client, cancel ONLY running A -> A throws CancellationError, B succeeds
+        // Case 2: Run A (in-flight HTTP OPTIONS blocked for up to 5s), queue B on same client, cancel ONLY running A
+        // WITHOUT releasing the server -> A must be interrupted in C via csvn_cancel_check and throw CancellationError
+        // in < 2.0s (well before the 5s server deadline), while B succeeds and client state rolls back to case1URL
         let case2URL = require(URL(string: "http://127.0.0.1:\(cancelPort)/case2"))
         let case2Arrived = cancelStateDir.appendingPathComponent("case2.arrived")
         let case2Release = cancelStateDir.appendingPathComponent("case2.release")
@@ -1329,9 +1406,8 @@ struct CVCSKitTests {
             try await client.diff(workingCopy: wc, paths: ["z_tail.txt"])
         }
         try await Task.sleep(nanoseconds: 50_000_000)
+        let a2CancelStart = ContinuousClock.now
         taskA2.cancel()
-        try await Task.sleep(nanoseconds: 50_000_000)
-        try "200".write(to: case2Release, atomically: true, encoding: .utf8)
 
         let a2Cancelled: Bool = await {
             do {
@@ -1343,11 +1419,15 @@ struct CVCSKitTests {
                 return false
             }
         }()
+        let a2CancelElapsed = ContinuousClock.now - a2CancelStart
         expect(a2Cancelled)
+        expect(a2CancelElapsed < .seconds(2))
+        expect(!fm.fileExists(atPath: case2Release.path))
         expect(client.repositoryRoot == case1URL)
 
         let b2Diffs = try await taskB2.value
         expect(b2Diffs.count == 1 && b2Diffs.first?.path == "z_tail.txt")
+        try "403".write(to: case2Release, atomically: true, encoding: .utf8)
 
         // Case 3: Multiple queued operations (B, C, D) behind in-flight A; cancel D and B in reverse order while C and subsequent E succeed
         let case3URL = require(URL(string: "http://127.0.0.1:\(cancelPort)/case3"))
@@ -1393,7 +1473,8 @@ struct CVCSKitTests {
         let e3Status = try await client.status(of: wc)
         expect(e3Status.contains { $0.path == "z_tail.txt" })
 
-        // Case 4: Cross-instance performWrite cancelled while waiting on workingCopyWriteLock must not mutate working copy
+        // Case 4: Cross-instance performWrite cancelled while waiting on workingCopyWriteLock must return CancellationError
+        // promptly (< 0.5s) while W1 still holds the lock, unblock subsequent reads on W2, and not mutate working copy
         let case4URL = require(URL(string: "http://127.0.0.1:\(cancelPort)/case4"))
         let case4Arrived = cancelStateDir.appendingPathComponent("case4.arrived")
         let case4Release = cancelStateDir.appendingPathComponent("case4.release")
@@ -1417,18 +1498,30 @@ struct CVCSKitTests {
             try await writer2.setProperty("user:cancelled-prop", value: Data("should-not-write".utf8), workingCopy: wc, path: "z_tail.txt")
         }
         try await Task.sleep(nanoseconds: 50_000_000)
-        taskW2.cancel()
-        try await Task.sleep(nanoseconds: 30_000_000)
-        try "403".write(to: case4Release, atomically: true, encoding: .utf8)
+        let taskR2 = Task {
+            try await writer2.status(of: wc)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
 
-        _ = try? await taskW1.value
+        let w2CancelStart = ContinuousClock.now
+        taskW2.cancel()
         var w2Cancelled = false
         do {
             try await taskW2.value
         } catch is CancellationError {
             w2Cancelled = true
         }
+        let w2CancelElapsed = ContinuousClock.now - w2CancelStart
         expect(w2Cancelled)
+        expect(w2CancelElapsed < .milliseconds(500))
+        expect(!fm.fileExists(atPath: case4Release.path))
+
+        let r2Statuses = try await taskR2.value
+        expect(r2Statuses.contains { $0.path == "z_tail.txt" })
+        expect(!fm.fileExists(atPath: case4Release.path))
+
+        try "403".write(to: case4Release, atomically: true, encoding: .utf8)
+        _ = try? await taskW1.value
         let propAfterCancel = try await client.property("user:cancelled-prop", at: .workingCopy(root: wc, path: "z_tail.txt"))
         expect(propAfterCancel == nil)
 

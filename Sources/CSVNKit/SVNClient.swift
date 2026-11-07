@@ -86,7 +86,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         if let h = swapActiveHandle(nil) { csvn_context_destroy(h) }
     }
 
-    /// 请求取消当前上下文上正在执行的底层 SVN 操作。
+    /// 请求取消当前实例上**正在执行**的底层 SVN 操作。
+    ///
+    /// - Note: 该方法仅作用于调用时刻处于活动状态的单个操作；若当前无运行中操作，
+    ///   或当前操作结束后启动新的排队操作，新操作会在开始时重置底层取消标志而不会受影响。
+    ///   若需取消排队中或跨实例等待写锁的特定异步调用，请直接取消对应的 Swift `Task`。
     public func requestCancel() {
         stateLock.withLock {
             activeOperation?.isCancelled = true
@@ -261,10 +265,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     private func performWrite<T>(_ body: @escaping () throws -> T) async throws -> T {
         try await perform {
-            try Self.workingCopyWriteLock.withLock {
+            try self.checkActiveCancellation()
+            while !Self.workingCopyWriteLock.lock(before: Date(timeIntervalSinceNow: 0.01)) {
                 try self.checkActiveCancellation()
-                return try body()
             }
+            defer { Self.workingCopyWriteLock.unlock() }
+            try self.checkActiveCancellation()
+            return try body()
         }
     }
 

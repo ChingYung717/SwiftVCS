@@ -13,6 +13,7 @@ jobs:
   build-and-test:
     name: Build, Test & Package (macOS arm64)
     runs-on: macos-15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -21,6 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build dependencies
+        timeout-minutes: 10
         run: brew install subversion apr apr-util pkgconf
 
       - name: Record runner toolchain and dependency versions
@@ -34,12 +36,14 @@ jobs:
           brew list --versions subversion apr apr-util pkgconf utf8proc lz4 sqlite expat openssl@3 || true
 
       - name: Build and run unit checks
+        timeout-minutes: 10
         run: |
           source scripts/svn_build_env.sh
           swift build
           swift run SwiftVCSChecks
 
       - name: Run C shim ASAN and UBSAN boundary checks
+        timeout-minutes: 5
         run: |
           source scripts/svn_build_env.sh
           TMP_ASAN="$(mktemp -d "${RUNNER_TEMP:-/tmp}/swiftvcs-asan.XXXXXX")"
@@ -52,15 +56,18 @@ jobs:
           "$TMP_ASAN/c_shim_asan_test" "file://$TMP_ASAN/repo" "$TMP_ASAN/wc"
 
       - name: Run offline SVN and loopback security tests
+        timeout-minutes: 10
         run: |
           ./Tests/run_e2e.sh
           source scripts/svn_build_env.sh
           python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
 
       - name: Package standalone VCSExplorer.app
+        timeout-minutes: 10
         run: ./make_app.sh
 
       - name: Verify package
+        timeout-minutes: 5
         run: |
           app=dist/VCSExplorer.app
           test "$(lipo -archs "$app/Contents/MacOS/VCSExplorer")" = arm64
@@ -92,6 +99,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     concurrency:
@@ -110,6 +118,7 @@ jobs:
           name: VCSExplorer-arm64
 
       - name: Publish the package for this commit
+        timeout-minutes: 5
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
