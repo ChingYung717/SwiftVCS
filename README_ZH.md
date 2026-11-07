@@ -9,6 +9,10 @@
 
 **SwiftVCS** 是面向 macOS 的原生 Subversion (SVN) 客户端与分层开发套件。它通过 C11 桥接层（`CSVNShim`）直接调用 `libsvn_client` 等原生 C 接口，提供 **GitHub Desktop 风格的图形界面（`VCS Explorer`）** 与 **命令行工具（`vcsctl`）**。
 
+<p align="center">
+  <img src="docs/images/03-history-split.png" alt="VCS Explorer — 提交级并排对比" width="900">
+</p>
+
 ---
 
 ## 1. 模块划分与工程结构
@@ -32,7 +36,113 @@ SwiftVCS/
 
 ---
 
-## 2. 界面快捷键一览 (`VCS Explorer`)
+## 2. 界面预览
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/01-welcome.png" alt="欢迎页"><br><sub><strong>欢迎页</strong>：一键连接远端 SVN 仓库、打开本地工作副本或访问最近仓库</sub></td>
+    <td width="50%"><img src="docs/images/05-changes.png" alt="更改页"><br><sub><strong>更改（<code>⌘2</code>）</strong>：工作副本状态勾选、一键纳管（<code>svn add</code>）、并排差异预览与提交</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/04-history-unified.png" alt="统一视图"><br><sub><strong>历史（<code>⌘1</code>）</strong>：按修订/作者/路径过滤，支持并排与统一视图（<code>⌘⇧D</code>）一键切换</sub></td>
+    <td width="50%"><img src="docs/images/06-browse.png" alt="浏览页"><br><sub><strong>浏览（<code>⌘3</code>）</strong>：远端目录树面包屑导航、在线代码行号预览与路径历史联动</sub></td>
+  </tr>
+</table>
+
+---
+
+## 3. 快速开始（运行引导）与源码构建
+
+```mermaid
+flowchart TD
+    S(["开始使用 SwiftVCS"]) --> Q{"选择运行方式"}
+    Q -->|"方式一：下载预编译包"| R1["从 GitHub Releases 下载\nVCSExplorer-arm64.zip"]
+    R1 --> R2["校验 SHA256SUMS，解压并拖入「应用程序」"]
+    R2 --> R3["首次打开（ad-hoc 签名未公证）：\n系统设置 → 隐私与安全性 → 仍要打开\n或执行 xattr -dr com.apple.quarantine"]
+    Q -->|"方式二：从源码直接运行"| B1["brew install subversion apr apr-util pkgconf"]
+    B1 --> B2["source scripts/svn_build_env.sh"]
+    B2 --> B3["swift run VCSExplorer"]
+    Q -->|"离线快速体验"| D1["./scripts/make_readme_demo.sh /tmp/swiftvcs-demo"]
+    D1 --> B2
+    R3 --> W["进入 VCS Explorer 欢迎页"]
+    B3 --> W
+    W -->|"连接远端仓库 ⌘⇧N"| C["填写仓库 URL 与账号密码\n自签名证书：先抓取并核对 SHA-256 指纹"]
+    W -->|"打开本地工作副本 ⌘O"| L["选择已检出的本地 .svn 目录"]
+    C --> H["历史 ⌘1（并排/统一 Diff ⌘⇧D）· 浏览 ⌘3"]
+    L --> G["更改 ⌘2：勾选改动、预览差异并提交 ⌘↩"]
+```
+
+### 方式一：下载预编译包直接运行（Apple Silicon `arm64`）
+
+每次推送 `main` 分支，CI 会自动构建并发布经过校验的 Preview Release。预编译包的最低系统版本以 Release 附带的 `build-info.txt` 为准（当前 `arm64` 预编译包要求 **macOS 15.0+**）：
+
+```bash
+gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+shasum -a 256 --check SHA256SUMS
+
+unzip -q VCSExplorer-arm64.zip
+mv VCSExplorer.app /Applications/
+```
+
+> **首次打开提示**：预编译预览包采用 ad-hoc 签名且未公证（`Signature: ad hoc, not notarized`）。首次启动若遇到 macOS Gatekeeper 拦截，可在「**系统设置 → 隐私与安全性**」底部点击「**仍要打开**」，或在终端执行：
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/VCSExplorer.app
+> open /Applications/VCSExplorer.app
+> ```
+
+### 方式二：源码构建与运行（支持 `macOS 14.0+`）
+
+安装 Homebrew 的 `subversion`、`apr`、`apr-util` 和 `pkgconf` 后，执行 `./scripts/svn_build_env.sh` 即可构建。需要运行 `VCSExplorer` 或其他 SwiftPM 命令时，先执行 `source scripts/svn_build_env.sh`：
+
+```bash
+brew install subversion apr apr-util pkgconf
+./scripts/svn_build_env.sh
+source scripts/svn_build_env.sh
+swift run VCSExplorer
+```
+
+`VCSExplorer` 支持以下命令行启动参数：
+
+| 启动参数 | 说明 |
+|---|---|
+| `--repo <URL>` | 启动后自动连接指定 SVN 仓库（支持 `https://`、`http://`、`svn://`、`svn+ssh://`、`file://`）并加载最近提交历史 |
+| `--user <用户名>` | 预填 SVN 认证用户名 |
+| `--wc <本地路径>` | 关联本地 `.svn` 工作副本目录；若未同时指定 `--repo`，启动后自动切到「更改 (`⌘2`)」页签 |
+| `--selftest <URL> [工作副本]` | 不打开图形窗口，复用 `AppModel` 主链路执行离线端到端自检并输出逐项结果 |
+
+> **安全建议**：避免在命令行参数中直接传递明文口令。请在「连接 SVN 仓库 (`⌘⇧N`)」弹窗中输入口令并开启「**记住 HTTPS 凭据（macOS 钥匙串）**」。
+
+### 离线快速体验（无需远端 SVN 服务器）
+
+```bash
+./scripts/make_readme_demo.sh /tmp/swiftvcs-demo
+source scripts/svn_build_env.sh
+swift run VCSExplorer \
+  --repo file:///tmp/swiftvcs-demo/SwiftVCSDemo \
+  --wc /tmp/swiftvcs-demo/SwiftVCSDemo-wc
+```
+
+### 首次连接与自签名 TLS 证书两步核验
+
+<p align="center">
+  <img src="docs/images/02-connect.png" alt="连接 SVN 仓库与 TLS 证书两步核验" width="760">
+</p>
+
+1. 启动后在欢迎页点击「**连接远端 SVN 仓库**」（或按快捷键 `⌘⇧N`）打开连接设置弹窗；
+2. 输入仓库 URL、用户名与密码（可勾选保存至 macOS 钥匙串），以及可选的本地工作副本路径；
+3. 若企业内网 SVN 使用**自签名 HTTPS 证书**，点击「**抓取并核验服务器证书**」，界面会先展示证书主体（Subject）与 `SHA-256` 指纹；与管理员提供的指纹核对一致后，点击「**确认指纹无误，信任并连接**」，即可仅为该主机和端口保存叶证书并完成连接。
+
+### 打包独立应用 (`VCSExplorer.app`)
+
+```bash
+./make_app.sh
+```
+
+输出产物位于 `dist/VCSExplorer.app` 与 `dist/VCSExplorer-<架构>.zip`（已将全部 22 个依赖 `.dylib` 内置到 `Contents/Frameworks/`）。
+
+---
+
+## 4. 界面快捷键一览 (`VCS Explorer`)
 
 | 快捷键 | 功能说明 |
 |---|---|
@@ -47,7 +157,7 @@ SwiftVCS/
 
 ---
 
-## 3. 本地配置与安全设计
+## 5. 本地配置与安全设计
 
 - **配置文件目录**：`~/.config/vcs-explorer/`（目录权限强制设为 `0700`）
   - `settings.json`：保存最近连接的仓库列表、工作副本路径与界面偏好。
@@ -56,13 +166,9 @@ SwiftVCS/
 
 ---
 
-## 4. 开源协议
+## 6. 开源协议
 
 本项目代码基于 **[MIT License](./LICENSE)** 开源；打包内置的第三方动态库（Apache Subversion、APR、Serf、OpenSSL 等）许可证声明详见 **[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)**。
-
-## 源码构建
-
-安装 Homebrew 的 `subversion`、`apr`、`apr-util` 和 `pkgconf` 后，执行 `./scripts/svn_build_env.sh` 即可构建。需要运行其他 SwiftPM 命令时，先执行 `source scripts/svn_build_env.sh`。
 
 ## 工作副本协作
 

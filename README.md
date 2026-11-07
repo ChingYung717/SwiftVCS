@@ -14,6 +14,10 @@
   <a href="./THIRD_PARTY_NOTICES.md">Third-Party Notices</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/03-history-split.png" alt="VCS Explorer — 提交级并排对比 / Commit-level split diff" width="900">
+</p>
+
 ---
 
 ## 简体中文文档
@@ -48,6 +52,19 @@
 4. **企业内网自签名 HTTPS 证书两步核验 (`Two-Step TLS Fingerprint Verification`)**
    - 针对使用内部私有 CA 或自签名证书的企业 SVN 服务器，提供「抓取并核验服务器证书 → 展示证书主体（Subject）与 `SHA-256` 指纹 → 用户确认无误后仅对该 HTTPS 主机和端口信任叶证书」的两步安全信任流，避免盲目信任（Blind TOFU）。
 
+### 界面预览
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/01-welcome.png" alt="欢迎页"><br><sub><strong>欢迎页</strong>：一键连接远端 SVN 仓库、打开本地工作副本或访问最近仓库</sub></td>
+    <td width="50%"><img src="docs/images/05-changes.png" alt="更改页"><br><sub><strong>更改（<code>⌘2</code>）</strong>：工作副本状态勾选、一键纳管（<code>svn add</code>）、并排差异预览与提交</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/04-history-unified.png" alt="统一视图"><br><sub><strong>历史（<code>⌘1</code>）</strong>：按修订/作者/路径过滤，支持并排与统一视图（<code>⌘⇧D</code>）一键切换</sub></td>
+    <td width="50%"><img src="docs/images/06-browse.png" alt="浏览页"><br><sub><strong>浏览（<code>⌘3</code>）</strong>：远端目录树面包屑导航、在线代码行号预览与路径历史联动</sub></td>
+  </tr>
+</table>
+
 ### 系统架构图
 
 ```text
@@ -65,18 +82,98 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 快速开始与构建打包
+### 快速开始（运行引导）与构建打包
+
+```mermaid
+flowchart TD
+    S(["开始使用 SwiftVCS"]) --> Q{"选择运行方式"}
+    Q -->|"方式一：下载预编译包"| R1["从 GitHub Releases 下载\nVCSExplorer-arm64.zip"]
+    R1 --> R2["校验 SHA256SUMS，解压并拖入「应用程序」"]
+    R2 --> R3["首次打开（ad-hoc 签名未公证）：\n系统设置 → 隐私与安全性 → 仍要打开\n或执行 xattr -dr com.apple.quarantine"]
+    Q -->|"方式二：从源码直接运行"| B1["brew install subversion apr apr-util pkgconf"]
+    B1 --> B2["source scripts/svn_build_env.sh"]
+    B2 --> B3["swift run VCSExplorer"]
+    Q -->|"离线快速体验"| D1["./scripts/make_readme_demo.sh /tmp/swiftvcs-demo"]
+    D1 --> B2
+    R3 --> W["进入 VCS Explorer 欢迎页"]
+    B3 --> W
+    W -->|"连接远端仓库 ⌘⇧N"| C["填写仓库 URL 与账号密码\n自签名证书：先抓取并核对 SHA-256 指纹"]
+    W -->|"打开本地工作副本 ⌘O"| L["选择已检出的本地 .svn 目录"]
+    C --> H["历史 ⌘1（并排/统一 Diff ⌘⇧D）· 浏览 ⌘3"]
+    L --> G["更改 ⌘2：勾选改动、预览差异并提交 ⌘↩"]
+```
 
 #### 1. 环境要求
-- **操作系统**：macOS 14.0 (Sonoma) 或更高版本（预编译包的最低版本取决于实际打包的动态库）
-- **开发工具**：Xcode Command Line Tools（Swift 5.9+）
-- **构建依赖**：通过 Homebrew 安装 `subversion` 与 `apr`（仅编译时需要；打包后的 `VCSExplorer.app` 已将全部依赖 `.dylib` 内置到 `Contents/Frameworks/`，目标机器无需安装 Homebrew）：
+- **操作系统**：源码编译支持 **macOS 14.0 (Sonoma)** 或更高版本；GitHub Releases 预编译包的最低系统版本取决于打包内置的动态库版本，请以对应 Release 附带的 `build-info.txt` 为准（当前 `arm64` 预编译包要求 **macOS 15.0+**）。
+- **开发工具**（仅源码构建需要）：Xcode Command Line Tools（Swift 5.9+）。
+- **构建依赖**（仅源码构建与离线演示脚本需要；打包后的 `VCSExplorer.app` 已将全部 22 个依赖 `.dylib` 内置到 `Contents/Frameworks/`，目标机器无需安装 Homebrew）：
 
 ```bash
 brew install subversion apr apr-util pkgconf
 ```
 
-#### 2. 编译与运行测试
+#### 2. 方式一：下载预编译包直接运行（Apple Silicon `arm64`）
+每次推送 `main` 分支，CI 都会自动构建并发布经过校验的 Preview Release：
+
+```bash
+# 使用 GitHub CLI 下载最新预编译包与校验文件（也可直接在网页端 Releases 页面下载）
+gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+shasum -a 256 --check SHA256SUMS
+
+# 解压并移入 /Applications
+unzip -q VCSExplorer-arm64.zip
+mv VCSExplorer.app /Applications/
+```
+
+> **首次打开提示**：预编译预览包采用 ad-hoc 签名且未公证（`Signature: ad hoc, not notarized`）。首次启动若遇到 macOS Gatekeeper 拦截，可在「**系统设置 → 隐私与安全性**」底部点击「**仍要打开**」，或在终端执行以下命令移除隔离属性后启动：
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/VCSExplorer.app
+> open /Applications/VCSExplorer.app
+> ```
+
+#### 3. 方式二：从源码直接启动图形界面 (`VCS Explorer`)
+
+```bash
+# 生成 pkg-config 配置并导出 PKG_CONFIG_PATH
+source scripts/svn_build_env.sh
+
+# 直接编译并启动 VCS Explorer 桌面端
+swift run VCSExplorer
+```
+
+`VCSExplorer` 支持通过命令行启动参数直接打开指定仓库或本地工作副本：
+
+| 启动参数 | 说明 |
+|---|---|
+| `--repo <URL>` | 启动后自动连接指定 SVN 仓库（支持 `https://`、`http://`、`svn://`、`svn+ssh://`、`file://`）并加载最近提交历史 |
+| `--user <用户名>` | 预填 SVN 认证用户名 |
+| `--wc <本地路径>` | 关联本地 `.svn` 工作副本目录；若未同时指定 `--repo`，启动后自动切到「更改 (`⌘2`)」页签 |
+| `--selftest <URL> [工作副本]` | 不打开图形窗口，复用 `AppModel` 主链路执行离线端到端自检并输出逐项结果 |
+
+> **安全建议**：避免在命令行参数中直接传递明文口令（会暴露在 Shell 历史与进程列表中）。请在界面「连接 SVN 仓库 (`⌘⇧N`)」弹窗中输入口令并开启「**记住 HTTPS 凭据（macOS 钥匙串）**」。
+
+#### 4. 离线快速体验（无需远端 SVN 服务器）
+若手头没有现成的 SVN 服务器，可使用仓库自带脚本在 `/tmp/swiftvcs-demo` 一键生成包含多作者提交历史、属性变更、历史复制（`copyfrom`）与未提交改动的本地 `file://` 演示仓库：
+
+```bash
+./scripts/make_readme_demo.sh /tmp/swiftvcs-demo
+source scripts/svn_build_env.sh
+swift run VCSExplorer \
+  --repo file:///tmp/swiftvcs-demo/SwiftVCSDemo \
+  --wc /tmp/swiftvcs-demo/SwiftVCSDemo-wc
+```
+
+#### 5. 首次连接与自签名 TLS 证书两步核验
+
+<p align="center">
+  <img src="docs/images/02-connect.png" alt="连接 SVN 仓库与 TLS 证书两步核验" width="760">
+</p>
+
+1. 启动后在欢迎页点击「**连接远端 SVN 仓库**」（或按快捷键 `⌘⇧N`）打开连接设置弹窗；
+2. 输入仓库 URL、用户名与密码（可勾选保存至 macOS 钥匙串），以及可选的本地工作副本路径；
+3. 若企业内网 SVN 使用**自签名 HTTPS 证书**，点击「**抓取并核验服务器证书**」，界面会先展示证书主体（Subject）与 `SHA-256` 指纹；与管理员提供的指纹核对一致后，点击「**确认指纹无误，信任并连接**」，即可仅为该主机和端口保存叶证书并完成连接。
+
+#### 6. 编译与运行测试
 
 ```bash
 # Debug 构建全部模块 (CVCSKit, CSVNKit, vcsctl, VCSExplorer)
@@ -88,7 +185,7 @@ swift run SwiftVCSChecks
 ./Tests/run_e2e.sh
 ```
 
-#### 3. 打包独立可分发的应用包 (`VCSExplorer.app`)
+#### 7. 打包独立可分发的应用包 (`VCSExplorer.app`)
 
 ```bash
 ./make_app.sh
@@ -163,21 +260,113 @@ vcsctl log      /path/to/wc --limit 50
 4. **Two-Step TLS Certificate Fingerprint Verification**
    - For enterprise SVN servers using self-signed certificates or private CAs, `VCS Explorer` probes the server certificate first, displays its Subject and `SHA-256` fingerprint, and only trusts that leaf certificate for its HTTPS host and port after confirmation.
 
-### Build, Test & Standalone Packaging
+### Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/01-welcome.png" alt="Welcome Screen"><br><sub><strong>Welcome</strong>: Connect to a remote SVN repository, open a local working copy, or jump to recent repositories</sub></td>
+    <td width="50%"><img src="docs/images/05-changes.png" alt="Changes Tab"><br><sub><strong>Changes (<code>⌘2</code>)</strong>: Working copy checklist, one-click stage (<code>svn add</code>), side-by-side diff preview, and commit box</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/04-history-unified.png" alt="Unified Diff View"><br><sub><strong>History (<code>⌘1</code>)</strong>: Instant filtering by revision/author/path, with instant Split & Unified view toggle (<code>⌘⇧D</code>)</sub></td>
+    <td width="50%"><img src="docs/images/06-browse.png" alt="Browse Tab"><br><sub><strong>Browse (<code>⌘3</code>)</strong>: Interactive breadcrumb navigation, line-numbered remote file preview, and path log jump</sub></td>
+  </tr>
+</table>
+
+### Getting Started, Build & Standalone Packaging
+
+```mermaid
+flowchart TD
+    S(["Start Using SwiftVCS"]) --> Q{"How to run?"}
+    Q -->|"Option A: Prebuilt Release"| R1["Download VCSExplorer-arm64.zip\nfrom GitHub Releases"]
+    R1 --> R2["Verify SHA256SUMS, unzip & move to /Applications"]
+    R2 --> R3["First launch (ad-hoc signed, not notarized):\nSystem Settings → Privacy & Security → Open Anyway\nor run xattr -dr com.apple.quarantine"]
+    Q -->|"Option B: Run from Source"| B1["brew install subversion apr apr-util pkgconf"]
+    B1 --> B2["source scripts/svn_build_env.sh"]
+    B2 --> B3["swift run VCSExplorer"]
+    Q -->|"Offline Quick Demo"| D1["./scripts/make_readme_demo.sh /tmp/swiftvcs-demo"]
+    D1 --> B2
+    R3 --> W["VCS Explorer Welcome Screen"]
+    B3 --> W
+    W -->|"Connect Remote Repo ⌘⇧N"| C["Enter Repository URL & Credentials\nSelf-signed TLS: Probe & verify SHA-256 fingerprint"]
+    W -->|"Open Working Copy ⌘O"| L["Select an existing local .svn directory"]
+    C --> H["History ⌘1 (Split/Unified Diff ⌘⇧D) · Browse ⌘3"]
+    L --> G["Changes ⌘2: Review diffs & commit checked files ⌘↩"]
+```
+
+#### Option A: Download Prebuilt App Bundle (Apple Silicon `arm64`)
+Every push to `main` publishes a verified preview bundle on GitHub Releases:
+
+```bash
+# Download the latest preview bundle and checksums via GitHub CLI (or from the Releases page)
+gh release download --repo ChingYung717/SwiftVCS --pattern 'VCSExplorer-arm64.zip' --pattern 'SHA256SUMS' --pattern 'build-info.txt'
+shasum -a 256 --check SHA256SUMS
+
+unzip -q VCSExplorer-arm64.zip
+mv VCSExplorer.app /Applications/
+```
+
+> **First-Launch Note**: Preview bundles are ad-hoc signed and not notarized (`Signature: ad hoc, not notarized`), and their minimum macOS version is determined by the bundled dynamic libraries as recorded in `build-info.txt` (currently **macOS 15.0+**). On first launch, either click **Open Anyway** under **System Settings → Privacy & Security**, or strip the quarantine attribute:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/VCSExplorer.app
+> open /Applications/VCSExplorer.app
+> ```
+
+#### Option B: Build & Launch from Source (`macOS 14.0+`)
 
 ```bash
 # 1. Install build-time dependencies via Homebrew (Apple Silicon or Intel)
 brew install subversion apr apr-util pkgconf
 
-# 2. Build all targets
+# 2. Export PKG_CONFIG_PATH and launch the GUI directly
+source scripts/svn_build_env.sh
+swift run VCSExplorer
+```
+
+Supported launch arguments for `VCSExplorer`:
+
+| Argument | Description |
+|---|---|
+| `--repo <URL>` | Automatically connect to the given SVN repository (`https://`, `http://`, `svn://`, `svn+ssh://`, or `file://`) and load recent history |
+| `--user <name>` | Pre-fill the SVN authentication username |
+| `--wc <path>` | Associate a local `.svn` working copy; opens directly on the **Changes (`⌘2`)** tab when `--repo` is omitted |
+| `--selftest <URL> [wc]` | Run headless end-to-end verification through `AppModel` without opening a window |
+
+> **Security Tip**: Avoid passing plaintext passwords on the command line (which exposes them in shell history and process listings). Enter passwords in the **Connect Repository (`⌘⇧N`)** sheet and enable **Remember HTTPS credentials (macOS Keychain)**.
+
+#### Try It Offline (No SVN Server Required)
+Generate a self-contained local `file://` demo repository (with multi-author commits, property changes, `copyfrom` history, and uncommitted working copy edits) in one command:
+
+```bash
+./scripts/make_readme_demo.sh /tmp/swiftvcs-demo
+source scripts/svn_build_env.sh
+swift run VCSExplorer \
+  --repo file:///tmp/swiftvcs-demo/SwiftVCSDemo \
+  --wc /tmp/swiftvcs-demo/SwiftVCSDemo-wc
+```
+
+#### First-Time Connection & Two-Step TLS Verification
+
+<p align="center">
+  <img src="docs/images/02-connect.png" alt="Connect SVN Repository and Two-Step TLS Verification" width="760">
+</p>
+
+1. Click **Connect Remote SVN Repository** on the welcome screen (or press `⌘⇧N`);
+2. Enter the repository URL, username, password (optionally saved to macOS Keychain), and local working copy path;
+3. For self-signed HTTPS servers, click **Probe & Verify Server Certificate** (`抓取并核验服务器证书`), verify the displayed Subject and `SHA-256` fingerprint against your administrator's fingerprint, and click **Confirm & Connect** (`确认指纹无误，信任并连接`).
+
+#### Build, Test & Standalone Packaging
+
+```bash
+# 1. Build all targets and run unit checks
 ./scripts/svn_build_env.sh
 source scripts/svn_build_env.sh
 swift run SwiftVCSChecks
 
-# 3. Run the offline E2E test suite (uses local file:// repositories)
+# 2. Run the offline E2E test suite (uses local file:// repositories)
 ./Tests/run_e2e.sh
 
-# 4. Package a standalone, self-contained macOS app bundle
+# 3. Package a standalone, self-contained macOS app bundle
 ./make_app.sh
 # Outputs:
 #   dist/VCSExplorer.app (bundles all 22 libsvn/libapr/libserf dylibs under Contents/Frameworks/ via @rpath)
