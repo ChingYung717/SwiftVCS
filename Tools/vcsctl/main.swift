@@ -413,6 +413,9 @@ do {
                 continue
             }
             if let notice = d.statusNotice { out("[\(notice)]") }
+            if d.isTruncated {
+                out("[内容过大，已截断]")
+            }
             for h in d.hunks {
                 out(h.header)
                 for l in h.lines {

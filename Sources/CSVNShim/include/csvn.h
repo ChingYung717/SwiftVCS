@@ -179,6 +179,14 @@ int csvn_diff(csvn_ctx *ctx,
               char **out_text,
               long *out_len);
 
+/* 6a. 带字节上限的工作副本差异；max_bytes <= 0 表示不限制，超过上限时 *out_truncated = 1 */
+int csvn_diff_capped(csvn_ctx *ctx,
+                     const char *path,
+                     long max_bytes,
+                     char **out_text,
+                     long *out_len,
+                     int *out_truncated);
+
 /* 6b. 单个文件在指定修订中的改动（peg = revision, start = revision - 1, end = revision） */
 int csvn_diff_revision(csvn_ctx *ctx,
                        const char *file_url,

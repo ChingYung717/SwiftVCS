@@ -1061,10 +1061,12 @@ static char *read_whole_file(const char *path, long *out_len)
     return read_file_capped(path, 0, out_len, NULL);
 }
 
-int csvn_diff(csvn_ctx *ctx,
-              const char *path,
-              char **out_text,
-              long *out_len)
+int csvn_diff_capped(csvn_ctx *ctx,
+                     const char *path,
+                     long max_bytes,
+                     char **out_text,
+                     long *out_len,
+                     int *out_truncated)
 {
     svn_error_t *err;
     apr_pool_t *scratch;
@@ -1076,7 +1078,11 @@ int csvn_diff(csvn_ctx *ctx,
     char templ[] = "/tmp/csvn-diff-XXXXXX";
     char *text = NULL;
 
-    if (!ctx || !path) return -100;
+    if (!ctx || !path || !out_text) return -100;
+    *out_text = NULL;
+    if (out_len) *out_len = 0;
+    if (out_truncated) *out_truncated = 0;
+
     apr_thread_mutex_lock(ctx->mutex);
     csvn_clear_error(ctx);
 
@@ -1126,12 +1132,33 @@ int csvn_diff(csvn_ctx *ctx,
         return rc;
     }
 
-    text = read_file_capped(templ, 32 * 1024 * 1024, out_len, NULL);
+    text = read_file_capped(templ, max_bytes, out_len, out_truncated);
     remove(templ);
     *out_text = text;
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);
     return text ? 0 : -100;
+}
+
+int csvn_diff(csvn_ctx *ctx,
+              const char *path,
+              char **out_text,
+              long *out_len)
+{
+    int truncated = 0;
+    int rc = csvn_diff_capped(ctx, path, 32 * 1024 * 1024, out_text, out_len, &truncated);
+    if (rc == 0 && truncated) {
+        if (out_text && *out_text) {
+            free(*out_text);
+            *out_text = NULL;
+        }
+        if (out_len) *out_len = 0;
+        apr_thread_mutex_lock(ctx->mutex);
+        csvn_set_error(ctx, svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "差异输出超过 32 MB 上限"));
+        apr_thread_mutex_unlock(ctx->mutex);
+        return -100;
+    }
+    return rc;
 }
 
 int csvn_diff_revision(csvn_ctx *ctx,

@@ -206,6 +206,19 @@ DASH_LOG=$("$VCSCTL" log "file://$T/repo" --limit 1 2>&1)
 check "日志包含以 - 开头的提交说明" "\\-fix: 支持短横线开头的提交说明" "$DASH_LOG"
 "$SVN_BIN/svn" up "$T/wc2" >/dev/null
 
+# 回归测试：工作副本存在超过 32 MB 差异的文件时，vcsctl diff 显式提示截断且不遗漏后续已修改文件
+python3 -c '
+with open("'"$T/wc2/a_huge.txt"'", "w") as f:
+    f.write(("A" * 1023 + "\n") * 33800)
+'
+"$VCSCTL" add "$T/wc2" a_huge.txt >/dev/null
+echo "后续文件修改不被大文件截断遗漏" >> "$T/wc2/docs/README.md"
+HUGE_DIFF=$("$VCSCTL" diff "$T/wc2" 2>&1 | grep -v '^+AAA')
+check "超 32 MB 工作副本差异显示截断提示" "\\[内容过大，已截断\\]" "$HUGE_DIFF"
+check "超 32 MB 工作副本差异不遗漏后续文件" "后续文件修改不被大文件截断遗漏" "$HUGE_DIFF"
+"$VCSCTL" revert "$T/wc2" a_huge.txt docs/README.md >/dev/null
+rm -f "$T/wc2/a_huge.txt"
+
 echo "==> 图形界面自检（与界面同一条模型路径）"
 if ! OUT=$("$GUI" --selftest "file://$T/repo" "$T/wc2" 2>&1); then
     printf '界面自检进程失败：%s\n' "$OUT" >&2

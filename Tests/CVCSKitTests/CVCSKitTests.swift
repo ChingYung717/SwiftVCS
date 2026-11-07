@@ -4,14 +4,16 @@ import CSVNKit
 
 @main
 struct CVCSKitTests {
-    static func main() {
+    static func main() async throws {
         testParseSingleFileUnifiedDiff()
         testParseMultiFileDiffDoesNotBleedHeadersIntoPreviousHunk()
         testWorkingCopyStatusPendingFlag()
         testKeychainScopeIncludesProtocolPortAndRepository()
         testMergeRevisionRange()
         testCompleteAndTruncatedText()
-        print("6 unit tests passed")
+        try await testSequentialReconnectCredentialIsolation()
+        try await testTruncatedWorkingCopyDiffPreservesSubsequentFiles()
+        print("8 unit tests passed")
     }
 
     private static func testCompleteAndTruncatedText() {
@@ -121,5 +123,189 @@ struct CVCSKitTests {
         expect((try? MergeRequest(source: source, revision: Int(Int32.max) + 1)) == nil)
         expect((try? MergeRequest(source: source, from: 7, to: 2)) == nil)
         expect((try? MergeRequest(source: source, from: 2, to: 7, peg: 0)) == nil)
+    }
+
+    private static func findSVNTool(_ name: String) -> String {
+        let candidates = [
+            "/opt/homebrew/opt/subversion/bin/\(name)",
+            "/usr/local/opt/subversion/bin/\(name)",
+            "/usr/bin/\(name)"
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        return name
+    }
+
+    private static func runProcess(_ executable: String, _ arguments: [String]) throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: executable)
+        p.arguments = arguments
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        try p.run()
+        p.waitUntilExit()
+        expect(p.terminationStatus == 0)
+    }
+
+    private static func testSequentialReconnectCredentialIsolation() async throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("swiftvcs-cred-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let svnadmin = findSVNTool("svnadmin")
+        let svnserve = findSVNTool("svnserve")
+        let repoA = tempRoot.appendingPathComponent("repoA")
+        let repoB = tempRoot.appendingPathComponent("repoB")
+        try runProcess(svnadmin, ["create", repoA.path])
+        try runProcess(svnadmin, ["create", repoB.path])
+
+        try """
+        [general]
+        anon-access = none
+        auth-access = write
+        password-db = passwd
+        authz-db = authz
+        realm = RepoA
+        """.write(to: repoA.appendingPathComponent("conf/svnserve.conf"), atomically: true, encoding: .utf8)
+        try """
+        [users]
+        alice = pwA
+        bob = pwB
+        """.write(to: repoA.appendingPathComponent("conf/passwd"), atomically: true, encoding: .utf8)
+        try """
+        [/]
+        alice = rw
+        """.write(to: repoA.appendingPathComponent("conf/authz"), atomically: true, encoding: .utf8)
+
+        try """
+        [general]
+        anon-access = none
+        auth-access = write
+        password-db = passwd
+        authz-db = authz
+        realm = RepoB
+        """.write(to: repoB.appendingPathComponent("conf/svnserve.conf"), atomically: true, encoding: .utf8)
+        try """
+        [users]
+        alice = pwA
+        bob = pwB
+        """.write(to: repoB.appendingPathComponent("conf/passwd"), atomically: true, encoding: .utf8)
+        try """
+        [/]
+        bob = rw
+        """.write(to: repoB.appendingPathComponent("conf/authz"), atomically: true, encoding: .utf8)
+
+        // Pick an ephemeral loopback port
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        expect(sock >= 0)
+        let bindRC = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        expect(bindRC == 0)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(sock, $0, &len)
+            }
+        }
+        let port = Int(UInt16(bigEndian: addr.sin_port))
+        close(sock)
+
+        let logFile = tempRoot.appendingPathComponent("svnserve.log")
+        let server = Process()
+        server.executableURL = URL(fileURLWithPath: svnserve)
+        server.arguments = [
+            "-d", "--foreground",
+            "--listen-host", "127.0.0.1",
+            "--listen-port", "\(port)",
+            "-r", tempRoot.path,
+            "--log-file", logFile.path
+        ]
+        server.standardOutput = Pipe()
+        server.standardError = Pipe()
+        try server.run()
+        defer {
+            server.terminate()
+            server.waitUntilExit()
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let urlA = require(URL(string: "svn://127.0.0.1:\(port)/repoA"))
+        let urlB = require(URL(string: "svn://127.0.0.1:\(port)/repoB"))
+        let configDir = tempRoot.appendingPathComponent("config")
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        let client = try SVNClient(
+            username: "alice",
+            password: "pwA",
+            configDir: configDir.path,
+            baseURL: urlA,
+            useSavedCredentials: false
+        )
+        // 1. Connect to Repo A using initial alice credentials
+        let infoA = try await client.connect(to: urlA, credentials: nil)
+        expect(infoA.youngestRevision == 0)
+
+        // 2. Explicitly connect to Repo B using bob credentials
+        let bobCreds = Credentials(.usernamePassword(user: "bob", password: "pwB"))
+        let infoB1 = try await client.connect(to: urlB, credentials: bobCreds)
+        expect(infoB1.youngestRevision == 0)
+
+        // 3. Reconnect to Repo B with credentials: nil -> must continue using bob, never alice
+        let infoB2 = try await client.connect(to: urlB, credentials: nil)
+        expect(infoB2.youngestRevision == 0)
+
+        // 4. Switching back to Repo A with credentials: nil must not leak bob (nor silently resurrect alice)
+        var repoARejectedWithoutCredentials = false
+        do {
+            _ = try await client.connect(to: urlA, credentials: nil)
+        } catch {
+            repoARejectedWithoutCredentials = true
+        }
+        expect(repoARejectedWithoutCredentials)
+    }
+
+    private static func testTruncatedWorkingCopyDiffPreservesSubsequentFiles() async throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("swiftvcs-diffcap-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let svnadmin = findSVNTool("svnadmin")
+        let repo = tempRoot.appendingPathComponent("repo")
+        let wc = tempRoot.appendingPathComponent("wc")
+        try runProcess(svnadmin, ["create", repo.path])
+
+        let client = try SVNClient(useSavedCredentials: false)
+        _ = try await client.connect(to: URL(fileURLWithPath: repo.path), credentials: nil)
+        _ = try await client.checkout(path: nil, to: wc, revision: nil)
+
+        let fileA = wc.appendingPathComponent("a.txt")
+        let fileZ = wc.appendingPathComponent("z.txt")
+        try "initial a\n".write(to: fileA, atomically: true, encoding: .utf8)
+        try "initial z\n".write(to: fileZ, atomically: true, encoding: .utf8)
+        _ = try await client.add(workingCopy: wc, paths: ["a.txt", "z.txt"])
+        _ = try await client.commit(workingCopy: wc, paths: [], message: "init", progress: nil)
+
+        let largeLines = (1...200).map { "line \($0) " + String(repeating: "x", count: 40) }.joined(separator: "\n") + "\n"
+        try largeLines.write(to: fileA, atomically: true, encoding: .utf8)
+        try "modified z line\n".write(to: fileZ, atomically: true, encoding: .utf8)
+
+        let diffs = try await client.diff(workingCopy: wc, paths: [], maxBytes: 512)
+        expect(diffs.count == 2)
+        expect(diffs[0].path == "a.txt")
+        expect(diffs[0].isTruncated)
+        expect(diffs[1].path == "z.txt")
+        expect(!diffs[1].isTruncated)
+        expect(diffs[1].addedCount == 1)
     }
 }

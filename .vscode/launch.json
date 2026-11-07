@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Debug vcsctl",
+            "target": "vcsctl",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vcsctl"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Release vcsctl",
+            "target": "vcsctl",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vcsctl"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Debug VCSExplorer",
+            "target": "VCSExplorer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug VCSExplorer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Release VCSExplorer",
+            "target": "VCSExplorer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release VCSExplorer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Debug SwiftVCSChecks",
+            "target": "SwiftVCSChecks",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SwiftVCSChecks"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftVCS}",
+            "name": "Release SwiftVCSChecks",
+            "target": "SwiftVCSChecks",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SwiftVCSChecks"
+        }
+    ]
+}

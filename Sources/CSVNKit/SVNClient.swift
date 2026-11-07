@@ -10,15 +10,19 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     // MARK: 存储
 
+    private struct ScopedCredentials {
+        var url: URL?
+        var username: String?
+        var password: String?
+    }
+
     private var handle: OpaquePointer?
     private let queue = DispatchQueue(label: "vcs.svn.backend", qos: .userInitiated)
     private let stateLock = NSLock()
-    private let username: String?
-    private let password: String?
     private let configDir: String?
     private let trustBundlePath: String?
     private let useSavedCredentials: Bool
-    private var credentialURL: URL?
+    private var scopedCredentials: ScopedCredentials
     private var rememberedConnection: (url: URL, username: String, password: String, realm: String)?
     private var _baseURL: URL?
     private var _rootURL: URL?
@@ -48,12 +52,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         baseURL: URL? = nil,
         useSavedCredentials: Bool = true
     ) throws {
-        self.username = username
-        self.password = password
         self.configDir = configDir
         self.trustBundlePath = trustBundlePath
         self.useSavedCredentials = useSavedCredentials
-        credentialURL = baseURL
+        self.scopedCredentials = ScopedCredentials(
+            url: baseURL.map(Self.trimTrailingSlash),
+            username: username,
+            password: password
+        )
         self.baseURL = baseURL
         handle = try createHandle(url: baseURL, credentials: nil).handle
     }
@@ -67,12 +73,19 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         if let url, url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
             throw VCSError.invalidArgument("请通过独立参数传递凭据")
         }
-        var user = username
-        var secret = password
+        var user = scopedCredentials.username
+        var secret = scopedCredentials.password
         var realm: String?
-        if let url, let credentialURL, Self.trimTrailingSlash(credentialURL) != Self.trimTrailingSlash(url) {
-            user = nil
-            secret = nil
+        if let url {
+            let normURL = Self.trimTrailingSlash(url)
+            if let credentialURL = scopedCredentials.url {
+                if Self.trimTrailingSlash(credentialURL) != normURL {
+                    user = nil
+                    secret = nil
+                }
+            } else {
+                scopedCredentials.url = normURL
+            }
         }
         switch credentials?.kind {
         case .usernamePassword(let suppliedUser, let suppliedPassword):
@@ -305,7 +318,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                let value = csvn_auth_realm(h), value.pointee != 0 {
                 self.rememberedConnection = (url, username, password, String(cString: value))
             }
-            self.credentialURL = url
+            self.scopedCredentials = ScopedCredentials(
+                url: Self.trimTrailingSlash(url),
+                username: candidate.user,
+                password: candidate.password
+            )
             connected = true
             return RepositoryInfo(
                 url: url,
@@ -625,9 +642,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         decodeDiffSections(rawData).text
     }
 
-    private static func decodeDiffSections(_ rawData: Data) -> (text: String, lossy: Bool) {
+    private static func decodeDiffSections(_ rawData: Data, isTruncated: Bool = false) -> (text: String, lossy: Bool) {
         if rawData.isEmpty { return ("", false) }
-        if let whole = decodeText(rawData) {
+        if let whole = decodeText(rawData, isTruncated: isTruncated) {
             return (whole, false)
         }
         let lineSlices = rawData.split(separator: 0x0A, omittingEmptySubsequences: false)
@@ -655,8 +672,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         flushSection()
 
         var lossy = false
-        let decodedSections = sectionsData.map { section in
-            if let decoded = decodeText(section) { return decoded }
+        let decodedSections = sectionsData.enumerated().map { idx, section in
+            let sectionTruncated = isTruncated && idx == sectionsData.count - 1
+            if let decoded = decodeText(section, isTruncated: sectionTruncated) { return decoded }
             lossy = true
             return String(decoding: section, as: UTF8.self)
         }
@@ -706,38 +724,99 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     public func diff(workingCopy: URL, paths: [String]) async throws -> [FileDiff] {
-        try await perform {
+        try await diff(workingCopy: workingCopy, paths: paths, maxBytes: 32 * 1024 * 1024)
+    }
+
+    public func diff(workingCopy: URL, paths: [String], maxBytes: Int) async throws -> [FileDiff] {
+        guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
+        return try await perform {
             let h = try self.requireHandle()
             let wcPath = try self.writeRoot(workingCopy)
             let targets = paths.isEmpty ? [wcPath] : try paths.map {
                 try self.writePath($0, root: wcPath, originalRoot: workingCopy.standardizedFileURL.path)
             }
 
-            var out: [FileDiff] = []
-            for t in targets {
+            func diffSinglePath(_ path: String) throws -> (diffs: [FileDiff], truncated: Bool) {
                 var text: UnsafeMutablePointer<CChar>? = nil
                 var len: Int = 0
-                let rc = t.withCString { p in
-                    csvn_diff(h, p, &text, &len)
+                var truncatedFlag: Int32 = 0
+                let rc = path.withCString { p in
+                    csvn_diff_capped(h, p, maxBytes, &text, &len, &truncatedFlag)
                 }
                 try self.check(rc)
                 defer { if let text { csvn_free_string(text) } }
-                guard let text, len > 0 else { continue }
+                let isTrunc = truncatedFlag != 0
+                let relPath = path == wcPath ? "." : (path.hasPrefix(wcPath + "/") ? String(path.dropFirst(wcPath.count + 1)) : path)
+                guard let text, len > 0 else {
+                    if isTrunc {
+                        return ([FileDiff(id: relPath, path: relPath, localPath: URL(fileURLWithPath: path),
+                                          isBinary: Self.isKnownBinaryPath(path), hunks: [], isTruncated: true)], true)
+                    }
+                    return ([], false)
+                }
                 let data = Data(bytes: text, count: len)
-                let (raw, lossy) = Self.decodeDiffSections(data)
-                if raw.isEmpty { continue }
-
-                let parsed = Self.parseMultiFileDiff(raw, workingCopyPath: wcPath, fallbackTarget: t)
-                out.append(contentsOf: parsed.map { diff in
+                let (raw, lossy) = Self.decodeDiffSections(data, isTruncated: isTrunc)
+                var parsed = raw.isEmpty ? [] : Self.parseMultiFileDiff(raw, workingCopyPath: wcPath, fallbackTarget: path)
+                parsed = parsed.map { diff in
                     guard lossy, !diff.isBinary else { return diff }
                     return FileDiff(id: diff.id, path: diff.path, localPath: diff.localPath,
                                     isBinary: diff.isBinary, hunks: diff.hunks,
                                     isTruncated: diff.isTruncated, statusNotice: "部分差异无法完整解码")
-                })
+                }
+                if isTrunc {
+                    if !parsed.isEmpty {
+                        let lastIdx = parsed.count - 1
+                        let last = parsed[lastIdx]
+                        parsed[lastIdx] = FileDiff(id: last.id, path: last.path, localPath: last.localPath,
+                                                   isBinary: last.isBinary, hunks: last.hunks,
+                                                   isTruncated: true, statusNotice: last.statusNotice,
+                                                   propertyChanges: last.propertyChanges)
+                    } else {
+                        parsed = [FileDiff(id: relPath, path: relPath, localPath: URL(fileURLWithPath: path),
+                                           isBinary: Self.isKnownBinaryPath(path), hunks: [],
+                                           isTruncated: true, statusNotice: lossy ? "部分差异无法完整解码" : nil)]
+                    }
+                }
+                return (parsed, isTrunc)
+            }
+
+            var out: [FileDiff] = []
+            var statusesByTarget: [(target: String, statuses: [WorkingCopyStatus])] = []
+            for t in targets {
+                let pending = try self.readStatus(t).filter { $0.kind.isPendingChange }
+                statusesByTarget.append((target: t, statuses: pending))
+                let pendingFiles = pending
+                    .filter { !$0.isDirectory && $0.kind != .missing && $0.kind != .obstructed }
+                    .map { $0.path == "." ? t : t + "/" + $0.path }
+                    .sorted()
+
+                let hasOversizedFile = maxBytes > 0 && pendingFiles.count > 1 && pendingFiles.contains { filePath in
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
+                          let sz = (attrs[.size] as? NSNumber)?.intValue ?? (attrs[.size] as? Int) else { return false }
+                    return sz > maxBytes
+                }
+
+                if hasOversizedFile {
+                    for filePath in pendingFiles {
+                        let (fileDiffs, _) = try diffSinglePath(filePath)
+                        out.append(contentsOf: fileDiffs)
+                    }
+                } else {
+                    let (targetDiffs, isTrunc) = try diffSinglePath(t)
+                    if isTrunc && pendingFiles.count > 1 {
+                        for filePath in pendingFiles {
+                            let (fileDiffs, _) = try diffSinglePath(filePath)
+                            out.append(contentsOf: fileDiffs)
+                        }
+                    } else {
+                        out.append(contentsOf: targetDiffs)
+                    }
+                }
             }
             var seen: Set<String> = []
-            for target in targets {
-                for status in try self.readStatus(target) where status.kind.isPendingChange {
+            for entry in statusesByTarget {
+                let target = entry.target
+                for status in entry.statuses {
                     let path = status.path == "." ? target : target + "/" + status.path
                     guard seen.insert(path).inserted else { continue }
                     let relative = path == wcPath ? "." : String(path.dropFirst(wcPath.count + 1))
