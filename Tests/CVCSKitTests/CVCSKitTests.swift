@@ -1333,16 +1333,119 @@ struct CVCSKitTests {
         try await Task.sleep(nanoseconds: 50_000_000)
         try "200".write(to: case2Release, atomically: true, encoding: .utf8)
 
-        var a2Cancelled = false
-        do {
-            _ = try await taskA2.value
-        } catch is CancellationError {
-            a2Cancelled = true
-        }
+        let a2Cancelled: Bool = await {
+            do {
+                _ = try await taskA2.value
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                return false
+            }
+        }()
         expect(a2Cancelled)
+        expect(client.repositoryRoot == case1URL)
 
         let b2Diffs = try await taskB2.value
         expect(b2Diffs.count == 1 && b2Diffs.first?.path == "z_tail.txt")
+
+        // Case 3: Multiple queued operations (B, C, D) behind in-flight A; cancel D and B in reverse order while C and subsequent E succeed
+        let case3URL = require(URL(string: "http://127.0.0.1:\(cancelPort)/case3"))
+        let case3Arrived = cancelStateDir.appendingPathComponent("case3.arrived")
+        let case3Release = cancelStateDir.appendingPathComponent("case3.release")
+        let taskA3 = Task {
+            try await client.connect(to: case3URL, credentials: nil)
+        }
+        var a3InFlight = false
+        for _ in 0..<50 {
+            if fm.fileExists(atPath: case3Arrived.path) {
+                a3InFlight = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        expect(a3InFlight)
+
+        let taskB3 = Task { try await client.diff(workingCopy: wc, paths: ["dir1", "dir2"]) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let taskC3 = Task { try await client.diff(workingCopy: wc, paths: ["z_tail.txt"]) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let taskD3 = Task { try await client.status(of: wc) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        taskD3.cancel()
+        taskB3.cancel()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        try "200".write(to: case3Release, atomically: true, encoding: .utf8)
+
+        var b3Cancelled = false
+        do { _ = try await taskB3.value } catch is CancellationError { b3Cancelled = true }
+        expect(b3Cancelled)
+
+        var d3Cancelled = false
+        do { _ = try await taskD3.value } catch is CancellationError { d3Cancelled = true }
+        expect(d3Cancelled)
+
+        let a3Info = try await taskA3.value
+        expect(a3Info.youngestRevision == 7)
+        let c3Diffs = try await taskC3.value
+        expect(c3Diffs.count == 1 && c3Diffs.first?.path == "z_tail.txt")
+        let e3Status = try await client.status(of: wc)
+        expect(e3Status.contains { $0.path == "z_tail.txt" })
+
+        // Case 4: Cross-instance performWrite cancelled while waiting on workingCopyWriteLock must not mutate working copy
+        let case4URL = require(URL(string: "http://127.0.0.1:\(cancelPort)/case4"))
+        let case4Arrived = cancelStateDir.appendingPathComponent("case4.arrived")
+        let case4Release = cancelStateDir.appendingPathComponent("case4.release")
+        let writer1 = try SVNClient(baseURL: case4URL, useSavedCredentials: false)
+        let writer2 = try SVNClient(useSavedCredentials: false)
+        let dummyDest = tempRoot.appendingPathComponent("wc-checkout-lock")
+        let taskW1 = Task {
+            try await writer1.checkout(path: nil, to: dummyDest, revision: nil)
+        }
+        var w1InFlight = false
+        for _ in 0..<50 {
+            if fm.fileExists(atPath: case4Arrived.path) {
+                w1InFlight = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        expect(w1InFlight)
+
+        let taskW2 = Task {
+            try await writer2.setProperty("user:cancelled-prop", value: Data("should-not-write".utf8), workingCopy: wc, path: "z_tail.txt")
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        taskW2.cancel()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        try "403".write(to: case4Release, atomically: true, encoding: .utf8)
+
+        _ = try? await taskW1.value
+        var w2Cancelled = false
+        do {
+            try await taskW2.value
+        } catch is CancellationError {
+            w2Cancelled = true
+        }
+        expect(w2Cancelled)
+        let propAfterCancel = try await client.property("user:cancelled-prop", at: .workingCopy(root: wc, path: "z_tail.txt"))
+        expect(propAfterCancel == nil)
+
+        // Case 5: disconnect() called from an already-cancelled Task must still clean up handle and rootURL
+        let disconnectTask = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await writer1.disconnect()
+        }
+        await disconnectTask.value
+        expect(writer1.repositoryRoot == nil)
+        var disconnectedBrowseFailed = false
+        do {
+            _ = try await writer1.browse(path: nil)
+        } catch {
+            disconnectedBrowseFailed = true
+        }
+        expect(disconnectedBrowseFailed)
 
         // Restore connection to local file:// repository for subsequent checks
         _ = try await client.connect(to: URL(fileURLWithPath: repo.path), credentials: nil)

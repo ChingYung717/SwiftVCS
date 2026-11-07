@@ -148,6 +148,15 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
     }
 
+    private func checkActiveCancellation() throws {
+        let cancelled = stateLock.withLock {
+            activeOperation?.isCancelled == true || (_handle.map { csvn_is_cancelled($0) != 0 } ?? false)
+        }
+        if cancelled {
+            throw CancellationError()
+        }
+    }
+
     private func createHandle(url: URL?, credentials: Credentials?) throws
         -> (handle: OpaquePointer, user: String?, password: String?, realm: String?) {
         if let url, url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
@@ -251,7 +260,12 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     private static let workingCopyWriteLock = NSLock()
 
     private func performWrite<T>(_ body: @escaping () throws -> T) async throws -> T {
-        try await perform { try Self.workingCopyWriteLock.withLock(body) }
+        try await perform {
+            try Self.workingCopyWriteLock.withLock {
+                try self.checkActiveCancellation()
+                return try body()
+            }
+        }
     }
 
     /// 把 shim 的返回码翻译成统一的 VCSError。
@@ -400,13 +414,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     csvn_context_destroy(h)
                 }
             }
+            try self.checkActiveCancellation()
             var uuid = [CChar](repeating: 0, count: 256)
             var rev: Int32 = 0
             let rc = url.absoluteString.withCString { u in
                 csvn_connect(h, u, &uuid, Int32(uuid.count), &rev)
             }
             try self.check(rc)
-            self.baseURL = Self.trimTrailingSlash(url)
 
             var rootBuf = [CChar](repeating: 0, count: 2048)
             let rootRC = url.absoluteString.withCString { u in
@@ -415,16 +429,21 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             if rootRC == -7 {
                 try self.check(rootRC)
             }
+            try self.checkActiveCancellation()
+
+            let resolvedRootURL: URL?
             if rootRC == 0 {
                 let rootStr = String(cString: rootBuf)
                 if !rootStr.isEmpty, let resolved = URL(string: rootStr) {
-                    self.rootURL = Self.trimTrailingSlash(resolved)
+                    resolvedRootURL = Self.trimTrailingSlash(resolved)
                 } else {
-                    self.rootURL = nil
+                    resolvedRootURL = nil
                 }
             } else {
-                self.rootURL = nil
+                resolvedRootURL = nil
             }
+            self.baseURL = Self.trimTrailingSlash(url)
+            self.rootURL = resolvedRootURL
 
             let authRealm: String? = {
                 guard let value = csvn_auth_realm(h), value.pointee != 0 else { return nil }
@@ -447,19 +466,22 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 uuid: String(cString: uuid).isEmpty ? nil : String(cString: uuid),
                 revision: Int(rev),
                 youngestRevision: Int(rev),
-                rootURL: self.rootURL ?? Self.trimTrailingSlash(url)
+                rootURL: resolvedRootURL ?? Self.trimTrailingSlash(url)
             )
         }
     }
 
     public func disconnect() async {
-        try? await perform {
-            if let handle = self.swapActiveHandle(nil) {
-                csvn_context_destroy(handle)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async {
+                if let handle = self.swapActiveHandle(nil) {
+                    csvn_context_destroy(handle)
+                }
+                self.rememberedConnection = nil
+                self.baseURL = nil
+                self.rootURL = nil
+                cont.resume()
             }
-            self.rememberedConnection = nil
-            self.baseURL = nil
-            self.rootURL = nil
         }
     }
 
@@ -922,6 +944,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             var budgetExhausted = false
 
             for group in diffGroups {
+                try self.checkActiveCancellation()
                 if remainingTotalBytes <= 0 || remainingSections <= 0 {
                     budgetExhausted = true
                     break
@@ -1069,6 +1092,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
             var seen: Set<String> = []
             for status in wcStatuses where status.kind.isPendingChange {
+                try self.checkActiveCancellation()
                 let path = status.path == "." ? cleanWC : cleanWC + "/" + status.path
                 let matchesTarget = targets.contains { t in
                     t == cleanWC || path == t || path.hasPrefix(t + "/")

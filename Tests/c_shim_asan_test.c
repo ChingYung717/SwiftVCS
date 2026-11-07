@@ -117,7 +117,17 @@ static void test_connect_and_output_pointer_contracts(const char *repo_url, cons
     int total_trunc = 0;
     assert(csvn_diff_sections_ex(ctx, wc_path, wc_path, 4096, 65536, 16, &sections, &sec_count, &total_trunc) == -7);
     assert(sections == NULL && sec_count == 0);
+    char root_buf[512];
+    assert(csvn_get_repos_root(ctx, repo_url, root_buf, (int)sizeof(root_buf)) == -7);
+    csvn_property *props = NULL;
+    int prop_count = 0;
+    assert(csvn_wc_property_snapshot(ctx, wc_path, 0, 0, &props, &prop_count) == -7);
+    assert(csvn_set_property(ctx, wc_path, ".", "user:test", "v", 1, 0) == -7);
+    char **mkdir_out = NULL;
+    int mkdir_count = 0;
+    assert(csvn_mkdir_working(ctx, wc_path, "cancelled_dir", 0, 1, -1, &mkdir_out, &mkdir_count) == -7);
     csvn_clear_cancel(ctx);
+    assert(csvn_get_repos_root(ctx, repo_url, root_buf, (int)sizeof(root_buf)) == 0);
     assert(csvn_diff_sections_ex(ctx, wc_path, wc_path, 4096, 65536, 16, &sections, &sec_count, &total_trunc) == 0);
     csvn_free_diff_sections(sections, sec_count);
 
