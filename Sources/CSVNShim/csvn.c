@@ -1161,6 +1161,328 @@ int csvn_diff(csvn_ctx *ctx,
     return rc;
 }
 
+typedef struct {
+    csvn_diff_section *sections;
+    size_t *caps;
+    int count;
+    int cap;
+    size_t max_bytes;
+    const char *fallback_path;
+    int state; /* 0: 行首匹配 "Index: ", 1: 读取 Index: 行路径直到 '\n', 2: 普通内容行直到 '\n' */
+    int line_count;
+    char prefix_buf[7];
+    size_t prefix_len;
+    char *index_buf;
+    size_t index_len;
+    size_t index_cap;
+} diff_stream_baton;
+
+void csvn_free_diff_sections(csvn_diff_section *sections, int count)
+{
+    int i;
+    if (!sections) return;
+    for (i = 0; i < count; i++) {
+        free(sections[i].path);
+        free(sections[i].text);
+    }
+    free(sections);
+}
+
+static svn_error_t *diff_start_section(diff_stream_baton *db, const char *path, size_t path_len)
+{
+    csvn_diff_section *sec;
+    if (db->count == db->cap) {
+        int ncap = db->cap ? db->cap * 2 : 16;
+        csvn_diff_section *nsecs = (csvn_diff_section *)realloc(
+            db->sections, sizeof(csvn_diff_section) * (size_t)ncap
+        );
+        if (!nsecs) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        db->sections = nsecs;
+        size_t *ncaps = (size_t *)realloc(db->caps, sizeof(size_t) * (size_t)ncap);
+        if (!ncaps) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        db->caps = ncaps;
+        db->cap = ncap;
+    }
+    sec = &db->sections[db->count];
+    memset(sec, 0, sizeof(*sec));
+    db->caps[db->count] = 0;
+    sec->path = (char *)malloc(path_len + 1);
+    if (!sec->path) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+    if (path_len > 0) memcpy(sec->path, path, path_len);
+    sec->path[path_len] = '\0';
+    db->count++;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *diff_append_bytes(diff_stream_baton *db, const char *bytes, size_t len)
+{
+    int idx, k;
+    csvn_diff_section *sec;
+    size_t allowed = len;
+    size_t needed;
+    size_t prior_len = 0;
+
+    if (len == 0) return SVN_NO_ERROR;
+    if (db->count == 0) {
+        const char *fb = db->fallback_path ? db->fallback_path : "";
+        SVN_ERR(diff_start_section(db, fb, strlen(fb)));
+        db->line_count = 1;
+    }
+    idx = db->count - 1;
+    sec = &db->sections[idx];
+
+    if (db->max_bytes > 0) {
+        for (k = 0; k < idx; k++) {
+            if (db->sections[k].path && sec->path && strcmp(db->sections[k].path, sec->path) == 0) {
+                prior_len += (size_t)db->sections[k].length;
+            }
+        }
+        size_t used = prior_len + (size_t)sec->length;
+        if (used >= db->max_bytes) {
+            sec->truncated = 1;
+            return SVN_NO_ERROR;
+        }
+        if (used + len > db->max_bytes) {
+            allowed = db->max_bytes - used;
+            sec->truncated = 1;
+        }
+    }
+    if (allowed == 0) return SVN_NO_ERROR;
+
+    needed = (size_t)sec->length + allowed + 1;
+    if (needed > db->caps[idx]) {
+        size_t ncap = db->caps[idx] ? db->caps[idx] * 2 : 1024;
+        while (ncap < needed) {
+            if (ncap > ((size_t)-1) / 2) {
+                ncap = needed;
+                break;
+            }
+            ncap *= 2;
+        }
+        if (db->max_bytes > 0 && ncap > db->max_bytes + 1) {
+            ncap = db->max_bytes + 1;
+        }
+        char *ntext = (char *)realloc(sec->text, ncap);
+        if (!ntext) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        sec->text = ntext;
+        db->caps[idx] = ncap;
+    }
+    memcpy(sec->text + sec->length, bytes, allowed);
+    sec->length += (long)allowed;
+    sec->text[sec->length] = '\0';
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *diff_append_index_buf(diff_stream_baton *db, const char *bytes, size_t len)
+{
+    size_t needed;
+    if (len == 0) return SVN_NO_ERROR;
+    needed = db->index_len + len + 1;
+    if (needed > db->index_cap) {
+        size_t ncap = db->index_cap ? db->index_cap * 2 : 256;
+        while (ncap < needed) {
+            if (ncap > ((size_t)-1) / 2) {
+                ncap = needed;
+                break;
+            }
+            ncap *= 2;
+        }
+        char *nbuf = (char *)realloc(db->index_buf, ncap);
+        if (!nbuf) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
+        db->index_buf = nbuf;
+        db->index_cap = ncap;
+    }
+    memcpy(db->index_buf + db->index_len, bytes, len);
+    db->index_len += len;
+    db->index_buf[db->index_len] = '\0';
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *diff_finish_index_line(diff_stream_baton *db, int has_newline)
+{
+    size_t path_len = db->index_len;
+    if (db->count > 0 && db->line_count <= 2) {
+        db->sections[db->count - 1].truncated = 0;
+    }
+    while (path_len > 0 && db->index_buf[path_len - 1] == '\r') {
+        path_len--;
+    }
+    SVN_ERR(diff_start_section(db, db->index_buf ? db->index_buf : "", path_len));
+    db->line_count = 1;
+    SVN_ERR(diff_append_bytes(db, "Index: ", 7));
+    if (db->index_len > 0) {
+        SVN_ERR(diff_append_bytes(db, db->index_buf, db->index_len));
+    }
+    if (has_newline) {
+        SVN_ERR(diff_append_bytes(db, "\n", 1));
+    }
+    db->index_len = 0;
+    db->state = 0;
+    db->prefix_len = 0;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *diff_stream_write(void *baton, const char *data, apr_size_t *len)
+{
+    static const char index_prefix[7] = "Index: ";
+    diff_stream_baton *db = (diff_stream_baton *)baton;
+    const char *p = data;
+    size_t rem = *len;
+
+    while (rem > 0) {
+        if (db->state == 0) {
+            char c = *p;
+            if (c == index_prefix[db->prefix_len]) {
+                db->prefix_buf[db->prefix_len++] = c;
+                p++;
+                rem--;
+                if (db->prefix_len == 7) {
+                    db->state = 1;
+                    db->index_len = 0;
+                }
+            } else {
+                db->line_count++;
+                if (db->prefix_len > 0) {
+                    SVN_ERR(diff_append_bytes(db, db->prefix_buf, db->prefix_len));
+                    db->prefix_len = 0;
+                }
+                if (c == '\n') {
+                    SVN_ERR(diff_append_bytes(db, p, 1));
+                    p++;
+                    rem--;
+                } else {
+                    db->state = 2;
+                }
+            }
+        } else if (db->state == 1) {
+            const char *nl = (const char *)memchr(p, '\n', rem);
+            size_t take = nl ? (size_t)(nl - p) : rem;
+            SVN_ERR(diff_append_index_buf(db, p, take));
+            p += take;
+            rem -= take;
+            if (nl) {
+                p++;
+                rem--;
+                SVN_ERR(diff_finish_index_line(db, 1));
+            }
+        } else {
+            const char *nl = (const char *)memchr(p, '\n', rem);
+            if (nl) {
+                size_t chunk = (size_t)(nl - p) + 1;
+                SVN_ERR(diff_append_bytes(db, p, chunk));
+                p += chunk;
+                rem -= chunk;
+                db->state = 0;
+                db->prefix_len = 0;
+            } else {
+                SVN_ERR(diff_append_bytes(db, p, rem));
+                p += rem;
+                rem = 0;
+            }
+        }
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *diff_stream_close(void *baton)
+{
+    diff_stream_baton *db = (diff_stream_baton *)baton;
+    if (db->state == 0 && db->prefix_len > 0) {
+        db->line_count++;
+        SVN_ERR(diff_append_bytes(db, db->prefix_buf, db->prefix_len));
+        db->prefix_len = 0;
+    } else if (db->state == 1) {
+        SVN_ERR(diff_finish_index_line(db, 0));
+    }
+    if (db->count > 0 && db->line_count <= 2) {
+        db->sections[db->count - 1].truncated = 0;
+    }
+    return SVN_NO_ERROR;
+}
+
+int csvn_diff_sections(csvn_ctx *ctx,
+                       const char *path,
+                       const char *relative_to_dir,
+                       long max_bytes,
+                       csvn_diff_section **out_sections,
+                       int *out_count)
+{
+    svn_error_t *err;
+    apr_pool_t *scratch;
+    const char *canon_path;
+    const char *canon_rel = NULL;
+    svn_opt_revision_t rev1, rev2;
+    svn_stream_t *outstream = NULL;
+    svn_stream_t *errstream = NULL;
+    diff_stream_baton db;
+
+    if (!ctx || !path || !out_sections || !out_count || max_bytes < 0) return -100;
+    *out_sections = NULL;
+    *out_count = 0;
+
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+
+    scratch = svn_pool_create(ctx->pool);
+    canon_path = csvn_canon_dirent(path, scratch);
+    if (relative_to_dir && *relative_to_dir) {
+        const char *cand = csvn_canon_dirent(relative_to_dir, scratch);
+        if (svn_dirent_is_ancestor(cand, canon_path)) {
+            canon_rel = cand;
+        }
+    }
+
+    rev1 = csvn_rev_kind(svn_opt_revision_base);
+    rev2 = csvn_rev_kind(svn_opt_revision_working);
+
+    memset(&db, 0, sizeof(db));
+    db.max_bytes = (size_t)max_bytes;
+    db.fallback_path = canon_path;
+
+    outstream = svn_stream_create(&db, scratch);
+    svn_stream_set_write(outstream, diff_stream_write);
+    svn_stream_set_close(outstream, diff_stream_close);
+    errstream = svn_stream_empty(scratch);
+
+    err = svn_client_diff7(NULL,
+                           canon_path, &rev1,
+                           canon_path, &rev2,
+                           canon_rel,
+                           svn_depth_infinity,
+                           FALSE /* ignore_ancestry */,
+                           FALSE /* no_diff_added */,
+                           FALSE /* no_diff_deleted */,
+                           TRUE  /* show_copies_as_adds */,
+                           FALSE /* ignore_content_type */,
+                           TRUE  /* ignore_properties */,
+                           FALSE /* properties_only */,
+                           FALSE /* use_git_diff_format */,
+                           FALSE /* pretty_print_mergeinfo */,
+                           "UTF-8",
+                           outstream, errstream,
+                           NULL,
+                           ctx->client,
+                           scratch);
+    if (!err) err = svn_stream_close(outstream);
+
+    free(db.caps);
+    free(db.index_buf);
+
+    if (err) {
+        int rc = csvn_classify(ctx, err);
+        csvn_free_diff_sections(db.sections, db.count);
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
+
+    *out_sections = db.sections;
+    *out_count = db.count;
+    svn_pool_destroy(scratch);
+    apr_thread_mutex_unlock(ctx->mutex);
+    return 0;
+}
+
 int csvn_diff_revision(csvn_ctx *ctx,
                        const char *file_url,
                        int revision,
@@ -2577,14 +2899,17 @@ int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int
         if (!err) err = svn_wc_crawl_revisions6(ctx->client->wc_ctx, path, &reporter, &base,
                                                FALSE, svn_depth_empty, TRUE, FALSE, FALSE,
                                                NULL, NULL, NULL, NULL, pool);
-        if (!err && (!base.url || !SVN_IS_VALID_REVNUM(base.revision)))
-            err = invalid_wc("无法确定替换前的节点及修订号");
-        svn_opt_revision_t rev = csvn_rev_number(base.revision);
-        apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
-        if (!err) err = svn_client_proplist4(base.url, &rev, &rev, svn_depth_empty, NULL, FALSE,
-                                             receive_properties, rows, ctx->client, pool);
-        if (!err) err = export_properties(output, count, rows);
-        return finish_wc_operation(ctx, err, pool);
+        if (!err && base.url && SVN_IS_VALID_REVNUM(base.revision)) {
+            svn_opt_revision_t rev = csvn_rev_number(base.revision);
+            apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
+            err = svn_client_proplist4(base.url, &rev, &rev, svn_depth_empty, NULL, FALSE,
+                                       receive_properties, rows, ctx->client, pool);
+            if (!err) {
+                err = export_properties(output, count, rows);
+                return finish_wc_operation(ctx, err, pool);
+            }
+        }
+        svn_error_clear(err);
     }
     apr_hash_t *properties = NULL;
     svn_node_kind_t kind;

@@ -14,6 +14,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         var url: URL?
         var username: String?
         var password: String?
+        var realm: String?
     }
 
     private var handle: OpaquePointer?
@@ -58,10 +59,18 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         self.scopedCredentials = ScopedCredentials(
             url: baseURL.map(Self.trimTrailingSlash),
             username: username,
-            password: password
+            password: password,
+            realm: nil
         )
         self.baseURL = baseURL
-        handle = try createHandle(url: baseURL, credentials: nil).handle
+        let initial = try createHandle(url: baseURL, credentials: nil)
+        self.scopedCredentials = ScopedCredentials(
+            url: baseURL.map(Self.trimTrailingSlash),
+            username: initial.user,
+            password: initial.password,
+            realm: initial.realm
+        )
+        handle = initial.handle
     }
 
     deinit {
@@ -69,28 +78,25 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     private func createHandle(url: URL?, credentials: Credentials?) throws
-        -> (handle: OpaquePointer, user: String?, password: String?) {
+        -> (handle: OpaquePointer, user: String?, password: String?, realm: String?) {
         if let url, url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
             throw VCSError.invalidArgument("请通过独立参数传递凭据")
         }
         var user = scopedCredentials.username
         var secret = scopedCredentials.password
-        var realm: String?
-        if let url {
-            let normURL = Self.trimTrailingSlash(url)
-            if let credentialURL = scopedCredentials.url {
-                if Self.trimTrailingSlash(credentialURL) != normURL {
-                    user = nil
-                    secret = nil
-                }
-            } else {
-                scopedCredentials.url = normURL
+        var realm = scopedCredentials.realm
+        if let url, let credentialURL = scopedCredentials.url {
+            if Self.trimTrailingSlash(credentialURL) != Self.trimTrailingSlash(url) {
+                user = nil
+                secret = nil
+                realm = nil
             }
         }
         switch credentials?.kind {
         case .usernamePassword(let suppliedUser, let suppliedPassword):
             user = suppliedUser
             secret = suppliedPassword
+            realm = nil
         case .keychain(let service, let account):
             guard let url, let saved = try KeychainStore.loadReference(service: service, username: account, url: url) else {
                 throw VCSError.authenticationFailed("该仓库没有对应的钥匙串凭据")
@@ -118,7 +124,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                                           &errbuf, Int32(errbuf.count)) else {
             throw VCSError.underlying("无法初始化 SVN 上下文：\(String(cString: errbuf))")
         }
-        return (h, user, secret)
+        return (h, user, secret, realm)
     }
 
     /// 仅保存已成功连接且实际完成口令认证的 HTTPS 凭据。
@@ -313,15 +319,20 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 self.rootURL = nil
             }
 
+            let authRealm: String? = {
+                guard let value = csvn_auth_realm(h), value.pointee != 0 else { return nil }
+                return String(cString: value)
+            }()
             if KeychainStore.service(for: url) != nil,
                let username = candidate.user, let password = candidate.password,
-               let value = csvn_auth_realm(h), value.pointee != 0 {
-                self.rememberedConnection = (url, username, password, String(cString: value))
+               let authRealm {
+                self.rememberedConnection = (url, username, password, authRealm)
             }
             self.scopedCredentials = ScopedCredentials(
                 url: Self.trimTrailingSlash(url),
                 username: candidate.user,
-                password: candidate.password
+                password: candidate.password,
+                realm: candidate.realm ?? authRealm
             )
             connected = true
             return RepositoryInfo(
@@ -732,108 +743,155 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return try await perform {
             let h = try self.requireHandle()
             let wcPath = try self.writeRoot(workingCopy)
-            let targets = paths.isEmpty ? [wcPath] : try paths.map {
-                try self.writePath($0, root: wcPath, originalRoot: workingCopy.standardizedFileURL.path)
+            let cleanWC = wcPath.hasSuffix("/") ? String(wcPath.dropLast()) : wcPath
+            let targets = paths.isEmpty ? [cleanWC] : try paths.map {
+                try self.writePath($0, root: cleanWC, originalRoot: workingCopy.standardizedFileURL.path)
             }
 
-            func diffSinglePath(_ path: String) throws -> (diffs: [FileDiff], truncated: Bool) {
-                var text: UnsafeMutablePointer<CChar>? = nil
-                var len: Int = 0
-                var truncatedFlag: Int32 = 0
-                let rc = path.withCString { p in
-                    csvn_diff_capped(h, p, maxBytes, &text, &len, &truncatedFlag)
+            let wcStatuses = try self.readStatus(cleanWC)
+            let structuralDirs: [String] = wcStatuses
+                .filter { $0.isDirectory && ($0.kind == .added || $0.kind == .replaced || $0.kind == .deleted) }
+                .map { $0.path == "." ? cleanWC : cleanWC + "/" + $0.path }
+                .sorted { $0.count < $1.count }
+
+            func effectiveDiffRoot(for target: String) -> String {
+                guard target != cleanWC else { return cleanWC }
+                if let ancestor = structuralDirs.first(where: { target.hasPrefix($0 + "/") }) {
+                    return ancestor
                 }
-                try self.check(rc)
-                defer { if let text { csvn_free_string(text) } }
-                let isTrunc = truncatedFlag != 0
-                let relPath = path == wcPath ? "." : (path.hasPrefix(wcPath + "/") ? String(path.dropFirst(wcPath.count + 1)) : path)
-                guard let text, len > 0 else {
-                    if isTrunc {
-                        return ([FileDiff(id: relPath, path: relPath, localPath: URL(fileURLWithPath: path),
-                                          isBinary: Self.isKnownBinaryPath(path), hunks: [], isTruncated: true)], true)
+                return target
+            }
+
+            var diffGroups: [(root: String, filters: [String])] = []
+            for t in targets {
+                let root = effectiveDiffRoot(for: t)
+                if let idx = diffGroups.firstIndex(where: { root == $0.root || root.hasPrefix($0.root + "/") }) {
+                    if !diffGroups[idx].filters.contains(t) {
+                        diffGroups[idx].filters.append(t)
                     }
-                    return ([], false)
-                }
-                let data = Data(bytes: text, count: len)
-                let (raw, lossy) = Self.decodeDiffSections(data, isTruncated: isTrunc)
-                var parsed = raw.isEmpty ? [] : Self.parseMultiFileDiff(raw, workingCopyPath: wcPath, fallbackTarget: path)
-                parsed = parsed.map { diff in
-                    guard lossy, !diff.isBinary else { return diff }
-                    return FileDiff(id: diff.id, path: diff.path, localPath: diff.localPath,
-                                    isBinary: diff.isBinary, hunks: diff.hunks,
-                                    isTruncated: diff.isTruncated, statusNotice: "部分差异无法完整解码")
-                }
-                if isTrunc {
-                    if !parsed.isEmpty {
-                        let lastIdx = parsed.count - 1
-                        let last = parsed[lastIdx]
-                        parsed[lastIdx] = FileDiff(id: last.id, path: last.path, localPath: last.localPath,
-                                                   isBinary: last.isBinary, hunks: last.hunks,
-                                                   isTruncated: true, statusNotice: last.statusNotice,
-                                                   propertyChanges: last.propertyChanges)
-                    } else {
-                        parsed = [FileDiff(id: relPath, path: relPath, localPath: URL(fileURLWithPath: path),
-                                           isBinary: Self.isKnownBinaryPath(path), hunks: [],
-                                           isTruncated: true, statusNotice: lossy ? "部分差异无法完整解码" : nil)]
+                } else {
+                    var mergedFilters: [String] = []
+                    var remainingGroups: [(root: String, filters: [String])] = []
+                    for existing in diffGroups {
+                        if existing.root == root || existing.root.hasPrefix(root + "/") {
+                            for f in existing.filters where !mergedFilters.contains(f) {
+                                mergedFilters.append(f)
+                            }
+                        } else {
+                            remainingGroups.append(existing)
+                        }
                     }
+                    if !mergedFilters.contains(t) {
+                        mergedFilters.append(t)
+                    }
+                    remainingGroups.append((root: root, filters: mergedFilters))
+                    diffGroups = remainingGroups
                 }
-                return (parsed, isTrunc)
             }
 
             var out: [FileDiff] = []
-            var statusesByTarget: [(target: String, statuses: [WorkingCopyStatus])] = []
-            for t in targets {
-                let pending = try self.readStatus(t).filter { $0.kind.isPendingChange }
-                statusesByTarget.append((target: t, statuses: pending))
-                let pendingFiles = pending
-                    .filter { !$0.isDirectory && $0.kind != .missing && $0.kind != .obstructed }
-                    .map { $0.path == "." ? t : t + "/" + $0.path }
-                    .sorted()
+            var indexByPath: [String: Int] = [:]
 
-                let hasOversizedFile = maxBytes > 0 && pendingFiles.count > 1 && pendingFiles.contains { filePath in
-                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
-                          let sz = (attrs[.size] as? NSNumber)?.intValue ?? (attrs[.size] as? Int) else { return false }
-                    return sz > maxBytes
-                }
-
-                if hasOversizedFile {
-                    for filePath in pendingFiles {
-                        let (fileDiffs, _) = try diffSinglePath(filePath)
-                        out.append(contentsOf: fileDiffs)
+            for group in diffGroups {
+                var sections: UnsafeMutablePointer<csvn_diff_section>? = nil
+                var count: Int32 = 0
+                let rc = group.root.withCString { p in
+                    cleanWC.withCString { wcC in
+                        csvn_diff_sections(h, p, wcC, maxBytes, &sections, &count)
                     }
-                } else {
-                    let (targetDiffs, isTrunc) = try diffSinglePath(t)
-                    if isTrunc && pendingFiles.count > 1 {
-                        for filePath in pendingFiles {
-                            let (fileDiffs, _) = try diffSinglePath(filePath)
-                            out.append(contentsOf: fileDiffs)
-                        }
+                }
+                try self.check(rc)
+                defer { csvn_free_diff_sections(sections, count) }
+                guard let sections, count > 0 else { continue }
+
+                for i in 0..<Int(count) {
+                    let sec = sections[i]
+                    let rawPath = sec.path.map { String(cString: $0) } ?? group.root
+                    let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    var rel = trimmedPath
+                    if rel.hasPrefix(cleanWC + "/") {
+                        rel = String(rel.dropFirst(cleanWC.count + 1))
+                    } else if rel == cleanWC {
+                        rel = "."
+                    }
+                    let absPath = trimmedPath.hasPrefix("/")
+                        ? trimmedPath
+                        : (rel == "." ? cleanWC : cleanWC + "/" + rel)
+
+                    let matchesFilter = group.filters.contains { filter in
+                        filter == cleanWC || absPath == filter || absPath.hasPrefix(filter + "/")
+                    }
+                    guard matchesFilter else { continue }
+
+                    let isTrunc = sec.truncated != 0
+                    let data = (sec.text != nil && sec.length > 0)
+                        ? Data(bytes: sec.text!, count: Int(sec.length))
+                        : Data()
+                    let decoded = data.isEmpty ? "" : Self.decodeText(data, isTruncated: isTrunc)
+                    let lossy = !data.isEmpty && decoded == nil
+                    let body = decoded ?? String(decoding: data, as: UTF8.self)
+                    let hunks = body.isEmpty ? [] : Self.parseUnifiedDiff(body)
+                    let isBin = Self.hasBinaryDiffHeader(body)
+                        || data.contains(0)
+                        || Self.isKnownBinaryPath(absPath)
+                    if hunks.isEmpty && !isBin && !isTrunc { continue }
+
+                    let notice: String? = isBin
+                        ? "二进制文件，不支持文本差异预览"
+                        : (lossy ? "部分差异无法完整解码" : nil)
+
+                    if let existingIdx = indexByPath[rel] {
+                        let prev = out[existingIdx]
+                        let mergedBin = prev.isBinary || isBin
+                        out[existingIdx] = FileDiff(
+                            id: prev.id,
+                            path: prev.path,
+                            localPath: prev.localPath,
+                            isBinary: mergedBin,
+                            hunks: mergedBin ? [] : (prev.hunks + hunks),
+                            isTruncated: prev.isTruncated || isTrunc,
+                            statusNotice: prev.statusNotice ?? notice,
+                            propertyChanges: prev.propertyChanges
+                        )
                     } else {
-                        out.append(contentsOf: targetDiffs)
+                        indexByPath[rel] = out.count
+                        out.append(
+                            FileDiff(
+                                id: rel,
+                                path: rel,
+                                localPath: URL(fileURLWithPath: absPath),
+                                isBinary: isBin,
+                                hunks: isBin ? [] : hunks,
+                                isTruncated: isTrunc,
+                                statusNotice: notice
+                            )
+                        )
                     }
                 }
             }
+
             var seen: Set<String> = []
-            for entry in statusesByTarget {
-                let target = entry.target
-                for status in entry.statuses {
-                    let path = status.path == "." ? target : target + "/" + status.path
-                    guard seen.insert(path).inserted else { continue }
-                    let relative = path == wcPath ? "." : String(path.dropFirst(wcPath.count + 1))
-                    let old = try self.propertySnapshot {
-                        csvn_wc_property_snapshot(h, path, 1, status.kind == .replaced ? 1 : 0, $0, $1)
-                    }
-                    let new = try self.propertySnapshot { csvn_wc_property_snapshot(h, path, 0, 0, $0, $1) }
-                    let changes = self.propertyChanges(from: old, to: new)
-                    guard !changes.isEmpty else { continue }
-                    if let index = out.firstIndex(where: { $0.path == relative }) {
-                        out[index] = self.withProperties(changes, in: out[index])
-                    } else {
-                        out.append(FileDiff(id: relative, path: relative,
-                                            localPath: URL(fileURLWithPath: path),
-                                            isBinary: Self.isKnownBinaryPath(path), hunks: [],
-                                            propertyChanges: changes))
-                    }
+            for status in wcStatuses where status.kind.isPendingChange {
+                let path = status.path == "." ? cleanWC : cleanWC + "/" + status.path
+                let matchesTarget = targets.contains { t in
+                    t == cleanWC || path == t || path.hasPrefix(t + "/")
+                }
+                guard matchesTarget, seen.insert(path).inserted else { continue }
+                let relative = path == cleanWC ? "." : String(path.dropFirst(cleanWC.count + 1))
+                let old = try self.propertySnapshot {
+                    csvn_wc_property_snapshot(h, path, 1, status.kind == .replaced ? 1 : 0, $0, $1)
+                }
+                let new = try self.propertySnapshot { csvn_wc_property_snapshot(h, path, 0, 0, $0, $1) }
+                let changes = self.propertyChanges(from: old, to: new)
+                guard !changes.isEmpty else { continue }
+                if let index = indexByPath[relative] {
+                    out[index] = self.withProperties(changes, in: out[index])
+                } else {
+                    indexByPath[relative] = out.count
+                    out.append(FileDiff(id: relative, path: relative,
+                                        localPath: URL(fileURLWithPath: path),
+                                        isBinary: Self.isKnownBinaryPath(path), hunks: [],
+                                        propertyChanges: changes))
                 }
             }
             return out

@@ -187,6 +187,22 @@ int csvn_diff_capped(csvn_ctx *ctx,
                      long *out_len,
                      int *out_truncated);
 
+typedef struct {
+    char *path;       /* Index: 头指示的路径（malloc 分配） */
+    char *text;       /* 该文件段的 unified diff 原始字节（malloc 分配） */
+    long length;      /* text 的字节长度 */
+    int truncated;    /* 该文件段是否因超过 max_bytes 被截断 */
+} csvn_diff_section;
+
+/* 6a-2. 按 Index: 段逐项限制字节上限的工作副本差异，保留目录复制/替换上下文 */
+int csvn_diff_sections(csvn_ctx *ctx,
+                       const char *path,
+                       const char *relative_to_dir,
+                       long max_bytes,
+                       csvn_diff_section **out_sections,
+                       int *out_count);
+void csvn_free_diff_sections(csvn_diff_section *sections, int count);
+
 /* 6b. 单个文件在指定修订中的改动（peg = revision, start = revision - 1, end = revision） */
 int csvn_diff_revision(csvn_ctx *ctx,
                        const char *file_url,
