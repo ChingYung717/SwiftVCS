@@ -11,8 +11,9 @@ xcuserdata/
 *.xcuserdata
 DerivedData/
 
-# macOS
+# macOS & Editors
 .DS_Store
 .AppleDouble
 .LSOverride
 ._*
+.vscode/
