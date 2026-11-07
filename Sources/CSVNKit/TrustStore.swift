@@ -338,15 +338,225 @@ public enum KeychainError: Error, LocalizedError {
     }
 }
 
+// MARK: - URL 凭据清洗与脱敏
+
+/// 负责在持久化、UI 展示、复制与日志输出前清洗或脱敏仓库 URL。
+/// - 持久化规则（`sanitizeForPersistence`）：
+///   - 剥离所有协议中的 `password`；
+///   - 剥离 `https`、`http`、`svn`、`file` 等不需要 URL 内嵌 userinfo 的协议中的 `user`；
+///   - 保留 `svn+ssh://user@host/path` 中合法的 SSH 用户名（因其属于 SSH 连接目标语义，同时剥离可能误填的口令）；
+///   - 对无法解析、缺少合法主机或 authority 中存在多重 `@`（如未编码的口令含 `@`）的输入返回 `nil`，拒绝落盘。
+public enum SVNURLSanitizer {
+    public static func sanitizeForPersistence(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) != nil ||
+           trimmed.rangeOfCharacter(from: .controlCharacters) != nil {
+            return nil
+        }
+        var pctIdx = trimmed.startIndex
+        while pctIdx < trimmed.endIndex {
+            if trimmed[pctIdx] == "%" {
+                let h1 = trimmed.index(after: pctIdx)
+                guard h1 < trimmed.endIndex else { return nil }
+                let h2 = trimmed.index(after: h1)
+                guard h2 < trimmed.endIndex,
+                      trimmed[h1].isHexDigit,
+                      trimmed[h2].isHexDigit else {
+                    return nil
+                }
+                pctIdx = trimmed.index(after: h2)
+            } else {
+                pctIdx = trimmed.index(after: pctIdx)
+            }
+        }
+
+        guard let schemeRange = trimmed.range(of: "://") else { return nil }
+        let rawScheme = String(trimmed[..<schemeRange.lowerBound]).lowercased()
+        let afterScheme = trimmed[schemeRange.upperBound...]
+        let authorityEnd = afterScheme.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? afterScheme.endIndex
+        let rawAuthority = String(afterScheme[..<authorityEnd])
+        let afterAuthority = afterScheme[authorityEnd...]
+
+        // 若 authority 中出现多个字面量 '@'（例如未编码密码中包含 '@'），或口令中含未编码 '/' 导致 '@host' 落入 path，拒绝落盘
+        if rawAuthority.filter({ $0 == "@" }).count > 1 {
+            return nil
+        }
+        if afterAuthority.contains("@") {
+            let firstSegment = afterAuthority.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true).first
+            if rawAuthority.contains(":") || rawAuthority.contains("@") || firstSegment?.contains("@") == true {
+                return nil
+            }
+        }
+
+        guard var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              scheme == rawScheme else {
+            return nil
+        }
+        guard components.query == nil, components.fragment == nil else {
+            return nil
+        }
+        if components.path.rangeOfCharacter(from: .controlCharacters) != nil ||
+           components.percentEncodedPath.lowercased().contains("%00") {
+            return nil
+        }
+
+        switch scheme {
+        case "file":
+            components.scheme = "file"
+            components.percentEncodedUser = nil
+            components.percentEncodedPassword = nil
+            if let host = components.host, !host.isEmpty && host.lowercased() != "localhost" {
+                return nil
+            }
+            components.host = ""
+            var path = components.percentEncodedPath
+            guard path.hasPrefix("/") else { return nil }
+            while path.count > 1 && path.hasSuffix("/") {
+                path.removeLast()
+            }
+            components.percentEncodedPath = path
+            guard let url = components.url, url.isFileURL,
+                  url.user == nil, url.password == nil else {
+                return nil
+            }
+            return url.absoluteString
+
+        case "https", "http", "svn", "svn+ssh":
+            components.scheme = scheme
+            components.percentEncodedPassword = nil
+            if scheme == "svn+ssh" {
+                if let user = components.user {
+                    if user.isEmpty ||
+                       user.contains(":") ||
+                       user.contains("@") ||
+                       user.contains("/") ||
+                       user.rangeOfCharacter(from: .whitespacesAndNewlines) != nil ||
+                       user.rangeOfCharacter(from: .controlCharacters) != nil {
+                        return nil
+                    }
+                } else if components.percentEncodedUser != nil {
+                    return nil
+                }
+            } else {
+                components.percentEncodedUser = nil
+            }
+
+            // 校验去除 userinfo 后的原始主机写法（非 IPv6 字面量不得含额外冒号）
+            let hostPortSub: Substring
+            if let atIdx = rawAuthority.lastIndex(of: "@") {
+                hostPortSub = rawAuthority[rawAuthority.index(after: atIdx)...]
+            } else {
+                hostPortSub = rawAuthority[...]
+            }
+            if !hostPortSub.isEmpty {
+                if hostPortSub.first == "[" {
+                    guard let closeIdx = hostPortSub.firstIndex(of: "]") else { return nil }
+                    let remainder = hostPortSub[hostPortSub.index(after: closeIdx)...]
+                    if !remainder.isEmpty && !remainder.hasPrefix(":") {
+                        return nil
+                    }
+                } else {
+                    if hostPortSub.filter({ $0 == ":" }).count > 1 {
+                        return nil
+                    }
+                }
+            } else {
+                return nil
+            }
+
+            var path = components.percentEncodedPath
+            while path.count > 1 && path.hasSuffix("/") {
+                path.removeLast()
+            }
+            if path == "/" {
+                path = ""
+            }
+            components.percentEncodedPath = path
+
+            guard let cleanURL = components.url,
+                  cleanURL.password == nil,
+                  cleanURL.user == nil || scheme == "svn+ssh",
+                  SVNOrigin(cleanURL) != nil else {
+                return nil
+            }
+            return cleanURL.absoluteString
+
+        default:
+            return nil
+        }
+    }
+
+    /// 用于 UI、剪贴板或状态栏展示的脱敏字符串：若可合法清洗则返回清洗结果，否则隐藏一切疑似凭据片段。
+    public static func redactForDisplay(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if let clean = sanitizeForPersistence(trimmed) {
+            return clean
+        }
+        return redactCredentials(inMessage: trimmed)
+    }
+
+    /// 脱敏任意日志或错误消息中形如 `scheme://user:pass@host` 或 `user:pass@` 的内嵌凭据。
+    public static func redactCredentials(inMessage message: String) -> String {
+        guard message.contains("@") else { return message }
+        var result = message
+        let schemePatterns = [
+            // 1. 含 scheme，且 user:pass 中口令可能包含 '/'、'?'、'#'、'@'，后跟合法主机名/IPv6/端口/路径
+            #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/:<>"']+):([^\s<>"']+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"']|$))"#,
+            // 2. 含 scheme，首个 '/' 前的任意 userinfo（允许含 '?'、'#'、'@'）
+            #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/<>"']+)@"#,
+        ]
+        for pattern in schemePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: nsRange,
+                    withTemplate: "$1<redacted>@"
+                )
+            }
+        }
+        let fallbackPatterns = [
+            // 3. 不含 scheme 的 user:pass@host（允许口令中含 '/'、'?'、'#'、'@'，后跟主机名/IPv6/端口/路径）
+            #"([^\s:/?#<>"']+):([^\s<>"']+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"']|$))"#,
+            // 4. 不含 scheme 的 user:pass@（允许口令中含 '?'、'#'、'@'，不含 '/'）
+            #"([^\s:/?#<>"']+):([^\s/<>"']+)@"#,
+        ]
+        for pattern in fallbackPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    options: [],
+                    range: nsRange,
+                    withTemplate: "<redacted>@"
+                )
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - 客户端配置持久化
 
 /// 保存最近连接的仓库 URL、用户名与本地工作副本路径（`~/.config/vcs-explorer/settings.json`）。
-public struct AppSettings: Codable, Sendable {
+public struct AppSettings: Codable, Equatable, Sendable {
     public var repoURL: String
     public var username: String
     public var workingCopyPath: String
     public var rememberPassword: Bool
     public var recentRepos: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case repoURL
+        case username
+        case workingCopyPath
+        case rememberPassword
+        case recentRepos
+    }
 
     public init(
         repoURL: String = "",
@@ -361,42 +571,154 @@ public struct AppSettings: Codable, Sendable {
         self.rememberPassword = rememberPassword
         self.recentRepos = recentRepos
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.repoURL = try container.decodeIfPresent(String.self, forKey: .repoURL) ?? ""
+        self.username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+        self.workingCopyPath = try container.decodeIfPresent(String.self, forKey: .workingCopyPath) ?? ""
+        self.rememberPassword = try container.decodeIfPresent(Bool.self, forKey: .rememberPassword) ?? false
+        self.recentRepos = try container.decodeIfPresent([String].self, forKey: .recentRepos) ?? []
+    }
+
+    /// 返回经 URL 凭据清洗与最近仓库去重（最多保留 8 条）后的安全配置副本。
+    public func sanitized() -> AppSettings {
+        let cleanRepoURL = SVNURLSanitizer.sanitizeForPersistence(repoURL) ?? ""
+        var seen = Set<String>()
+        var cleanRecents: [String] = []
+        for item in recentRepos {
+            guard let cleanItem = SVNURLSanitizer.sanitizeForPersistence(item),
+                  !cleanItem.isEmpty else { continue }
+            if seen.insert(cleanItem).inserted {
+                cleanRecents.append(cleanItem)
+                if cleanRecents.count >= 8 {
+                    break
+                }
+            }
+        }
+        return AppSettings(
+            repoURL: cleanRepoURL,
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+            workingCopyPath: workingCopyPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            rememberPassword: rememberPassword,
+            recentRepos: cleanRecents
+        )
+    }
+}
+
+public enum AppSettingsStoreError: Error, LocalizedError, Sendable {
+    case temporaryFileCreationFailed(String)
+    case persistenceFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .temporaryFileCreationFailed(let path):
+            return "无法创建设置临时文件：\(path)"
+        case .persistenceFailed(let reason):
+            return "无法保存客户端设置：\(reason)"
+        }
+    }
 }
 
 public enum AppSettingsStore {
-    private static var settingsURL: URL {
+    private static let errorLock = NSLock()
+    private static var _lastError: String?
+
+    public static var lastError: String? {
+        get {
+            errorLock.lock()
+            defer { errorLock.unlock() }
+            return _lastError
+        }
+        set {
+            errorLock.lock()
+            defer { errorLock.unlock() }
+            _lastError = newValue
+        }
+    }
+
+    public static var defaultSettingsURL: URL {
         TrustStore.shared.root.appendingPathComponent("settings.json")
     }
 
-    public static func load() -> AppSettings {
-        guard let data = try? Data(contentsOf: settingsURL),
-              let s = try? JSONDecoder().decode(AppSettings.self, from: data) else {
+    public static func load(from fileURL: URL? = nil) -> AppSettings {
+        let targetURL = fileURL ?? defaultSettingsURL
+        guard let data = try? Data(contentsOf: targetURL),
+              let raw = try? JSONDecoder().decode(AppSettings.self, from: data) else {
             return AppSettings(repoURL: "", username: "", workingCopyPath: "", rememberPassword: false, recentRepos: [])
         }
-        return s
+        let clean = raw.sanitized()
+        let rawText = String(decoding: data, as: UTF8.self)
+        let needsMigrationRewrite = (clean != raw) || rawText.contains("@") && {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let encoded = try? encoder.encode(clean) else { return true }
+            return String(decoding: encoded, as: UTF8.self) != rawText
+        }()
+        if needsMigrationRewrite {
+            do {
+                try saveThrowing(clean, to: targetURL)
+            } catch {
+                lastError = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
+            }
+        }
+        return clean
     }
 
-    public static func save(_ settings: AppSettings) {
+    public static func saveThrowing(_ settings: AppSettings, to fileURL: URL? = nil) throws {
+        let targetURL = fileURL ?? defaultSettingsURL
+        let clean = settings.sanitized()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(settings) else { return }
-        let rootDir = TrustStore.shared.root
-        try? FileManager.default.createDirectory(
+        let data = try encoder.encode(clean)
+        let rootDir = targetURL.deletingLastPathComponent()
+        let fm = FileManager.default
+        try fm.createDirectory(
             at: rootDir,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: rootDir.path)
-        let tempURL = rootDir.appendingPathComponent(".settings-\(UUID().uuidString).tmp")
-        if FileManager.default.createFile(
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: rootDir.path)
+
+        let tempURL = rootDir.appendingPathComponent(".\(targetURL.lastPathComponent)-\(UUID().uuidString).tmp")
+        defer {
+            if fm.fileExists(atPath: tempURL.path) {
+                try? fm.removeItem(at: tempURL)
+            }
+        }
+
+        guard fm.createFile(
             atPath: tempURL.path,
             contents: data,
             attributes: [.posixPermissions: 0o600]
-        ) {
-            _ = try? FileManager.default.replaceItemAt(settingsURL, withItemAt: tempURL)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
-            try? FileManager.default.removeItem(at: tempURL)
+        ) else {
+            throw AppSettingsStoreError.temporaryFileCreationFailed(tempURL.path)
+        }
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
+
+        do {
+            if fm.fileExists(atPath: targetURL.path) {
+                _ = try fm.replaceItemAt(targetURL, withItemAt: tempURL)
+            } else {
+                try fm.moveItem(at: tempURL, to: targetURL)
+            }
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+            lastError = nil
+        } catch {
+            let redacted = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
+            lastError = redacted
+            throw AppSettingsStoreError.persistenceFailed(redacted)
+        }
+    }
+
+    public static func save(_ settings: AppSettings, to fileURL: URL? = nil) {
+        do {
+            try saveThrowing(settings, to: fileURL)
+        } catch {
+            let redacted = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
+            lastError = redacted
+            fputs("[AppSettingsStore] \(redacted)\n", stderr)
         }
     }
 }
+

@@ -74,8 +74,9 @@ struct ConnectSheet: View {
                                 if !model.recentRepos.isEmpty {
                                     Menu {
                                         ForEach(model.recentRepos, id: \.self) { r in
-                                            Button(r) {
-                                                model.repoURLString = r
+                                            let displayRepo = SVNURLSanitizer.redactForDisplay(r)
+                                            Button(displayRepo) {
+                                                model.repoURLString = SVNURLSanitizer.sanitizeForPersistence(r) ?? displayRepo
                                             }
                                         }
                                     } label: {
@@ -91,7 +92,7 @@ struct ConnectSheet: View {
                                     Image(systemName: "checkmark.circle.fill")
                                         .foregroundStyle(.green)
                                         .font(.system(size: 12.5))
-                                    Text(verbatim: "当前已连接：\(info.url.absoluteString)（最新 r\(info.youngestRevision)）")
+                                    Text(verbatim: "当前已连接：\(SVNURLSanitizer.redactForDisplay(info.url.absoluteString))（最新 r\(info.youngestRevision)）")
                                         .font(.system(size: 12))
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
@@ -153,7 +154,7 @@ struct ConnectSheet: View {
                     }
 
                     // 3. TLS / SSL 证书信任管理
-                    SheetSectionCard(title: "TLS / SSL 证书信任管理") {
+                    SheetSectionCard(title: "TLS / SSL 证书信任例外管理") {
                         VStack(alignment: .leading, spacing: 10) {
                             if let host = currentHost {
                                 HStack(spacing: 10) {
@@ -162,12 +163,12 @@ struct ConnectSheet: View {
                                         .font(.system(size: 16))
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(verbatim: isCurrentHostTrusted
-                                             ? "已信任服务器 \(host) 的证书"
-                                             : "尚未导入 \(host) 的自签名证书")
+                                             ? "已配置服务器 \(host) 的自签名/未知 CA 证书信任例外"
+                                             : "尚未导入 \(host) 的自签名/未知 CA 证书信任例外")
                                             .font(.system(size: 13, weight: .semibold))
                                         Text(isCurrentHostTrusted
-                                             ? "仅信任此主机和端口上已核验的叶证书"
-                                             : "若该仓库使用自签名 HTTPS 证书，请先抓取证书并核对 SHA-256 指纹")
+                                             ? "仅对该 host:port 上指纹匹配的叶证书豁免未知 CA（非全局强固定）；主机名（SAN/CN）与有效期仍强制校验"
+                                             : "若该仓库使用自签名证书，请先抓取并核对 SHA-256 指纹；证书 SAN/CN 必须与目标主机名一致")
                                             .font(.system(size: 11.5))
                                             .foregroundStyle(.secondary)
                                     }
@@ -202,7 +203,7 @@ struct ConnectSheet: View {
                                                 .fill(Color.primary.opacity(0.05))
                                         )
                                     HStack(spacing: 8) {
-                                        Text("请确认上述 SHA-256 指纹与服务器管理员提供的证书指纹一致。")
+                                        Text("请确认上述 SHA-256 指纹与服务器管理员提供的证书指纹一致（仅豁免未知 CA，主机名与有效期仍受检）。")
                                             .font(.system(size: 11))
                                             .foregroundStyle(.secondary)
                                         Spacer()
@@ -242,7 +243,7 @@ struct ConnectSheet: View {
                             if !model.trustedCertificates.isEmpty {
                                 Divider()
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text("已导入的受信任服务器证书：")
+                                    Text("已导入的服务器证书信任例外（仅豁免未知 CA，不绕过主机名或过期校验）：")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(.secondary)
                                     ForEach(model.trustedCertificates, id: \.name) { cert in

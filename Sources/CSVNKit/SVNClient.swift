@@ -17,7 +17,16 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         var realm: String?
     }
 
-    private var handle: OpaquePointer?
+    private final class OperationCancelState: @unchecked Sendable {
+        var isCancelled = false
+    }
+
+    private var _handle: OpaquePointer?
+    private var activeOperation: OperationCancelState?
+    private var handle: OpaquePointer? {
+        get { stateLock.withLock { _handle } }
+        set { stateLock.withLock { _handle = newValue } }
+    }
     private let queue = DispatchQueue(label: "vcs.svn.backend", qos: .userInitiated)
     private let stateLock = NSLock()
     private let configDir: String?
@@ -74,7 +83,69 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     deinit {
-        if let h = handle { csvn_context_destroy(h) }
+        if let h = swapActiveHandle(nil) { csvn_context_destroy(h) }
+    }
+
+    /// 请求取消当前上下文上正在执行的底层 SVN 操作。
+    public func requestCancel() {
+        stateLock.withLock {
+            activeOperation?.isCancelled = true
+            if let h = _handle {
+                csvn_request_cancel(h)
+            }
+        }
+    }
+
+    private func beginOperation(_ op: OperationCancelState) -> Bool {
+        stateLock.withLock {
+            if op.isCancelled {
+                return false
+            }
+            activeOperation = op
+            if let h = _handle {
+                csvn_clear_cancel(h)
+            }
+            return true
+        }
+    }
+
+    private func cancelOperation(_ op: OperationCancelState) {
+        stateLock.withLock {
+            guard !op.isCancelled else { return }
+            op.isCancelled = true
+            if activeOperation === op, let h = _handle {
+                csvn_request_cancel(h)
+            }
+        }
+    }
+
+    private func finishOperation(_ op: OperationCancelState) {
+        stateLock.withLock {
+            if activeOperation === op {
+                activeOperation = nil
+            }
+            if let h = _handle {
+                csvn_clear_cancel(h)
+            }
+        }
+    }
+
+    private func swapActiveHandle(_ newHandle: OpaquePointer?) -> OpaquePointer? {
+        stateLock.withLock {
+            let previous = _handle
+            if let previous {
+                csvn_clear_cancel(previous)
+            }
+            _handle = newHandle
+            if let newHandle {
+                if activeOperation?.isCancelled == true {
+                    csvn_request_cancel(newHandle)
+                } else {
+                    csvn_clear_cancel(newHandle)
+                }
+            }
+            return previous
+        }
     }
 
     private func createHandle(url: URL?, credentials: Credentials?) throws
@@ -118,7 +189,17 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         let strings = [user, secret, configDir, origin?.authPrefix, realm, pin,
                        origin?.scheme == "https" ? trustBundlePath : nil, origin?.host]
         let cStrings = strings.map { value in value.flatMap { strdup($0) } }
-        defer { for value in cStrings { free(value) } }
+        defer {
+            for value in cStrings {
+                if let value {
+                    let len = strlen(value)
+                    if len > 0 {
+                        _ = memset_s(value, len, 0, len)
+                    }
+                    free(value)
+                }
+            }
+        }
         guard let h = csvn_context_create(cStrings[0], cStrings[1], cStrings[2], cStrings[3],
                                           cStrings[4], cStrings[5], cStrings[6], cStrings[7],
                                           &errbuf, Int32(errbuf.count)) else {
@@ -140,13 +221,29 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     // MARK: 基础设施
 
-    /// 在私有队列上执行一段阻塞的 libsvn 调用。
+    /// 在私有队列上执行一段阻塞的 libsvn 调用，并将 Swift Task 取消桥接到底层 `csvn_request_cancel`。
     private func perform<T>(_ body: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
-            queue.async {
-                do { cont.resume(returning: try body()) }
-                catch { cont.resume(throwing: error) }
+        try Task.checkCancellation()
+        let cancelState = OperationCancelState()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
+                queue.async {
+                    guard self.beginOperation(cancelState) else {
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        let result = try body()
+                        self.finishOperation(cancelState)
+                        cont.resume(returning: result)
+                    } catch {
+                        self.finishOperation(cancelState)
+                        cont.resume(throwing: error)
+                    }
+                }
             }
+        } onCancel: {
+            self.cancelOperation(cancelState)
         }
     }
 
@@ -168,6 +265,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             throw VCSError.transport(msg)
         case -4:
             throw VCSError.invalidArgument(msg)
+        case -7:
+            throw CancellationError()
         case -100:
             throw VCSError.underlying(msg)
         default:
@@ -241,6 +340,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let rc = probeURL.absoluteString.withCString { u in
                 csvn_get_repos_root(h, u, &rootBuf, Int32(rootBuf.count))
             }
+            if rc == -7 {
+                try self.check(rc)
+            }
             if rc == 0 {
                 let s = String(cString: rootBuf)
                 if !s.isEmpty, let resolved = URL(string: s) {
@@ -275,7 +377,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
         guard rc == 0 else { return nil }
         let str = String(cString: out)
-        return str.isEmpty ? nil : URL(string: str)
+        guard !str.isEmpty, let clean = SVNURLSanitizer.sanitizeForPersistence(str) else {
+            return nil
+        }
+        return URL(string: clean)
     }
 
     // MARK: 1. 连接
@@ -285,14 +390,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             self.rememberedConnection = nil
             let candidate = try self.createHandle(url: url, credentials: credentials)
             let h = candidate.handle
-            let previous = self.handle
-            self.handle = h
+            let previous = self.swapActiveHandle(h)
             var connected = false
             defer {
                 if connected {
                     if let previous { csvn_context_destroy(previous) }
                 } else {
-                    self.handle = previous
+                    _ = self.swapActiveHandle(previous)
                     csvn_context_destroy(h)
                 }
             }
@@ -307,6 +411,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             var rootBuf = [CChar](repeating: 0, count: 2048)
             let rootRC = url.absoluteString.withCString { u in
                 csvn_get_repos_root(h, u, &rootBuf, Int32(rootBuf.count))
+            }
+            if rootRC == -7 {
+                try self.check(rootRC)
             }
             if rootRC == 0 {
                 let rootStr = String(cString: rootBuf)
@@ -347,9 +454,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     public func disconnect() async {
         try? await perform {
-            if let handle = self.handle {
+            if let handle = self.swapActiveHandle(nil) {
                 csvn_context_destroy(handle)
-                self.handle = nil
             }
             self.rememberedConnection = nil
             self.baseURL = nil
@@ -739,7 +845,26 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     public func diff(workingCopy: URL, paths: [String], maxBytes: Int) async throws -> [FileDiff] {
+        let defaultTotal = max(64 * 1024 * 1024, maxBytes > 0 ? min(maxBytes * 2, 128 * 1024 * 1024) : 64 * 1024 * 1024)
+        return try await diff(
+            workingCopy: workingCopy,
+            paths: paths,
+            maxBytes: maxBytes,
+            totalMaxBytes: defaultTotal,
+            maxSections: 4096
+        )
+    }
+
+    public func diff(
+        workingCopy: URL,
+        paths: [String],
+        maxBytes: Int,
+        totalMaxBytes: Int,
+        maxSections: Int
+    ) async throws -> [FileDiff] {
         guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
+        guard totalMaxBytes >= 0 else { throw VCSError.invalidArgument("差异总字节上限不能为负数") }
+        guard maxSections >= 0 else { throw VCSError.invalidArgument("差异分段上限不能为负数") }
         return try await perform {
             let h = try self.requireHandle()
             let wcPath = try self.writeRoot(workingCopy)
@@ -791,82 +916,154 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
             var out: [FileDiff] = []
             var indexByPath: [String: Int] = [:]
+            let effectiveMaxSections = maxSections > 0 ? maxSections : 4096
+            var remainingTotalBytes = totalMaxBytes > 0 ? totalMaxBytes : (32 * 1024 * 1024)
+            var remainingSections = effectiveMaxSections
+            var budgetExhausted = false
 
             for group in diffGroups {
+                if remainingTotalBytes <= 0 || remainingSections <= 0 {
+                    budgetExhausted = true
+                    break
+                }
                 var sections: UnsafeMutablePointer<csvn_diff_section>? = nil
                 var count: Int32 = 0
+                var groupTotalTruncated: Int32 = 0
+                let sectionCap = Int32(clamping: remainingSections)
                 let rc = group.root.withCString { p in
                     cleanWC.withCString { wcC in
-                        csvn_diff_sections(h, p, wcC, maxBytes, &sections, &count)
+                        csvn_diff_sections_ex(
+                            h,
+                            p,
+                            wcC,
+                            maxBytes,
+                            remainingTotalBytes,
+                            sectionCap,
+                            &sections,
+                            &count,
+                            &groupTotalTruncated
+                        )
                     }
                 }
                 try self.check(rc)
                 defer { csvn_free_diff_sections(sections, count) }
-                guard let sections, count > 0 else { continue }
+                if let sections, count > 0 {
+                    for i in 0..<Int(count) {
+                        let sec = sections[i]
+                        let consumedBytes = max(0, Int(sec.length))
+                        remainingTotalBytes = max(0, remainingTotalBytes - consumedBytes)
+                        remainingSections = max(0, remainingSections - 1)
 
-                for i in 0..<Int(count) {
-                    let sec = sections[i]
-                    let rawPath = sec.path.map { String(cString: $0) } ?? group.root
-                    let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                    var rel = trimmedPath
-                    if rel.hasPrefix(cleanWC + "/") {
-                        rel = String(rel.dropFirst(cleanWC.count + 1))
-                    } else if rel == cleanWC {
-                        rel = "."
-                    }
-                    let absPath = trimmedPath.hasPrefix("/")
-                        ? trimmedPath
-                        : (rel == "." ? cleanWC : cleanWC + "/" + rel)
+                        let rawPath = sec.path.map { String(cString: $0) } ?? group.root
+                        let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                        var rel = trimmedPath
+                        if rel.hasPrefix(cleanWC + "/") {
+                            rel = String(rel.dropFirst(cleanWC.count + 1))
+                        } else if rel == cleanWC {
+                            rel = "."
+                        }
+                        let absPath = trimmedPath.hasPrefix("/")
+                            ? trimmedPath
+                            : (rel == "." ? cleanWC : cleanWC + "/" + rel)
 
-                    let matchesFilter = group.filters.contains { filter in
-                        filter == cleanWC || absPath == filter || absPath.hasPrefix(filter + "/")
-                    }
-                    guard matchesFilter else { continue }
+                        let matchesFilter = group.filters.contains { filter in
+                            filter == cleanWC || absPath == filter || absPath.hasPrefix(filter + "/")
+                        }
+                        guard matchesFilter else { continue }
 
-                    let isTrunc = sec.truncated != 0
-                    let data = (sec.text != nil && sec.length > 0)
-                        ? Data(bytes: sec.text!, count: Int(sec.length))
-                        : Data()
-                    let decoded = data.isEmpty ? "" : Self.decodeText(data, isTruncated: isTrunc)
-                    let lossy = !data.isEmpty && decoded == nil
-                    let body = decoded ?? String(decoding: data, as: UTF8.self)
-                    let hunks = body.isEmpty ? [] : Self.parseUnifiedDiff(body)
-                    let isBin = Self.hasBinaryDiffHeader(body)
-                        || data.contains(0)
-                        || Self.isKnownBinaryPath(absPath)
-                    if hunks.isEmpty && !isBin && !isTrunc { continue }
+                        let isTrunc = sec.truncated != 0
+                        let data = (sec.text != nil && sec.length > 0)
+                            ? Data(bytes: sec.text!, count: Int(sec.length))
+                            : Data()
+                        let decoded = data.isEmpty ? "" : Self.decodeText(data, isTruncated: isTrunc)
+                        let lossy = !data.isEmpty && decoded == nil
+                        let body = decoded ?? String(decoding: data, as: UTF8.self)
+                        let hunks = body.isEmpty ? [] : Self.parseUnifiedDiff(body)
+                        let isBin = Self.hasBinaryDiffHeader(body)
+                            || data.contains(0)
+                            || Self.isKnownBinaryPath(absPath)
+                        if hunks.isEmpty && !isBin && !isTrunc { continue }
 
-                    let notice: String? = isBin
-                        ? "二进制文件，不支持文本差异预览"
-                        : (lossy ? "部分差异无法完整解码" : nil)
+                        let notice: String? = isBin
+                            ? "二进制文件，不支持文本差异预览"
+                            : (lossy ? "部分差异无法完整解码" : nil)
 
-                    if let existingIdx = indexByPath[rel] {
-                        let prev = out[existingIdx]
-                        let mergedBin = prev.isBinary || isBin
-                        out[existingIdx] = FileDiff(
-                            id: prev.id,
-                            path: prev.path,
-                            localPath: prev.localPath,
-                            isBinary: mergedBin,
-                            hunks: mergedBin ? [] : (prev.hunks + hunks),
-                            isTruncated: prev.isTruncated || isTrunc,
-                            statusNotice: prev.statusNotice ?? notice,
-                            propertyChanges: prev.propertyChanges
-                        )
-                    } else {
-                        indexByPath[rel] = out.count
-                        out.append(
-                            FileDiff(
-                                id: rel,
-                                path: rel,
-                                localPath: URL(fileURLWithPath: absPath),
-                                isBinary: isBin,
-                                hunks: isBin ? [] : hunks,
-                                isTruncated: isTrunc,
-                                statusNotice: notice
+                        if let existingIdx = indexByPath[rel] {
+                            let prev = out[existingIdx]
+                            let mergedBin = prev.isBinary || isBin
+                            out[existingIdx] = FileDiff(
+                                id: prev.id,
+                                path: prev.path,
+                                localPath: prev.localPath,
+                                isBinary: mergedBin,
+                                hunks: mergedBin ? [] : (prev.hunks + hunks),
+                                isTruncated: prev.isTruncated || isTrunc,
+                                statusNotice: prev.statusNotice ?? notice,
+                                propertyChanges: prev.propertyChanges
                             )
-                        )
+                        } else {
+                            indexByPath[rel] = out.count
+                            out.append(
+                                FileDiff(
+                                    id: rel,
+                                    path: rel,
+                                    localPath: URL(fileURLWithPath: absPath),
+                                    isBinary: isBin,
+                                    hunks: isBin ? [] : hunks,
+                                    isTruncated: isTrunc,
+                                    statusNotice: notice
+                                )
+                            )
+                        }
                     }
+                }
+
+                if groupTotalTruncated != 0 {
+                    budgetExhausted = true
+                    break
+                }
+            }
+
+            if budgetExhausted {
+                let budgetNotice = "差异输出已达到预算上限，部分内容或后续文件未展开"
+                if !out.isEmpty {
+                    let lastIdx = out.count - 1
+                    let last = out[lastIdx]
+                    let combinedNotice: String
+                    if let existing = last.statusNotice, !existing.isEmpty {
+                        combinedNotice = existing.contains(budgetNotice) ? existing : "\(existing)；\(budgetNotice)"
+                    } else {
+                        combinedNotice = budgetNotice
+                    }
+                    out[lastIdx] = FileDiff(
+                        id: last.id,
+                        path: last.path,
+                        localPath: last.localPath,
+                        isBinary: last.isBinary,
+                        hunks: last.hunks,
+                        isTruncated: true,
+                        statusNotice: combinedNotice,
+                        propertyChanges: last.propertyChanges
+                    )
+                } else {
+                    let fallbackAbs = targets.first ?? cleanWC
+                    let fallbackRel = fallbackAbs == cleanWC
+                        ? "."
+                        : (fallbackAbs.hasPrefix(cleanWC + "/")
+                            ? String(fallbackAbs.dropFirst(cleanWC.count + 1))
+                            : fallbackAbs)
+                    indexByPath[fallbackRel] = 0
+                    out.append(
+                        FileDiff(
+                            id: fallbackRel,
+                            path: fallbackRel,
+                            localPath: URL(fileURLWithPath: fallbackAbs),
+                            isBinary: false,
+                            hunks: [],
+                            isTruncated: true,
+                            statusNotice: budgetNotice
+                        )
+                    )
                 }
             }
 
@@ -878,6 +1075,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 }
                 guard matchesTarget, seen.insert(path).inserted else { continue }
                 let relative = path == cleanWC ? "." : String(path.dropFirst(cleanWC.count + 1))
+                if indexByPath[relative] == nil && out.count >= effectiveMaxSections {
+                    continue
+                }
                 let old = try self.propertySnapshot {
                     csvn_wc_property_snapshot(h, path, 1, status.kind == .replaced ? 1 : 0, $0, $1)
                 }
@@ -906,11 +1106,12 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         maxBytes: Int = 2 * 1024 * 1024
     ) async throws -> FileDiff {
         let nativeRevision = try Self.nativeInteger(revision, field: "修订号", minimum: 1)
-        if let copyRevision = change.copyFromRevision {
-            _ = try Self.nativeInteger(copyRevision, field: "复制来源修订号")
+        let nativeCopyRevision = try change.copyFromRevision.map {
+            try Self.nativeInteger($0, field: "复制来源修订号", minimum: 1)
         }
         guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
         let content = try await diffFileContent(revision: revision, nativeRevision: nativeRevision,
+                                                nativeCopyRevision: nativeCopyRevision,
                                                 change: change, repoRootURL: repoRootURL, maxBytes: maxBytes)
         let changes = try await perform {
             let h = try self.requireHandle()
@@ -923,8 +1124,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             }
             let old: [String: Data]
             if (change.action == .added || change.action == .replaced),
-               let source = change.copyFromPath, let copyRevision = change.copyFromRevision {
-                old = try snapshot(Self.buildRepoURL(root: root, repoRelativePath: source), Int32(copyRevision))
+               let source = change.copyFromPath, let copyRev32 = nativeCopyRevision {
+                old = try snapshot(Self.buildRepoURL(root: root, repoRelativePath: source), copyRev32)
             } else if change.action == .added {
                 old = [:]
             } else {
@@ -936,7 +1137,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return withProperties(changes, in: content)
     }
 
-    private func diffFileContent(revision: Int, nativeRevision: Int32, change: ChangedPath,
+    private func diffFileContent(revision: Int, nativeRevision: Int32, nativeCopyRevision: Int32?, change: ChangedPath,
                                  repoRootURL: URL?, maxBytes: Int) async throws -> FileDiff {
         if change.kind == .directory {
             let fallbackURL = (repoRootURL ?? self.rootURL ?? self.baseURL)
@@ -974,14 +1175,16 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let root = try self.resolveRootURLSync(handle: h, explicit: repoRootURL)
             let targetURL = Self.buildRepoURL(root: root, repoRelativePath: change.path)
 
-            func catContent(url: URL, rev: Int) -> (data: Data, truncated: Bool)? {
+            func catContent(url: URL, rev: Int32) throws -> (data: Data, truncated: Bool)? {
+                guard rev >= 0 else { return nil }
                 var buf: UnsafeMutablePointer<CChar>? = nil
                 var len: Int = 0
                 var truncated: Int32 = 0
                 let rc = url.absoluteString.withCString { u in
-                    csvn_cat_capped(h, u, Int32(rev), maxBytes, &buf, &len, &truncated)
+                    csvn_cat_capped(h, u, rev, maxBytes, &buf, &len, &truncated)
                 }
                 defer { if let buf { csvn_free_string(buf) } }
+                if rc == -7 { try self.check(rc) }
                 guard rc == 0, let buf else { return nil }
                 return (Data(bytes: buf, count: max(0, len)), truncated != 0)
             }
@@ -1037,14 +1240,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             switch change.action {
             case .added:
                 if let copyFrom = change.copyFromPath, !copyFrom.isEmpty,
-                   let copyRev = change.copyFromRevision, copyRev > 0 {
+                   let copyRev32 = nativeCopyRevision, copyRev32 > 0 {
                     let fromURL = Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
                     var textPtr: UnsafeMutablePointer<CChar>? = nil
                     var len: Int = 0
                     var truncated: Int32 = 0
                     let rc = fromURL.absoluteString.withCString { u1 in
                         targetURL.absoluteString.withCString { u2 in
-                            csvn_diff_urls(h, u1, Int32(copyRev), u2, nativeRevision, maxBytes, &textPtr, &len, &truncated)
+                            csvn_diff_urls(h, u1, copyRev32, u2, nativeRevision, maxBytes, &textPtr, &len, &truncated)
                         }
                     }
                     defer { if let textPtr { csvn_free_string(textPtr) } }
@@ -1053,10 +1256,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     return makeDiffFromUnified(
                         data: data,
                         truncated: truncated != 0,
-                        emptyNotice: "复制自 \(copyFrom)@r\(copyRev)，内容未修改"
+                        emptyNotice: "复制自 \(copyFrom)@r\(copyRev32)，内容未修改"
                     )
                 }
-                if let (data, truncated) = catContent(url: targetURL, rev: revision) {
+                if let (data, truncated) = try catContent(url: targetURL, rev: nativeRevision) {
                     if Self.looksBinaryData(data) {
                         return FileDiff(
                             id: change.path,
@@ -1092,8 +1295,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 )
 
             case .deleted:
-                let prevRev = max(1, revision - 1)
-                if let (data, truncated) = catContent(url: targetURL, rev: prevRev) {
+                let prevRev: Int32 = max(1, nativeRevision - 1)
+                if let (data, truncated) = try catContent(url: targetURL, rev: prevRev) {
                     if Self.looksBinaryData(data) {
                         return FileDiff(
                             id: change.path,
@@ -1146,14 +1349,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
             case .replaced:
                 if let copyFrom = change.copyFromPath, !copyFrom.isEmpty,
-                   let copyRev = change.copyFromRevision, copyRev > 0 {
+                   let copyRev32 = nativeCopyRevision, copyRev32 > 0 {
                     let fromURL = Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
                     var textPtr2: UnsafeMutablePointer<CChar>? = nil
                     var len2: Int = 0
                     var truncated2: Int32 = 0
                     let rc2 = fromURL.absoluteString.withCString { u1 in
                         targetURL.absoluteString.withCString { u2 in
-                            csvn_diff_urls(h, u1, Int32(copyRev), u2, nativeRevision, maxBytes, &textPtr2, &len2, &truncated2)
+                            csvn_diff_urls(h, u1, copyRev32, u2, nativeRevision, maxBytes, &textPtr2, &len2, &truncated2)
                         }
                     }
                     defer { if let textPtr2 { csvn_free_string(textPtr2) } }
@@ -1162,7 +1365,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     return makeDiffFromUnified(
                         data: data2,
                         truncated: truncated2 != 0,
-                        emptyNotice: "复制自 \(copyFrom)@r\(copyRev)，内容未修改"
+                        emptyNotice: "复制自 \(copyFrom)@r\(copyRev32)，内容未修改"
                     )
                 }
 
@@ -1174,6 +1377,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                         csvn_diff_urls(h, u, nativeRevision - 1, u, nativeRevision, maxBytes, &textPtr2, &len2, &truncated2)
                     }
                     defer { if let textPtr2 { csvn_free_string(textPtr2) } }
+                    if rc2 == -7 { try self.check(rc2) }
                     if rc2 == 0 {
                         let data2 = textPtr2.map { Data(bytes: $0, count: max(0, len2)) } ?? Data()
                         return makeDiffFromUnified(
@@ -1208,8 +1412,26 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         path: String? = nil,
         maxBytes: Int = 2 * 1024 * 1024
     ) async throws -> [FileDiff] {
+        try await diffRevision(
+            revision,
+            path: path,
+            maxBytes: maxBytes,
+            totalMaxBytes: 32 * 1024 * 1024,
+            maxFiles: 512
+        )
+    }
+
+    public func diffRevision(
+        _ revision: Int,
+        path: String? = nil,
+        maxBytes: Int = 2 * 1024 * 1024,
+        totalMaxBytes: Int,
+        maxFiles: Int
+    ) async throws -> [FileDiff] {
         _ = try Self.nativeInteger(revision, field: "修订号", minimum: 1)
         guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
+        guard totalMaxBytes >= 0 else { throw VCSError.invalidArgument("差异总字节上限不能为负数") }
+        guard maxFiles >= 0 else { throw VCSError.invalidArgument("差异文件数量上限不能为负数") }
         let logTarget: URL = try await perform {
             let h = try self.requireHandle()
             return try self.resolveRootURLSync(handle: h, explicit: nil)
@@ -1248,22 +1470,48 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             return filters
         }()
 
+        let effectiveMaxFiles = maxFiles > 0 ? maxFiles : 512
+        var remainingTotalBytes = totalMaxBytes > 0 ? totalMaxBytes : (32 * 1024 * 1024)
         var results: [FileDiff] = []
+
         for change in entry.changes {
+            try Task.checkCancellation()
             if !candidateFilters.isEmpty {
                 let matches = candidateFilters.contains { filter in
                     change.path == filter || change.path.hasPrefix(filter + "/")
                 }
                 if !matches { continue }
             }
+            if results.count >= effectiveMaxFiles || remainingTotalBytes <= 0 {
+                let targetURL = Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)
+                results.append(
+                    FileDiff(
+                        id: change.path,
+                        path: change.path,
+                        localPath: targetURL,
+                        isBinary: false,
+                        hunks: [],
+                        isTruncated: true,
+                        statusNotice: "该修订包含较多变更，已达到差异预算上限，后续文件未展开"
+                    )
+                )
+                break
+            }
+            let perFileCap = maxBytes > 0 ? min(maxBytes, remainingTotalBytes) : remainingTotalBytes
             do {
                 let d = try await diffFile(
                     revision: revision,
                     change: change,
                     repoRootURL: logTarget,
-                    maxBytes: maxBytes
+                    maxBytes: perFileCap
                 )
+                let approxBytes = d.hunks.reduce(0) { acc, h in
+                    acc + h.header.utf8.count + h.lines.reduce(0) { $0 + $1.text.utf8.count + 2 }
+                }
+                remainingTotalBytes = max(0, remainingTotalBytes - max(approxBytes, d.isTruncated ? perFileCap : 0))
                 if change.kind != .directory || !d.propertyChanges.isEmpty { results.append(d) }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 let targetURL = Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)
                 results.append(
@@ -1851,6 +2099,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 Self.workingCopyURL(at: workingCopy) != nil
             let target: String
             if !isWorkingCopyDir, workingCopy.scheme != nil {
+                guard (workingCopy.isFileURL && workingCopy.user == nil && workingCopy.password == nil) ||
+                      SVNOrigin(workingCopy) != nil else {
+                    throw VCSError.invalidArgument("请通过独立参数传递凭据")
+                }
                 var u = workingCopy
                 if let path, !path.isEmpty {
                     for comp in path.split(separator: "/") where !comp.isEmpty {

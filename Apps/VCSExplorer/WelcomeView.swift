@@ -1,3 +1,4 @@
+import CSVNKit
 import SwiftUI
 
 struct WelcomeView: View {
@@ -41,7 +42,7 @@ struct WelcomeView: View {
                         WelcomeActionCard(
                             icon: "bolt.horizontal.circle.fill",
                             title: "立即连接默认仓库",
-                            subtitle: model.repoURLString,
+                            subtitle: SVNURLSanitizer.redactForDisplay(model.repoURLString),
                             isPrimary: false
                         ) {
                             model.connect()
@@ -64,8 +65,9 @@ struct WelcomeView: View {
 
                         VStack(spacing: 1) {
                             ForEach(model.recentRepos, id: \.self) { repo in
+                                let displayRepo = SVNURLSanitizer.redactForDisplay(repo)
                                 Button {
-                                    model.repoURLString = repo
+                                    model.repoURLString = SVNURLSanitizer.sanitizeForPersistence(repo) ?? displayRepo
                                     model.connect()
                                 } label: {
                                     HStack(spacing: 10) {
@@ -73,12 +75,12 @@ struct WelcomeView: View {
                                             .foregroundStyle(Theme.brandBlue)
                                             .font(.system(size: 13))
                                         VStack(alignment: .leading, spacing: 2) {
-                                            Text(URL(string: repo)?.lastPathComponent.isEmpty == false
-                                                 ? (URL(string: repo)?.lastPathComponent ?? repo)
-                                                 : repo)
+                                            Text(URL(string: displayRepo)?.lastPathComponent.isEmpty == false
+                                                 ? (URL(string: displayRepo)?.lastPathComponent ?? displayRepo)
+                                                 : displayRepo)
                                                 .font(.system(size: 13, weight: .medium))
                                                 .foregroundStyle(.primary)
-                                            Text(repo)
+                                            Text(displayRepo)
                                                 .font(.system(size: 11, design: .monospaced))
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(1)

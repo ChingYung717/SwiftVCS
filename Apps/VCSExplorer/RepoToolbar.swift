@@ -10,24 +10,25 @@ struct RepoToolbar: View {
 
     private var repoDisplayName: String {
         if let info = model.repoInfo {
+            let clean = SVNURLSanitizer.redactForDisplay(info.url.absoluteString)
             let last = info.url.lastPathComponent
-            return last.isEmpty || last == "/" ? (info.url.host ?? info.url.absoluteString) : last
+            return last.isEmpty || last == "/" ? (info.url.host ?? clean) : last
         }
-        let trimmed = model.repoURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let url = URL(string: trimmed) {
+        let redacted = SVNURLSanitizer.redactForDisplay(model.repoURLString)
+        if let url = URL(string: redacted) {
             let last = url.lastPathComponent
             if !last.isEmpty && last != "/" { return last }
             if let host = url.host { return host }
         }
-        return trimmed.isEmpty ? "未连接仓库" : trimmed
+        return redacted.isEmpty ? "未连接仓库" : redacted
     }
 
     private var repoSubtitle: String {
         if let info = model.repoInfo {
-            return info.url.absoluteString
+            return SVNURLSanitizer.redactForDisplay(info.url.absoluteString)
         }
         if !model.repoURLString.isEmpty {
-            return model.repoURLString
+            return SVNURLSanitizer.redactForDisplay(model.repoURLString)
         }
         return "点击配置 SVN 仓库地址与证书"
     }
@@ -194,7 +195,7 @@ struct RepoToolbar: View {
                         Capsule()
                             .fill(Color.green.opacity(0.10))
                     )
-                    .help(String("已信任 \(host) 的 TLS 证书"))
+                    .help(String("已添加 \(host) 的自签名/未知 CA 证书信任例外（主机名与有效期仍强制校验）"))
                 }
 
                 Button {
@@ -234,11 +235,12 @@ struct RepoToolbar: View {
     private var repoMenuPopover: some View {
         VStack(alignment: .leading, spacing: 4) {
             if let info = model.repoInfo {
+                let cleanInfoURL = SVNURLSanitizer.redactForDisplay(info.url.absoluteString)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("已连接仓库")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
-                    Text(info.url.absoluteString)
+                    Text(cleanInfoURL)
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(.primary)
                         .textSelection(.enabled)
@@ -260,13 +262,14 @@ struct RepoToolbar: View {
                     .padding(.top, 4)
 
                 ForEach(model.recentRepos, id: \.self) { repo in
+                    let displayRepo = SVNURLSanitizer.redactForDisplay(repo)
                     PopoverActionRow(
-                        icon: repo == model.repoURLString && model.repoInfo != nil ? "checkmark.circle.fill" : "externaldrive",
-                        iconColor: repo == model.repoURLString && model.repoInfo != nil ? .green : .secondary,
-                        title: repo
+                        icon: displayRepo == SVNURLSanitizer.redactForDisplay(model.repoURLString) && model.repoInfo != nil ? "checkmark.circle.fill" : "externaldrive",
+                        iconColor: displayRepo == SVNURLSanitizer.redactForDisplay(model.repoURLString) && model.repoInfo != nil ? .green : .secondary,
+                        title: displayRepo
                     ) {
                         model.showRepoPopover = false
-                        model.repoURLString = repo
+                        model.repoURLString = SVNURLSanitizer.sanitizeForPersistence(repo) ?? displayRepo
                         model.connect()
                     }
                 }
@@ -294,10 +297,11 @@ struct RepoToolbar: View {
             }
 
             if let info = model.repoInfo {
+                let cleanInfoURL = SVNURLSanitizer.redactForDisplay(info.url.absoluteString)
                 PopoverActionRow(icon: "doc.on.doc", title: "复制仓库 URL") {
                     model.showRepoPopover = false
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(info.url.absoluteString, forType: .string)
+                    NSPasteboard.general.setString(cleanInfoURL, forType: .string)
                     model.statusText = "已复制仓库 URL"
                 }
 

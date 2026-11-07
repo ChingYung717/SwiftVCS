@@ -5,12 +5,12 @@
 | 界面操作 | 调用与参数 | 结果与错误 |
 |---|---|---|
 | 修改连接地址或用户名 | 写入 `repoURLString` 或 `username` | 清除密码输入。更换地址也会清除待确认的证书。 |
-| 连接仓库 | `connect(dismissSheetOnSuccess:)` 使用 URL、用户名、密码和「记住 HTTPS 凭据」状态 | 成功后返回仓库信息并加载目录和历史。连接期间修改地址或凭据时提示重新连接。钥匙串访问失败会显示系统错误。 |
+| 连接仓库 | `connect(dismissSheetOnSuccess:)` 使用 URL、用户名、密码和「记住 HTTPS 凭据」状态；`SVNClient` 上下文创建与 `AppSettingsStore.saveThrowing` 磁盘写入均移出主线程异步执行 | 成功后返回仓库信息并加载目录和历史；持久化至 `settings.json` 前自动通过 `SVNURLSanitizer` 剥离内嵌口令与非 `svn+ssh` 用户名，写盘失败时显示告警。连接或创建客户端期间若用户修改了地址、用户名、密码或工作副本路径，则丢弃旧异步结果并提示重新操作。 |
 | 抓取 HTTPS 证书 | `probeServerCertificate()` 从当前 URL 取得主机和端口 | 展示叶证书主体和 SHA-256 指纹。抓取期间切换地址时丢弃旧结果。 |
-| 确认证书 | 独立核对指纹后调用 `confirmPendingCertificateAndConnect(dismissOnSuccess:)` | 验证证书属于当前端点后保存并重试连接。TLS 仍检查证书有效期和主机名。 |
+| 确认证书 | 独立核对指纹后调用 `confirmPendingCertificateAndConnect(dismissOnSuccess:)` | 验证证书属于当前端点后保存为该 `host:port` 的自签名/未知 CA 证书信任例外并重试连接（非跨 CA 的严格证书固定；TLS 仍强制校验主机名 SAN/CN 与有效期，主机名不匹配或过期仍被拒绝）。 |
 | 提交改动 | `commitCheckedChanges()` 传入勾选路径和提交说明 | 有新修订时显示修订号。空提交显示没有可提交的改动。 |
 
-升级后需要重新输入 HTTPS 凭据，并为原来使用自签名证书的端点重新核验叶证书。
+升级后启动时，`AppSettingsStore.load()` 会自动清洗旧版 `settings.json` 中可能残留的内嵌凭据并去重覆写回磁盘（`0600` 权限）；用户需重新输入 HTTPS 凭据，并为使用自签名证书且包含合法主机名（SAN/CN）的端点重新核验叶证书。
 
 ## P0 工作副本操作
 

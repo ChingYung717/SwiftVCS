@@ -82,6 +82,11 @@ const char *csvn_auth_realm(csvn_ctx *ctx);
 
 void csvn_context_destroy(csvn_ctx *ctx);
 
+/* 取消控制：可从任意线程调用 csvn_request_cancel 请求中断当前正在执行的 libsvn 操作 */
+void csvn_request_cancel(csvn_ctx *ctx);
+void csvn_clear_cancel(csvn_ctx *ctx);
+int csvn_is_cancelled(csvn_ctx *ctx);
+
 /* 工作副本操作：所有路径必须相对 root，目标须在同一工作副本内。 */
 int csvn_delete_files(csvn_ctx *ctx, const char *root, const char *const *paths, int count);
 int csvn_move_file(csvn_ctx *ctx, const char *root, const char *source, const char *destination);
@@ -179,7 +184,7 @@ int csvn_diff(csvn_ctx *ctx,
               char **out_text,
               long *out_len);
 
-/* 6a. 带字节上限的工作副本差异；max_bytes <= 0 表示不限制，超过上限时 *out_truncated = 1 */
+/* 6a. 带字节上限的工作副本差异；max_bytes <= 0 表示默认上限，超过上限时 *out_truncated = 1 */
 int csvn_diff_capped(csvn_ctx *ctx,
                      const char *path,
                      long max_bytes,
@@ -201,6 +206,18 @@ int csvn_diff_sections(csvn_ctx *ctx,
                        long max_bytes,
                        csvn_diff_section **out_sections,
                        int *out_count);
+
+/* 6a-3. 带总保留字节预算、最大分段数上限与总预算截断标志的工作副本分段差异 */
+int csvn_diff_sections_ex(csvn_ctx *ctx,
+                          const char *path,
+                          const char *relative_to_dir,
+                          long max_bytes_per_file,
+                          long max_total_bytes,
+                          int max_sections,
+                          csvn_diff_section **out_sections,
+                          int *out_count,
+                          int *out_total_truncated);
+
 void csvn_free_diff_sections(csvn_diff_section *sections, int count);
 
 /* 6b. 单个文件在指定修订中的改动（peg = revision, start = revision - 1, end = revision） */

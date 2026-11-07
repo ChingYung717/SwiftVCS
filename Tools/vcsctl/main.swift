@@ -46,7 +46,7 @@ struct Args {
                         setFlag(rawKey, "")
                         i += 1
                     }
-                } else if ["dry-run", "exact", "raw", "inherited", "parents", "all", "remember"].contains(rawKey) {
+                } else if ["dry-run", "exact", "raw", "inherited", "parents", "all", "remember", "password-stdin"].contains(rawKey) {
                     setFlag(rawKey, "true")
                     i += 1
                 } else if i + 1 < argv.count, !argv[i + 1].hasPrefix("-") {
@@ -75,8 +75,22 @@ func parseArgs(_ argv: [String]) -> Args {
 // MARK: - 输出
 
 func die(_ message: String) -> Never {
-    FileHandle.standardError.write(Data(("错误：\(message)\n").utf8))
+    let redacted = SVNURLSanitizer.redactCredentials(inMessage: message)
+    FileHandle.standardError.write(Data(("错误：\(redacted)\n").utf8))
     exit(1)
+}
+
+func resolvePassword(_ args: Args) throws -> String? {
+    if args.string("password") != nil && args.bool("password-stdin") {
+        throw VCSError.invalidArgument("--password 与 --password-stdin 不能同时使用")
+    }
+    if args.bool("password-stdin") {
+        guard let line = readLine(strippingNewline: true) else {
+            throw VCSError.invalidArgument("--password-stdin 未从标准输入读取到口令")
+        }
+        return line
+    }
+    return args.string("password")
 }
 
 func printPropertyChanges(_ changes: [PropertyChange]) {
@@ -121,9 +135,10 @@ func makeClient(_ args: Args, url: String? = nil, workingCopyPath: String? = nil
         throw VCSError.invalidArgument("--server 必须与实际仓库的主机一致")
     }
 
+    let password = try resolvePassword(args)
     let client = try SVNClient(
         username: args.string("user"),
-        password: args.string("password"),
+        password: password,
         trustBundlePath: args.string("trust-bundle") ?? args.string("ca"),
         baseURL: repository
     )
@@ -147,7 +162,7 @@ func rememberCredentials(_ client: SVNClient) async throws {
 // 属性值原样输出时，不经过 Swift 字符串或 print。
 func nodeCommand(_ command: String, _ args: Args) async throws {
     let read = command == "proplist" || command == "propget"
-    let common: Set<String> = ["user", "password", "trust-bundle", "ca", "server"]
+    let common: Set<String> = ["user", "password", "password-stdin", "trust-bundle", "ca", "server"]
     let specific: Set<String>
     switch command {
     case "proplist": specific = ["path", "revision", "peg", "inherited"]
@@ -160,7 +175,7 @@ func nodeCommand(_ command: String, _ args: Args) async throws {
     guard let input = args.positional.first, !input.isEmpty,
           args.duplicates.isEmpty, Set(args.flags.keys).isSubset(of: common.union(specific)),
           args.flags.values.allSatisfy({ !$0.isEmpty }) else { throw invalid }
-    for flag in ["inherited", "raw", "parents"] {
+    for flag in ["inherited", "raw", "parents", "password-stdin"] {
         if let value = args.string(flag), value != "true" && value != "false" { throw invalid }
     }
     for flag in ["revision", "peg"] where args.string(flag) != nil {
@@ -268,11 +283,12 @@ guard let command = rawArgs.first else {
       revert --exact   仅回滚明确列出的路径，目录只回滚自身
 
     通用选项:
-      --user <用户名>  --password <口令>  --revision <修订号>  --limit <条数>
+      --user <用户名>  --password-stdin (推荐，从标准输入读取口令)  --password <口令>
+      --revision <修订号>  --limit <条数>
       --trust-bundle <证书包路径>
       --ca <PEM 文件>             仅在当前 SVN 会话使用的 CA 证书包
       info --fetch-cert <主机>     显示服务器叶证书的 SHA-256 指纹
-      info --fingerprint <指纹>    与独立获得的指纹匹配后信任证书
+      info --fingerprint <指纹>    校验指纹后保存该 host:port 的自签名/未知 CA 证书信任例外（仍严格校验主机名与有效期）
       --remember                 成功认证后保存到 macOS 钥匙串，复用时传 --user
     """)
     exit(0)
@@ -315,9 +331,9 @@ do {
         if args.bool("remember") {
             try await rememberCredentials(client)
         }
-        out("仓库 URL : \(info.url)")
+        out("仓库 URL : \(SVNURLSanitizer.redactForDisplay(info.url.absoluteString))")
         if let root = info.rootURL {
-            out("仓库根   : \(root)")
+            out("仓库根   : \(SVNURLSanitizer.redactForDisplay(root.absoluteString))")
         }
         out("仓库 UUID: \(info.uuid ?? "-")")
         out("最新修订 : r\(info.youngestRevision)")
@@ -459,7 +475,7 @@ do {
         try await nodeCommand(command, args)
 
     case "delete", "move", "rename", "copy", "resolve", "merge":
-        let common: Set<String> = ["user", "password", "trust-bundle", "ca", "server"]
+        let common: Set<String> = ["user", "password", "password-stdin", "trust-bundle", "ca", "server"]
         let specific: Set<String>
         switch command {
         case "merge": specific = ["source", "revision", "r", "from", "to", "peg", "dry-run"]

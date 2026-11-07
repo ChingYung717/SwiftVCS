@@ -150,8 +150,8 @@ swift run VCSExplorer \
 </p>
 
 1. Click **Connect Remote SVN Repository** on the welcome screen (or press `⌘⇧N`);
-2. Enter the repository URL, username, password (optionally saved to macOS Keychain), and local working copy path;
-3. For self-signed HTTPS servers, click **Probe & Verify Server Certificate** (`抓取并核验服务器证书`), verify the displayed Subject and `SHA-256` fingerprint against your administrator's fingerprint, and click **Confirm & Connect** (`确认指纹无误，信任并连接`).
+2. Enter the repository URL, username, password (optionally saved to macOS Keychain; `settings.json` is sanitized with `0600` permissions and never stores passwords or embedded non-SSH userinfo), and local working copy path;
+3. For self-signed or unknown-CA HTTPS servers, click **Probe & Verify Server Certificate** (`抓取并核验服务器证书`), verify the displayed Subject and `SHA-256` fingerprint against your administrator's fingerprint, and click **Confirm & Connect** (`确认指纹无误，信任并连接`) to store a `host:port` trust exception for that self-signed/unknown-CA leaf certificate (note: this is not cross-CA strict pinning, and TLS hostname SAN/CN and validity period are still strictly enforced).
 
 ### Build & Run Tests
 
@@ -160,6 +160,7 @@ swift run VCSExplorer \
 source scripts/svn_build_env.sh
 swift run SwiftVCSChecks
 ./Tests/run_e2e.sh
+python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
 ```
 
 ### Build Standalone `VCSExplorer.app`
@@ -168,7 +169,7 @@ swift run SwiftVCSChecks
 ./make_app.sh
 ```
 
-`make_app.sh` builds the Release executable, copies all required `libsvn_*`, `libapr*`, `libserf`, and `libssl` dynamic libraries into `dist/VCSExplorer.app/Contents/Frameworks/`, rewrites load paths to `@rpath`, preserves each library’s deployment target, includes the licenses and gettext source, and produces `dist/VCSExplorer-<arch>.zip`. The default ad-hoc signature is for local testing. For distribution, set `SWIFTVCS_SIGN_IDENTITY` and `SWIFTVCS_NOTARY_PROFILE` to use Developer ID and notarization.
+`make_app.sh` builds the Release executable, copies all required `libsvn_*`, `libapr*`, `libserf`, and `libssl` dynamic libraries into `dist/VCSExplorer.app/Contents/Frameworks/`, rewrites load paths to `@rpath`, preserves each library’s deployment target, includes the licenses and gettext source, and produces `dist/VCSExplorer-<arch>.zip`. `preview-*` tags published from `main` are ad-hoc signed, unnotarized preview builds accompanied by `SHA256SUMS` and `build-info.txt`; for formal semantic releases, set `SWIFTVCS_SIGN_IDENTITY` and `SWIFTVCS_NOTARY_PROFILE` to sign with Developer ID and notarize.
 
 ---
 

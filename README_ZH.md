@@ -161,9 +161,9 @@ swift run VCSExplorer \
 ## 5. 本地配置与安全设计
 
 - **配置文件目录**：`~/.config/vcs-explorer/`（目录权限强制设为 `0700`）
-  - `settings.json`：保存最近连接的仓库列表、工作副本路径与界面偏好。
-  - HTTPS 密码在认证成功后按仓库与认证域保存至 macOS 钥匙串。
-  - `pinned-certs/*.crt`：按 HTTPS 主机和端口保存经用户核对指纹的叶证书。
+  - `settings.json`（文件权限强制 `0600`）：仅保存经 `SVNURLSanitizer` 清洗后的最近仓库 URL（剥离一切口令，仅 `svn+ssh://` 保留 SSH 用户名）、工作副本路径与界面偏好；启动时若检测到旧版含内嵌凭据的历史记录会立即清洗并原子重写回磁盘。
+  - HTTPS 密码在认证成功后按仓库与认证域保存至 macOS 钥匙串；CLI 推荐使用 `--password-stdin`。
+  - `pinned-certs/*.crt`：按 HTTPS `host:port` 保存经用户核对 `SHA-256` 指纹的自签名/未知 CA 叶证书信任例外（非跨 CA 的严格证书固定，且仍强制校验主机名 SAN/CN 与有效期）。
 
 ---
 

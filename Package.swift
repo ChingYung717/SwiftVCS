@@ -40,7 +40,7 @@ let package = Package(
 
         .executableTarget(
             name: "SwiftVCSChecks",
-            dependencies: ["CVCSKit", "CSVNKit"],
+            dependencies: ["CVCSKit", "CSVNKit", "CSVNShim"],
             path: "Tests/CVCSKitTests"
         ),
     ]

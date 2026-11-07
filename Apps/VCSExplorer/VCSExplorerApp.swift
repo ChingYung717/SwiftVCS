@@ -256,26 +256,89 @@ final class AppModel: ObservableObject {
         return trimmed
     }
 
+    nonisolated private static func validatedRepoURL(_ raw: String) -> URL? {
+        guard !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else {
+            return nil
+        }
+        guard (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+            return nil
+        }
+        return url
+    }
+
+    nonisolated private static func persistSettingsSnapshot(
+        rawRepo: String,
+        rawUser: String,
+        rawWC: String,
+        rawRemember: Bool
+    ) -> (recentRepos: [String], saveError: String?) {
+        var s = AppSettingsStore.load()
+        let trimmedInput = rawRepo.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedInput.isEmpty {
+            s.repoURL = ""
+        } else if let cleanURL = SVNURLSanitizer.sanitizeForPersistence(trimmedInput),
+                  !cleanURL.isEmpty,
+                  !cleanURL.contains("swiftvcs-e2e") {
+            s.repoURL = cleanURL
+            s.recentRepos.removeAll { $0 == cleanURL }
+            s.recentRepos.insert(cleanURL, at: 0)
+            if s.recentRepos.count > 8 {
+                s.recentRepos = Array(s.recentRepos.prefix(8))
+            }
+        }
+        if !rawUser.isEmpty {
+            s.username = rawUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if !rawWC.contains("swiftvcs-e2e") {
+            s.workingCopyPath = rawWC
+        }
+        s.rememberPassword = rawRemember
+        let sanitized = s.sanitized()
+        AppSettingsStore.save(sanitized)
+        return (sanitized.recentRepos, AppSettingsStore.lastError)
+    }
+
     private func saveCurrentSettings() {
         guard !isSelfTest else { return }
-        var s = AppSettingsStore.load()
-        let cleanURL = normalizedRepoURL(repoURLString)
-        if !cleanURL.isEmpty, !cleanURL.contains("swiftvcs-e2e") {
-            s.repoURL = cleanURL
-            if !s.recentRepos.contains(cleanURL) {
-                s.recentRepos.insert(cleanURL, at: 0)
-                if s.recentRepos.count > 8 {
-                    s.recentRepos = Array(s.recentRepos.prefix(8))
+        let rawRepo = repoURLString
+        let rawUser = username
+        let rawWC = workingCopyPath
+        let rawRemember = rememberPassword
+        Task.detached(priority: .utility) {
+            let (recentsToPublish, saveErr) = Self.persistSettingsSnapshot(
+                rawRepo: rawRepo,
+                rawUser: rawUser,
+                rawWC: rawWC,
+                rawRemember: rawRemember
+            )
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.recentRepos = recentsToPublish
+                if let saveErr, self.errorText == nil {
+                    self.errorText = saveErr
                 }
             }
-            recentRepos = s.recentRepos
         }
-        if !username.isEmpty { s.username = username }
-        if !workingCopyPath.contains("swiftvcs-e2e") {
-            s.workingCopyPath = workingCopyPath
+    }
+
+    private func saveCurrentSettingsAsync() async {
+        guard !isSelfTest else { return }
+        let rawRepo = repoURLString
+        let rawUser = username
+        let rawWC = workingCopyPath
+        let rawRemember = rememberPassword
+        let (recentsToPublish, saveErr) = await Task.detached(priority: .utility) {
+            Self.persistSettingsSnapshot(
+                rawRepo: rawRepo,
+                rawUser: rawUser,
+                rawWC: rawWC,
+                rawRemember: rawRemember
+            )
+        }.value
+        recentRepos = recentsToPublish
+        if let saveErr, errorText == nil {
+            errorText = saveErr
         }
-        s.rememberPassword = rememberPassword
-        AppSettingsStore.save(s)
     }
 
     private func refreshTrustedCertificates() {
@@ -284,42 +347,86 @@ final class AppModel: ObservableObject {
         trustedHosts = certs.map { $0.name }
     }
 
-    private func ensureClient() throws -> SVNClient {
-        if let c = client { return c }
-
-        refreshTrustedCertificates()
-
-        var resolvedRepoURL = repoInfo?.url
-        if resolvedRepoURL == nil, !workingCopyPath.isEmpty {
-            if let wcURL = SVNClient.workingCopyURL(at: URL(fileURLWithPath: workingCopyPath)) {
-                resolvedRepoURL = wcURL
-                if repoURLString.isEmpty {
-                    repoURLString = wcURL.absoluteString
-                }
-            }
-        }
-        if resolvedRepoURL == nil {
-            resolvedRepoURL = URL(string: normalizedRepoURL(repoURLString))
-        }
-        let c = try SVNClient(
-            username: username.isEmpty ? nil : username,
-            password: resolvedRepoURL?.absoluteString == normalizedRepoURL(repoURLString) && !password.isEmpty
-                ? password : nil,
-            baseURL: resolvedRepoURL,
-            useSavedCredentials: rememberPassword
-        )
-        client = c
-        return c
+    private func refreshTrustedCertificatesAsync() async {
+        let certs = await Task.detached(priority: .userInitiated) {
+            TrustStore.shared.importedCertificates()
+        }.value
+        trustedCertificates = certs
+        trustedHosts = certs.map { $0.name }
     }
 
-    private func clientForWorkingCopy() throws -> SVNClient {
-        let wc = URL(fileURLWithPath: workingCopyPath)
-        if let url = SVNClient.workingCopyURL(at: wc),
-           url.absoluteString != normalizedRepoURL(repoURLString) {
-            return try SVNClient(username: username.isEmpty ? nil : username, baseURL: url,
-                                 useSavedCredentials: rememberPassword)
+    private func ensureClient() async throws -> SVNClient {
+        let snapRepoURL = normalizedRepoURL(repoURLString)
+        let snapUser = username
+        let snapPass = password
+        let snapRemember = rememberPassword
+        let snapWC = workingCopyPath
+        let snapInfoURL = repoInfo?.url
+
+        if let c = client { return c }
+
+        await refreshTrustedCertificatesAsync()
+
+        let (createdClient, discoveredWCURL) = try await Task.detached(priority: .userInitiated) { () -> (SVNClient, URL?) in
+            var resolvedRepoURL = snapInfoURL
+            var foundWCURL: URL? = nil
+            if resolvedRepoURL == nil, !snapWC.isEmpty {
+                if let wcURL = SVNClient.workingCopyURL(at: URL(fileURLWithPath: snapWC)) {
+                    resolvedRepoURL = wcURL
+                    foundWCURL = wcURL
+                }
+            }
+            if resolvedRepoURL == nil {
+                resolvedRepoURL = Self.validatedRepoURL(snapRepoURL)
+            }
+            let c = try SVNClient(
+                username: snapUser.isEmpty ? nil : snapUser,
+                password: resolvedRepoURL?.absoluteString == snapRepoURL && !snapPass.isEmpty
+                    ? snapPass : nil,
+                baseURL: resolvedRepoURL,
+                useSavedCredentials: snapRemember
+            )
+            return (c, foundWCURL)
+        }.value
+
+        guard normalizedRepoURL(repoURLString) == snapRepoURL || (repoURLString.isEmpty && discoveredWCURL != nil),
+              username == snapUser,
+              password == snapPass else {
+            throw VCSError.invalidArgument("连接设置已更改，请重新操作")
         }
-        return try ensureClient()
+        if repoURLString.isEmpty, let discoveredWCURL {
+            repoURLString = discoveredWCURL.absoluteString
+        }
+        client = createdClient
+        return createdClient
+    }
+
+    private func clientForWorkingCopy() async throws -> SVNClient {
+        let snapWC = workingCopyPath
+        let snapRepoURL = normalizedRepoURL(repoURLString)
+        let snapUser = username
+        let snapRemember = rememberPassword
+        let wc = URL(fileURLWithPath: snapWC)
+
+        let separateClient = try await Task.detached(priority: .userInitiated) { () -> SVNClient? in
+            if let url = SVNClient.workingCopyURL(at: wc),
+               url.absoluteString != snapRepoURL {
+                return try SVNClient(
+                    username: snapUser.isEmpty ? nil : snapUser,
+                    baseURL: url,
+                    useSavedCredentials: snapRemember
+                )
+            }
+            return nil
+        }.value
+
+        guard workingCopyPath == snapWC, username == snapUser else {
+            throw VCSError.invalidArgument("工作副本或认证设置已更改，请重试")
+        }
+        if let separateClient {
+            return separateClient
+        }
+        return try await ensureClient()
     }
 
     private func putCache(key: String, diff: FileDiff) {
@@ -340,15 +447,18 @@ final class AppModel: ObservableObject {
             throw VCSError.invalidArgument("请输入合法的仓库 URL，并在认证栏填写凭据")
         }
 
-        refreshTrustedCertificates()
+        await refreshTrustedCertificatesAsync()
         let submittedUser = username
         let submittedPassword = password
-        let c = try SVNClient(
-            username: submittedUser.isEmpty ? nil : submittedUser,
-            password: submittedPassword.isEmpty ? nil : submittedPassword,
-            baseURL: url,
-            useSavedCredentials: rememberPassword
-        )
+        let submittedRemember = rememberPassword
+        let c = try await Task.detached(priority: .userInitiated) {
+            try SVNClient(
+                username: submittedUser.isEmpty ? nil : submittedUser,
+                password: submittedPassword.isEmpty ? nil : submittedPassword,
+                baseURL: url,
+                useSavedCredentials: submittedRemember
+            )
+        }.value
         do {
             let info = try await c.connect(to: url, credentials: nil)
             guard normalizedRepoURL(repoURLString) == cleanURL,
@@ -374,23 +484,30 @@ final class AppModel: ObservableObject {
             now = Date()
             lastRefresh = now
 
-            if rememberPassword, !submittedPassword.isEmpty, SVNOrigin(url)?.scheme == "https" {
+            if submittedRemember, !submittedPassword.isEmpty, SVNOrigin(url)?.scheme == "https" {
                 do {
                     _ = try await c.rememberPassword()
                 } catch {
-                    errorText = error.localizedDescription
+                    errorText = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
                 }
             }
-            saveCurrentSettings()
+            await saveCurrentSettingsAsync()
 
             _ = try await browseCore(path: nil)
             return info
         } catch {
-            let desc = (error as? VCSError)?.errorDescription ?? "\(error)"
+            let rawDesc = (error as? VCSError)?.errorDescription ?? "\(error)"
+            let desc = SVNURLSanitizer.redactCredentials(inMessage: rawDesc)
             if desc.localizedCaseInsensitiveContains("certificate") ||
                desc.localizedCaseInsensitiveContains("SSL") ||
                desc.localizedCaseInsensitiveContains("TLS") {
-                certificateIssue = desc
+                if desc.localizedCaseInsensitiveContains("hostname") ||
+                   desc.localizedCaseInsensitiveContains("does not match") ||
+                   desc.localizedCaseInsensitiveContains("not issued for") {
+                    certificateIssue = "\(desc)（证书信任例外仅豁免自签名/未知 CA，不豁免主机名不匹配；请为目标主机重新签发包含正确 SAN/CN 的证书）"
+                } else {
+                    certificateIssue = desc
+                }
             }
             throw error
         }
@@ -398,7 +515,9 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func browseCore(path: String?) async throws -> [RepositoryEntry] {
-        let c = try ensureClient()
+        let snapRepoURL = normalizedRepoURL(repoURLString)
+        let snapUser = username
+        let c = try await ensureClient()
         let normalizedPath: String?
         if let p = path, !p.isEmpty {
             normalizedPath = p.hasSuffix("/") ? String(p.dropLast()) : p
@@ -406,6 +525,9 @@ final class AppModel: ObservableObject {
             normalizedPath = nil
         }
         let items = try await c.browse(path: normalizedPath)
+        guard normalizedRepoURL(repoURLString) == snapRepoURL, username == snapUser else {
+            throw VCSError.invalidArgument("仓库连接设置已切换，已丢弃旧浏览结果")
+        }
         previewTask?.cancel()
         isPreviewLoading = false
         showAllPreviewLines = false
@@ -425,7 +547,7 @@ final class AppModel: ObservableObject {
     }
 
     func checkoutCore(entry: RepositoryEntry?, destination: URL? = nil) async throws -> URL {
-        let c = try ensureClient()
+        let c = try await ensureClient()
         let dest = destination ?? URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("checkout-\(UUID().uuidString.prefix(6))")
 
@@ -448,14 +570,14 @@ final class AppModel: ObservableObject {
 
         let url = try await c.checkout(path: path, to: dest, revision: nil)
         workingCopyPath = url.path
-        saveCurrentSettings()
+        await saveCurrentSettingsAsync()
         try await refreshStatusCore()
         return url
     }
 
     func refreshStatusCore() async throws {
         guard !workingCopyPath.isEmpty else { return }
-        let c = try ensureClient()
+        let c = try await ensureClient()
         let oldCommittablePaths = Set(statuses.filter { $0.kind != .normal && $0.kind != .ignored }.map(\.path))
         let previousChecked = checkedPaths
         let path = workingCopyPath
@@ -484,11 +606,11 @@ final class AppModel: ObservableObject {
             selectedStatus = nil
             workingDiffState = .idle
         }
-        saveCurrentSettings()
+        await saveCurrentSettingsAsync()
     }
 
     func updateCore() async throws -> UpdateResult {
-        let c = try clientForWorkingCopy()
+        let c = try await clientForWorkingCopy()
         let path = workingCopyPath
         let r = try await c.update(
             workingCopy: URL(fileURLWithPath: path),
@@ -506,7 +628,7 @@ final class AppModel: ObservableObject {
     }
 
     func diffCore(forPaths specificPaths: [String]? = nil) async throws -> [FileDiff] {
-        let c = try clientForWorkingCopy()
+        let c = try await clientForWorkingCopy()
         let paths = specificPaths ?? statuses.filter { $0.kind.isPendingChange }.map(\.path)
         if paths.isEmpty && specificPaths == nil {
             return []
@@ -515,17 +637,19 @@ final class AppModel: ObservableObject {
     }
 
     func logCore(customPath: String? = nil, limit: Int = 50, startRevision: Int? = nil) async throws -> [LogEntry] {
-        let c = try ensureClient()
+        let snapRepoURL = normalizedRepoURL(repoURLString)
+        let snapUser = username
+        let c = try await ensureClient()
         let targetURL: URL
         let subPath: String?
 
         if let cp = customPath {
-            guard let base = repoInfo?.url ?? URL(string: normalizedRepoURL(repoURLString)) else {
+            guard let base = repoInfo?.url ?? Self.validatedRepoURL(normalizedRepoURL(repoURLString)) else {
                 throw VCSError.underlying("尚未连接仓库")
             }
             targetURL = base
             subPath = cp.isEmpty ? nil : cp
-        } else if let base = repoInfo?.url ?? URL(string: normalizedRepoURL(repoURLString)), base.scheme != nil {
+        } else if let base = repoInfo?.url ?? Self.validatedRepoURL(normalizedRepoURL(repoURLString)), base.scheme != nil {
             targetURL = base
             subPath = nil
         } else if !workingCopyPath.isEmpty {
@@ -541,6 +665,9 @@ final class AppModel: ObservableObject {
             limit: limit,
             startRevision: startRevision
         )
+        guard normalizedRepoURL(repoURLString) == snapRepoURL, username == snapUser else {
+            throw VCSError.invalidArgument("仓库连接设置已切换，已丢弃旧日志结果")
+        }
         now = Date()
         lastRefresh = now
 
@@ -562,7 +689,7 @@ final class AppModel: ObservableObject {
     }
 
     func commitCore(message: String, specificPaths: [String]? = nil) async throws -> CommitResult {
-        let c = try clientForWorkingCopy()
+        let c = try await clientForWorkingCopy()
         let path = workingCopyPath
         let paths = specificPaths ?? committableWorkingStatuses.map(\.path)
         let r = try await c.commitSelection(workingCopy: URL(fileURLWithPath: path), paths: paths, message: message)
@@ -575,7 +702,7 @@ final class AppModel: ObservableObject {
     }
 
     func revertCore(_ item: WorkingCopyStatus) async throws {
-        let c = try clientForWorkingCopy()
+        let c = try await clientForWorkingCopy()
         let path = workingCopyPath
         _ = try await c.revertSelection(workingCopy: URL(fileURLWithPath: path),
                                         paths: pairedPaths(for: item.path).sorted())
@@ -583,7 +710,7 @@ final class AppModel: ObservableObject {
     }
 
     func addCore(_ item: WorkingCopyStatus) async throws {
-        let c = try clientForWorkingCopy()
+        let c = try await clientForWorkingCopy()
         let path = workingCopyPath
         _ = try await c.add(workingCopy: URL(fileURLWithPath: path), paths: [item.path])
         await refreshAfterWrite(path: path)
@@ -594,7 +721,8 @@ final class AppModel: ObservableObject {
         do {
             try await refreshStatusCore()
         } catch {
-            errorText = "操作已完成，刷新失败：\(error.localizedDescription)"
+            let msg = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
+            errorText = "操作已完成，刷新失败：\(msg)"
         }
     }
 
@@ -611,7 +739,7 @@ final class AppModel: ObservableObject {
             }
         }
 
-        let c = try ensureClient()
+        let c = try await ensureClient()
 
         if FileIcon.isKnownBinaryExtension(entry.name) {
             isPreviewBinary = true
@@ -647,7 +775,8 @@ final class AppModel: ObservableObject {
         } catch {
             guard !Task.isCancelled else { return }
             if selectedEntry == nil || selectedEntry?.path == entry.path {
-                let msg = (error as? VCSError)?.errorDescription ?? "\(error)"
+                let rawMsg = (error as? VCSError)?.errorDescription ?? "\(error)"
+                let msg = SVNURLSanitizer.redactCredentials(inMessage: rawMsg)
                 isPreviewBinary = true
                 previewText = "读取文件预览失败：\(msg)"
             }
@@ -715,7 +844,7 @@ final class AppModel: ObservableObject {
         diffTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let c = try self.ensureClient()
+                let c = try await self.ensureClient()
                 let rootURL = self.repoInfo?.rootURL ?? c.repositoryRoot
                 let diff = try await c.diffFile(
                     revision: revision,
@@ -733,7 +862,8 @@ final class AppModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 guard self.selectedRevision == revision,
                       self.selectedChangedItem?.path == item.path else { return }
-                let msg = (error as? VCSError)?.errorDescription ?? "\(error)"
+                let rawMsg = (error as? VCSError)?.errorDescription ?? "\(error)"
+                let msg = SVNURLSanitizer.redactCredentials(inMessage: rawMsg)
                 self.fileDiffState = .failed(msg)
             }
         }
@@ -825,7 +955,8 @@ final class AppModel: ObservableObject {
             if dismissSheetOnSuccess {
                 self.showConnectSheet = false
             }
-            self.statusText = "已连接 \(info.url.lastPathComponent.isEmpty ? info.url.absoluteString : info.url.lastPathComponent)，最新修订 r\(info.youngestRevision)"
+            let displayURL = SVNURLSanitizer.redactForDisplay(info.url.absoluteString)
+            self.statusText = "已连接 \(info.url.lastPathComponent.isEmpty ? displayURL : info.url.lastPathComponent)，最新修订 r\(info.youngestRevision)"
         }
     }
 
@@ -853,15 +984,17 @@ final class AppModel: ObservableObject {
             guard let url = URL(string: self.normalizedRepoURL(self.repoURLString)) else {
                 throw VCSError.invalidArgument("仓库地址已更改，请重新获取证书")
             }
-            try TrustStore.shared.trust(probed, for: url)
+            try await Task.detached(priority: .userInitiated) {
+                try TrustStore.shared.trust(probed, for: url)
+            }.value
             self.pendingProbedCertificate = nil
-            self.refreshTrustedCertificates()
+            await self.refreshTrustedCertificatesAsync()
             let info = try await self.connectCore()
             _ = try? await self.logCore(customPath: self.customLogPath)
             if dismissOnSuccess {
                 self.showConnectSheet = false
             }
-            self.statusText = "已信任 \(probed.host):\(probed.port) 的证书并连接 \(info.url)"
+            self.statusText = "已信任 \(probed.host):\(probed.port) 的证书并连接 \(SVNURLSanitizer.redactForDisplay(info.url.absoluteString))"
         }
     }
 
@@ -876,11 +1009,13 @@ final class AppModel: ObservableObject {
 
     func removeTrustedCertificate(_ name: String) {
         run {
-            try TrustStore.shared.removeCertificate(name: name)
+            try await Task.detached(priority: .userInitiated) {
+                try TrustStore.shared.removeCertificate(name: name)
+            }.value
             if (self.repoInfo?.url).flatMap(SVNOrigin.init)?.endpoint == name {
                 self.disconnect()
             }
-            self.refreshTrustedCertificates()
+            await self.refreshTrustedCertificatesAsync()
             self.statusText = "已移除证书 \(name)"
         }
     }
@@ -929,17 +1064,26 @@ final class AppModel: ObservableObject {
 
     func refreshAll() {
         run {
+            var remoteError: Error? = nil
             if self.repoInfo != nil || !self.repoURLString.isEmpty {
-                if self.repoInfo == nil {
-                    _ = try await self.connectCore()
-                } else {
-                    _ = try? await self.browseCore(path: self.currentPath.isEmpty ? nil : self.currentPath)
+                do {
+                    if self.repoInfo == nil {
+                        _ = try await self.connectCore()
+                    } else {
+                        _ = try? await self.browseCore(path: self.currentPath.isEmpty ? nil : self.currentPath)
+                    }
+                    _ = try await self.logCore(customPath: self.customLogPath)
+                } catch {
+                    remoteError = error
                 }
-                _ = try await self.logCore(customPath: self.customLogPath)
             }
             if !self.workingCopyPath.isEmpty,
                FileManager.default.fileExists(atPath: self.workingCopyPath) {
                 try await self.refreshStatusCore()
+            }
+            await self.saveCurrentSettingsAsync()
+            if let remoteError {
+                throw remoteError
             }
             self.now = Date()
             self.lastRefresh = self.now
@@ -1349,7 +1493,7 @@ final class AppModel: ObservableObject {
             // 若勾选了未纳入版本控制的文件，先自动执行 svn add
             let unversionedPaths = selectedItems.filter { $0.kind == .unversioned }.map(\.path)
             if !unversionedPaths.isEmpty {
-                let c = try self.clientForWorkingCopy()
+                let c = try await self.clientForWorkingCopy()
                 _ = try await c.add(
                     workingCopy: URL(fileURLWithPath: self.workingCopyPath),
                     paths: unversionedPaths
@@ -1405,8 +1549,12 @@ final class AppModel: ObservableObject {
                 isBusy = busyCount > 0
             }
             do { try await body() }
-            catch let e as VCSError { self.errorText = e.errorDescription }
-            catch { self.errorText = "\(error)" }
+            catch let e as VCSError {
+                self.errorText = SVNURLSanitizer.redactCredentials(inMessage: e.errorDescription ?? "\(e)")
+            }
+            catch {
+                self.errorText = SVNURLSanitizer.redactCredentials(inMessage: "\(error)")
+            }
         }
     }
 
@@ -1466,7 +1614,7 @@ final class AppModel: ObservableObject {
 
         // 附加验证：提交级文件比对（diffFile）与并排配对算法
         await step("提交文件比对") {
-            let c = try m.ensureClient()
+            let c = try await m.ensureClient()
             let rootURL = m.repoInfo?.rootURL ?? c.repositoryRoot
             // 优先验证首个非二进制源码改动，同时覆盖最新提交改动
             if let textLog = m.logs.first(where: { log in
@@ -1566,8 +1714,8 @@ extension AppModel {
     private func loadProperties(_ inspection: PropertyInspection) async throws {
         let client: any RepositoryClient
         switch inspection.target {
-        case .workingCopy: client = try clientForWorkingCopy()
-        case .repository: client = try ensureClient()
+        case .workingCopy: client = try await clientForWorkingCopy()
+        case .repository: client = try await ensureClient()
         }
         let rows = try await client.properties(at: inspection.target, revision: nil, peg: nil, inherited: true)
         guard propertyInspection?.id == inspection.id else { return }
@@ -1591,7 +1739,7 @@ extension AppModel {
             guard self.propertyInspection?.id == inspection.id,
                   root == URL(fileURLWithPath: self.workingCopyPath) else { return }
             self.propertyFeedback = nil
-            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            let client: any RepositoryClient = try await self.clientForWorkingCopy()
             try await client.setProperty(name, value: text.map { Data($0.utf8) }, workingCopy: root, path: path)
             guard self.propertyInspection?.id == inspection.id else { return }
             let feedback = "属性已\(text == nil ? "删除" : "设置")，待提交"
@@ -1625,7 +1773,7 @@ extension AppModel {
         mkdirPreview = nil
         run {
             guard self.workspaceOperation?.id == operation.id else { return }
-            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            let client: any RepositoryClient = try await self.clientForWorkingCopy()
             let paths = try await client.previewDirectory(
                 workingCopy: URL(fileURLWithPath: operation.root), path: path, parents: parents)
             guard self.workspaceOperation?.id == operation.id else { return }
@@ -1680,7 +1828,7 @@ extension AppModel {
         let directory = matchingDirectoryPreview
         runWorkspaceWrite {
             guard operation.root == self.workingCopyPath, self.workspaceOperation?.id == operation.id else { return }
-            let client: any RepositoryClient = try self.clientForWorkingCopy()
+            let client: any RepositoryClient = try await self.clientForWorkingCopy()
             let wc = URL(fileURLWithPath: operation.root)
             do {
                 switch operation.kind {
@@ -1746,7 +1894,7 @@ extension AppModel {
             self.mergeError = nil
             self.mergeResult = nil
             do {
-                let client: any RepositoryClient = try self.clientForWorkingCopy()
+                let client: any RepositoryClient = try await self.clientForWorkingCopy()
                 let result = try await client.merge(workingCopy: URL(fileURLWithPath: operation.root),
                                                     request: request, dryRun: dryRun)
                 guard self.workingCopyPath == operation.root else { return }
@@ -1760,7 +1908,7 @@ extension AppModel {
                 }
             } catch {
                 guard self.workingCopyPath == operation.root else { return }
-                self.mergeError = error.localizedDescription
+                self.mergeError = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
                 if case VCSError.mergeInterrupted = error {
                     self.sidebarTab = .changes
                     try? await self.refreshStatusCore()
