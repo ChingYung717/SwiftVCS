@@ -7,6 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HERE/dist}"
 APP="$OUT/VCSExplorer.app"
 NAME="VCSExplorer"
+VERSION="${SWIFTVCS_VERSION:-1.0.0}"
 SIGN_IDENTITY="${SWIFTVCS_SIGN_IDENTITY:--}"
 NOTARY_PROFILE="${SWIFTVCS_NOTARY_PROFILE:-}"
 source "$HERE/scripts/svn_build_env.sh"
@@ -128,7 +129,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>local.vcsexplorer</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
     <key>NSHighResolutionCapable</key><true/>

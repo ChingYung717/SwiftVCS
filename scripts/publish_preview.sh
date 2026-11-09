@@ -3,8 +3,6 @@ set -euo pipefail
 
 repo="repos/${GH_REPO:?}"
 sha="${GITHUB_SHA:?}"
-tag="build-$sha"
-ref="refs/tags/$tag"
 assets=(VCSExplorer-arm64.zip SHA256SUMS build-info.txt)
 
 fail() {
@@ -15,6 +13,25 @@ fail() {
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "Invalid commit SHA"
 sha256sum --check --strict SHA256SUMS
 grep -Fxq "Commit: $sha" build-info.txt
+
+version="$(awk -F': ' '/^Version: /{print $2; exit}' build-info.txt)"
+version="${version:-${SWIFTVCS_VERSION:-1.0.0}}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "Invalid version: $version"
+short_sha="${sha:0:7}"
+tag="v${version}-${short_sha}"
+ref="refs/tags/$tag"
+
+commit_subject="$(git log -1 --format=%s "$sha" 2>/dev/null || true)"
+if [[ -z "$commit_subject" ]]; then
+    commit_subject="$(gh api "$repo/commits/$sha" --jq '.commit.message | split("\n")[0]' 2>/dev/null || true)"
+fi
+if [[ -n "$commit_subject" ]]; then
+    release_title="v${version}-${short_sha} · ${commit_subject}"
+    release_body="### ${commit_subject}"$'\n\n'"$(cat build-info.txt)"$'\n\nGitHub provides source ZIP and tar.gz archives for this tag.'
+else
+    release_title="SwiftVCS v${version} (${short_sha})"
+    release_body="$(cat build-info.txt)"$'\n\nGitHub provides source ZIP and tar.gz archives for this tag.'
+fi
 
 tag_commit() {
     gh api "$repo/git/matching-refs/tags/$tag" |
@@ -34,8 +51,8 @@ fi
 
 if [[ "$release" == null ]]; then
     release=$(gh api "$repo/releases" -f tag_name="$tag" -f target_commitish="$sha" \
-        -f name="SwiftVCS preview ${sha:0:12}" -F draft=true -F prerelease=true -f make_latest=false \
-        -f body="$(cat build-info.txt)"$'\n\nGitHub provides source ZIP and tar.gz archives for this tag.')
+        -f name="$release_title" -F draft=true -F prerelease=true -f make_latest=false \
+        -f body="$release_body")
 fi
 id=$(jq -er '.id' <<< "$release")
 jq -e '.prerelease' <<< "$release" > /dev/null || fail "$tag is not a preview release"

@@ -201,7 +201,7 @@ python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
    - `dist/VCSExplorer.app`
    - `dist/VCSExplorer-<架构>.zip`
 
-- **预览包与正式发布状态说明（SV-09）**：`main` 分支 CI 自动发布的 `preview-*` 标签产物属于面向开发验证的预览构建（ad-hoc 签名、未公证，附带 `SHA256SUMS` 与记录构建环境的 `build-info.txt`），不代表已完成 Apple Developer ID 签名与公证的语义化正式版本（`vX.Y.Z`）。正式分发时需通过 `SWIFTVCS_SIGN_IDENTITY` 指定 Developer ID Application 身份，并通过 `SWIFTVCS_NOTARY_PROFILE` 执行公证。
+- **预览包与正式发布状态说明（SV-09）**：`main` 分支 CI 自动发布的 `v<版本>-<短SHA>`（如 `v1.0.0-c4bfaef`）预发布标签产物属于面向开发验证的预览构建（ad-hoc 签名、未公证，附带 `SHA256SUMS` 与记录构建环境的 `build-info.txt`），不代表已完成 Apple Developer ID 签名与公证的语义化正式版本（`vX.Y.Z`）。正式分发时需通过 `SWIFTVCS_SIGN_IDENTITY` 指定 Developer ID Application 身份，并通过 `SWIFTVCS_NOTARY_PROFILE` 执行公证。
 - **依赖版本基线与构建可复现说明（SV-08）**：本地与 CI 通过 `scripts/svn_build_env.sh` 绑定 Homebrew 的 `subversion`（验证基线 `1.15.0` / `serf 1.3.10`）、`apr`（`1.7.6`）、`apr-util`（`1.6.6`）、`openssl@3`（`3.5.9`）、`sqlite`（`3.54.1`）、`utf8proc`（`2.12.0`）、`lz4`（`1.10.0`）。由于 Apple 链接器会将目标文件时间戳（`N_OSO` stab 条目）哈希进 Mach-O `LC_UUID`，且 `codesign` 会据此生成不同的 `LC_CODE_SIGNATURE` CDHash，两次独立干净构建产物的二进制哈希会因 `LC_UUID` 与签名块而不同；请以每次构建产物附带的 `build-info.txt` 与 `SHA256SUMS` 校验包完整性。
 
 ### 命令行工具 `vcsctl` 速查
@@ -378,7 +378,7 @@ python3 Tests/run_security.py "$(swift build --show-bin-path)/vcsctl"
 #   dist/VCSExplorer-<arch>.zip
 ```
 
-- **Preview vs. Formal Release (SV-09)**: `preview-*` artifacts published from `main` are ad-hoc signed, unnotarized preview builds accompanied by `SHA256SUMS` and `build-info.txt`; formal semantic releases (`vX.Y.Z`) require Apple Developer ID signing (`SWIFTVCS_SIGN_IDENTITY`) and notarization (`SWIFTVCS_NOTARY_PROFILE`).
+- **Preview vs. Formal Release (SV-09)**: `v<version>-<shortSHA>` (e.g. `v1.0.0-c4bfaef`) prerelease artifacts published from `main` are ad-hoc signed, unnotarized preview builds accompanied by `SHA256SUMS` and `build-info.txt`; formal semantic releases (`vX.Y.Z`) require Apple Developer ID signing (`SWIFTVCS_SIGN_IDENTITY`) and notarization (`SWIFTVCS_NOTARY_PROFILE`).
 - **Build Reproducibility & Dependency Baseline (SV-08)**: Verified against `subversion 1.15.0` (`serf 1.3.10`), `apr 1.7.6`, `apr-util 1.6.6`, `openssl@3 3.5.9`, `sqlite 3.54.1`, `utf8proc 2.12.0`, and `lz4 1.10.0`. Because Apple's linker hashes `.o` modification timestamps (`N_OSO` stabs) into `LC_UUID` and `codesign` derives a corresponding `LC_CODE_SIGNATURE` CDHash, two clean builds will differ in `LC_UUID` and signature bytes; use the per-build `SHA256SUMS` and `build-info.txt` to verify artifact integrity.
 
 ---
