@@ -14,11 +14,35 @@ fail() {
 sha256sum --check --strict SHA256SUMS
 grep -Fxq "Commit: $sha" build-info.txt
 
-version="$(awk -F': ' '/^Version: /{print $2; exit}' build-info.txt)"
-version="${version:-${SWIFTVCS_VERSION:-1.0.0}}"
-[[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "Invalid version: $version"
 short_sha="${sha:0:7}"
-tag="v${version}-${short_sha}"
+all_releases="$(gh api "$repo/releases" --paginate --slurp | jq -c 'flatten')"
+existing_tag="$(jq -r --arg s "-$short_sha" 'map(select(.tag_name | endswith($s))) | first | .tag_name // empty' <<< "$all_releases")"
+
+if [[ -n "$existing_tag" ]]; then
+    tag="$existing_tag"
+    version="${tag#v}"
+    version="${version%-"$short_sha"}"
+else
+    version="$(awk -F': ' '/^Version: /{print $2; exit}' build-info.txt)"
+    if [[ -z "$version" ]] && git rev-parse --verify "47190efc07355e2112affe494d0c23efe5dc8dd8^{commit}" >/dev/null 2>&1; then
+        patch_count="$(git rev-list --count 47190efc07355e2112affe494d0c23efe5dc8dd8.."$sha")"
+        version="1.0.${patch_count}"
+    fi
+    max_remote_patch="$(jq -r '
+        [ .[].tag_name | capture("^v1\\.0\\.(?<p>[0-9]+)-") | .p | tonumber ] | max // -1
+    ' <<< "$all_releases")"
+    next_remote_patch="$((max_remote_patch + 1))"
+    if [[ "$version" =~ ^1\.0\.([0-9]+)$ ]]; then
+        local_patch="${BASH_REMATCH[1]}"
+        if (( local_patch < next_remote_patch )); then
+            version="1.0.${next_remote_patch}"
+        fi
+    elif [[ -z "$version" ]]; then
+        version="1.0.${next_remote_patch}"
+    fi
+    [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "Invalid version: $version"
+    tag="v${version}-${short_sha}"
+fi
 ref="refs/tags/$tag"
 
 commit_subject="$(git log -1 --format=%s "$sha" 2>/dev/null || true)"
@@ -40,9 +64,8 @@ tag_commit() {
 }
 
 # A draft reserves its tag name even when it is absent from the public Releases list.
-release=$(gh api "$repo/releases" --paginate --slurp |
-    jq -c --arg tag "$tag" 'flatten | map(select(.tag_name == $tag)) |
-        if length > 1 then error("Multiple releases for tag") else first // null end')
+release=$(jq -c --arg tag "$tag" 'map(select(.tag_name == $tag)) |
+    if length > 1 then error("Multiple releases for tag") else first // null end' <<< "$all_releases")
 current_tag=$(tag_commit)
 if [[ -z "$current_tag" && "$release" == null ]]; then
     gh api "$repo/git/refs" -f ref="$ref" -f sha="$sha" --silent

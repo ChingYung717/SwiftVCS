@@ -7,7 +7,17 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HERE/dist}"
 APP="$OUT/VCSExplorer.app"
 NAME="VCSExplorer"
-VERSION="${SWIFTVCS_VERSION:-1.0.0}"
+if [ -n "${SWIFTVCS_VERSION:-}" ]; then
+    VERSION="$SWIFTVCS_VERSION"
+    BUILD_NUMBER="${SWIFTVCS_BUILD_NUMBER:-1}"
+elif git -C "$HERE" rev-parse --verify "47190efc07355e2112affe494d0c23efe5dc8dd8^{commit}" >/dev/null 2>&1; then
+    PATCH_COUNT="$(git -C "$HERE" rev-list --count 47190efc07355e2112affe494d0c23efe5dc8dd8..HEAD)"
+    VERSION="1.0.${PATCH_COUNT}"
+    BUILD_NUMBER="$((PATCH_COUNT + 1))"
+else
+    VERSION="1.0.0"
+    BUILD_NUMBER="1"
+fi
 SIGN_IDENTITY="${SWIFTVCS_SIGN_IDENTITY:--}"
 NOTARY_PROFILE="${SWIFTVCS_NOTARY_PROFILE:-}"
 source "$HERE/scripts/svn_build_env.sh"
@@ -130,7 +140,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
     <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>SwiftVCS</string>
