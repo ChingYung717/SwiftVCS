@@ -60,6 +60,6 @@ Thank you for your interest in contributing to **SwiftVCS & VCS Explorer**!
 
 ## 预发布 / Preview releases
 
-推送到 `main` 后，CI 先运行测试并验证 macOS arm64 安装包，再将此次推送的分支头发布为 `build-<完整提交 SHA>` 预发布版本。Release 提供 `VCSExplorer-arm64.zip`、校验和 `SHA256SUMS`、包含最低 macOS 版本的 `build-info.txt`，以及 GitHub 根据同一标签生成的源码 ZIP 和 tar.gz。安装包采用临时签名，供测试使用。
+推送到 `main` 后，CI 先运行测试并验证 macOS arm64 安装包，再将此次推送的分支头发布为 `v<版本号>-<7位短提交 SHA>`（例如 `v1.0.0-c4bfaef`）预发布版本，并在 Release 标题附带提交说明。Release 提供 `VCSExplorer-arm64.zip`、校验和 `SHA256SUMS`、包含版本号与最低 macOS 版本的 `build-info.txt`，以及 GitHub 根据同一标签生成的源码 ZIP 和 tar.gz。安装包采用临时签名，供测试使用。
 
-After each push to `main`, CI tests the branch tip and verifies the macOS arm64 package before publishing it as a `build-<full commit SHA>` prerelease. The release includes `VCSExplorer-arm64.zip`, `SHA256SUMS`, `build-info.txt` with the minimum macOS version, and GitHub's source archives for the same tag. The app is signed ad hoc for testing.
+After each push to `main`, CI tests the branch tip and verifies the macOS arm64 package before publishing it as a `v<version>-<short commit SHA>` (e.g. `v1.0.0-c4bfaef`) prerelease with the commit subject in the release title. The release includes `VCSExplorer-arm64.zip`, `SHA256SUMS`, `build-info.txt` with the version and minimum macOS version, and GitHub's source archives for the same tag. The app is signed ad hoc for testing.
