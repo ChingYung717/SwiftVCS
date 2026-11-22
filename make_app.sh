@@ -29,9 +29,13 @@ fi
 
 echo "==> 编译 release 版本"
 cd "$HERE"
-swift build -c release --product "$NAME"
+build_args=(-c release)
+if [ -n "${SWIFTVCS_SCRATCH_PATH:-}" ]; then
+    build_args+=(--scratch-path "$SWIFTVCS_SCRATCH_PATH")
+fi
+swift build "${build_args[@]}" --product "$NAME"
 
-BIN="$(swift build -c release --show-bin-path)/$NAME"
+BIN="$(swift build "${build_args[@]}" --show-bin-path)/$NAME"
 [ -f "$BIN" ] || { echo "找不到可执行文件: $BIN"; exit 1; }
 
 echo "==> 组装 $APP"
@@ -151,14 +155,22 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "==> 签名（${ARCH}，macOS ${MIN_MACOS}+）"
-sign_args=(--force --sign "$SIGN_IDENTITY")
 if [ "$SIGN_IDENTITY" != "-" ]; then
-    sign_args+=(--options runtime --timestamp)
+    sign_args=(--force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+    for dylib in "$APP/Contents/Frameworks/"*.dylib; do
+        codesign "${sign_args[@]}" "$dylib"
+    done
+    codesign "${sign_args[@]}" "$APP"
+else
+    # Ad-hoc 预览包过渡方案：开启 Hardened Runtime（阻断 DYLD_INSERT_LIBRARIES 与调试附加），
+    # 并仅附带 disable-library-validation entitlement 以兼容内置 22 个无 Team ID 的 @rpath dylib。
+    PREVIEW_ENTITLEMENTS="$HERE/scripts/preview-adhoc.entitlements"
+    [ -f "$PREVIEW_ENTITLEMENTS" ] || { echo "缺少预览包 entitlements 文件: $PREVIEW_ENTITLEMENTS" >&2; exit 1; }
+    for dylib in "$APP/Contents/Frameworks/"*.dylib; do
+        codesign --force --sign - "$dylib"
+    done
+    codesign --force --sign - --options runtime --entitlements "$PREVIEW_ENTITLEMENTS" "$APP"
 fi
-for dylib in "$APP/Contents/Frameworks/"*.dylib; do
-    codesign "${sign_args[@]}" "$dylib"
-done
-codesign "${sign_args[@]}" "$APP"
 codesign --verify --deep --strict --verbose=1 "$APP"
 
 ZIP_OUT="$OUT/VCSExplorer-$ARCH.zip"

@@ -300,13 +300,18 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return h
     }
 
-    /// 把仓库内相对路径拼成完整 URL（逐段追加，避免無尾斜杠时覆盖最后一段路径，并正确处理中文/空格编码）。
+    /// 把仓库内相对路径拼成完整 URL（逐段追加，避免无尾斜杠时覆盖最后一段路径，并拒绝 `..`/`.`/NUL 越界段）。
     private func url(for path: String?) throws -> URL {
         guard let base = baseURL else { throw VCSError.underlying("尚未连接仓库") }
         guard let path, !path.isEmpty else { return base }
+        guard !path.contains("\0") else { throw VCSError.invalidArgument("仓库路径包含非法字符") }
         var result = base
-        for component in path.split(separator: "/") where !component.isEmpty {
-            result = result.appendingPathComponent(String(component))
+        for rawComp in path.split(separator: "/") where !rawComp.isEmpty {
+            let component = String(rawComp)
+            guard component != ".", component != ".." else {
+                throw VCSError.invalidArgument("仓库路径不允许包含 . 或 ..")
+            }
+            result = result.appendingPathComponent(component)
         }
         return result
     }
@@ -485,6 +490,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     csvn_context_destroy(handle)
                 }
                 self.rememberedConnection = nil
+                self.scopedCredentials = ScopedCredentials(url: nil, username: nil, password: nil, realm: nil)
                 self.baseURL = nil
                 self.rootURL = nil
                 cont.resume()
@@ -2131,18 +2137,32 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 Self.workingCopyURL(at: workingCopy) != nil
             let target: String
             if !isWorkingCopyDir, workingCopy.scheme != nil {
-                guard (workingCopy.isFileURL && workingCopy.user == nil && workingCopy.password == nil) ||
+                guard (workingCopy.isFileURL && workingCopy.user == nil && workingCopy.password == nil
+                       && (workingCopy.host?.isEmpty ?? true)) ||
                       SVNOrigin(workingCopy) != nil else {
                     throw VCSError.invalidArgument("请通过独立参数传递凭据")
                 }
                 var u = workingCopy
                 if let path, !path.isEmpty {
-                    for comp in path.split(separator: "/") where !comp.isEmpty {
-                        u = u.appendingPathComponent(String(comp))
+                    guard !path.contains("\0") else {
+                        throw VCSError.invalidArgument("仓库路径包含非法字符")
+                    }
+                    for rawComp in path.split(separator: "/") where !rawComp.isEmpty {
+                        let comp = String(rawComp)
+                        guard comp != ".", comp != ".." else {
+                            throw VCSError.invalidArgument("仓库路径不允许包含 . 或 ..")
+                        }
+                        u = u.appendingPathComponent(comp)
                     }
                 }
                 target = u.absoluteString
             } else {
+                if let path, !path.isEmpty {
+                    guard !path.contains("\0"), !path.hasPrefix("/"),
+                          !path.split(separator: "/").contains("..") else {
+                        throw VCSError.invalidArgument("工作副本路径不允许包含非法越界段")
+                    }
+                }
                 target = path.map { self.localPath(workingCopy, $0) } ?? workingCopy.path
             }
             let rc: Int32 = target.withCString { p in

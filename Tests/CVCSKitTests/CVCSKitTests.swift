@@ -1695,6 +1695,29 @@ struct CVCSKitTests {
         let afterCancel = try await client.diffRevision(2, path: nil, maxBytes: 4096)
         expect(!afterCancel.isEmpty)
 
+        // 8b. Audit Round 2 checks: URL/origin leading '-' & file:// host validation, remote '..' rejection
+        expect(SVNOrigin(URL(string: "https://-evil.example.com/repo")!) == nil)
+        expect(SVNOrigin(URL(string: "svn+ssh://-oProxyCommand=id@svn.example.com/repo")!) == nil)
+        expect(SVNURLSanitizer.sanitizeForPersistence("file://evil.host/repo") == nil)
+        expect(SVNURLSanitizer.sanitizeForPersistence("svn+ssh://-baduser@svn.example.com/repo") == nil)
+        expect(SVNURLSanitizer.sanitizeForPersistence("https://-badhost.example.com/repo") == nil)
+
+        var dotdotBrowseRejected = false
+        do {
+            _ = try await client.browse(path: "../secret")
+        } catch {
+            dotdotBrowseRejected = true
+        }
+        expect(dotdotBrowseRejected)
+
+        var dotdotLogRejected = false
+        do {
+            _ = try await client.log(workingCopy: URL(fileURLWithPath: repo.path), path: "../secret", limit: 1, startRevision: nil)
+        } catch {
+            dotdotLogRejected = true
+        }
+        expect(dotdotLogRejected)
+
         // 9. Verify no /tmp/csvn-*diff* or /tmp/csvn-err-* temporary files were leaked
         let tmpEntries = (try? fm.contentsOfDirectory(atPath: "/tmp")) ?? []
         let leaked = tmpEntries.filter {

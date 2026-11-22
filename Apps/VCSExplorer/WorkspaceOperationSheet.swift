@@ -152,8 +152,8 @@ struct ConflictActions: View {
     var body: some View {
         Menu("解决冲突") {
             if !status.resolutions.isEmpty {
-                Button("打开工作文件…") { model.openConflictFile(status) }
-                    .help("用默认编辑器打开工作文件")
+                Button("以文本编辑器打开工作文件…") { model.openConflictFile(status) }
+                    .help("以纯文本编辑器打开工作文件（不执行脚本或可执行文件）")
                 ForEach(ConflictResolution.allCases, id: \.self) { strategy in
                     Button(strategy.displayName) {
                         model.requestWorkspaceOperation(.resolve(strategy), path: status.path)

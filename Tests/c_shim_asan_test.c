@@ -290,6 +290,77 @@ static void test_error_redaction_in_place(void)
              "Peg revision URL https://svn.example.com:8443/repo/file.txt@123 failed");
     csvn_redact_credentials_in_place(msg);
     assert(strstr(msg, "https://svn.example.com:8443/repo/file.txt@123") != NULL);
+
+    snprintf(msg, sizeof(msg),
+             "Redirect failed (https://alice:top/secret@localhost:8443/repo), retry");
+    csvn_redact_credentials_in_place(msg);
+    assert(strstr(msg, "top/secret") == NULL);
+    assert(strstr(msg, "(https://<redacted>@localhost:8443/repo), retry") != NULL);
+}
+
+static void test_audit_round2_c_boundaries(const char *wc_path)
+{
+    char errbuf[256];
+
+    /* 1. csvn_free_merge_result(NULL) must be a safe no-op */
+    csvn_free_merge_result(NULL);
+
+    /* 2. ca_path containing ';' or wildcard host must be rejected at context creation */
+    memset(errbuf, 0, sizeof(errbuf));
+    csvn_ctx *bad_ca = csvn_context_create(NULL, NULL, NULL,
+                                           "https://127.0.0.1:443", NULL,
+                                           NULL, "/tmp/a.pem;/tmp/b.pem", "127.0.0.1",
+                                           errbuf, (int)sizeof(errbuf));
+    assert(bad_ca == NULL);
+
+    memset(errbuf, 0, sizeof(errbuf));
+    csvn_ctx *bad_host = csvn_context_create(NULL, NULL, NULL,
+                                             "https://127.0.0.1:443", NULL,
+                                             NULL, "/tmp/a.pem", "*.example.com",
+                                             errbuf, (int)sizeof(errbuf));
+    assert(bad_host == NULL);
+
+    /* 3. Safe URI canonicalization rejects malformed/empty URLs cleanly without abort() */
+    csvn_ctx *ctx = csvn_context_create(NULL, NULL, NULL,
+                                        NULL, NULL, NULL, NULL, NULL,
+                                        errbuf, (int)sizeof(errbuf));
+    assert(ctx != NULL);
+    csvn_entry *entries = NULL;
+    int entry_count = 0;
+    assert(csvn_list(ctx, "", &entries, &entry_count) != 0);
+    assert(csvn_list(ctx, "http://[::1", &entries, &entry_count) != 0);
+
+    /* 4. csvn_validate_write_targets rejects unversioned dir containing nested .svn or symlink */
+    char dir_path[1024];
+    char nested_svn[1024];
+    char nested_link[1024];
+    snprintf(dir_path, sizeof(dir_path), "%s/unver_nested_svn", wc_path);
+    snprintf(nested_svn, sizeof(nested_svn), "%s/.svn", dir_path);
+    assert(mkdir(dir_path, 0700) == 0);
+    assert(mkdir(nested_svn, 0700) == 0);
+    const char *t1[1] = { dir_path };
+    assert(csvn_validate_write_targets(ctx, wc_path, t1, 1, 0, 1) != 0);
+    assert(rmdir(nested_svn) == 0);
+    assert(rmdir(dir_path) == 0);
+
+    snprintf(dir_path, sizeof(dir_path), "%s/unver_nested_link", wc_path);
+    snprintf(nested_link, sizeof(nested_link), "%s/lnk", dir_path);
+    assert(mkdir(dir_path, 0700) == 0);
+    assert(symlink("/etc/hosts", nested_link) == 0);
+    const char *t2[1] = { dir_path };
+    assert(csvn_validate_write_targets(ctx, wc_path, t2, 1, 0, 1) != 0);
+    assert(unlink(nested_link) == 0);
+    assert(rmdir(dir_path) == 0);
+
+    /* 5. csvn_wc_property_snapshot handles non-canonical path with trailing slash cleanly */
+    char noncanon[1024];
+    snprintf(noncanon, sizeof(noncanon), "%s/.", wc_path);
+    csvn_property *props = NULL;
+    int prop_count = 0;
+    assert(csvn_wc_property_snapshot(ctx, noncanon, 0, 0, &props, &prop_count) == 0);
+    csvn_free_properties(props, prop_count);
+
+    csvn_context_destroy(ctx);
 }
 
 int main(int argc, char **argv)
@@ -299,6 +370,7 @@ int main(int argc, char **argv)
     test_connect_and_output_pointer_contracts(argv[1], argv[2]);
     test_diff_stream_bounds_and_oversized_index();
     test_error_redaction_in_place();
+    test_audit_round2_c_boundaries(argv[2]);
     printf("C shim ASAN/UBSAN checks passed\n");
     return 0;
 }

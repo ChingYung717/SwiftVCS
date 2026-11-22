@@ -1,6 +1,7 @@
 import AppKit
 import CVCSKit
 import CSVNKit
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -928,9 +929,6 @@ final class AppModel: ObservableObject {
         if let i = args.firstIndex(of: "--user"), i + 1 < args.count {
             username = args[i + 1]
         }
-        if let i = args.firstIndex(of: "--password"), i + 1 < args.count {
-            password = args[i + 1]
-        }
         if let i = args.firstIndex(of: "--wc"), i + 1 < args.count {
             workingCopyPath = args[i + 1]
         }
@@ -1024,7 +1022,12 @@ final class AppModel: ObservableObject {
         diffTask?.cancel()
         workingDiffTask?.cancel()
         previewTask?.cancel()
+        let oldClient = client
         client = nil
+        if let oldClient {
+            oldClient.requestCancel()
+            Task { await oldClient.disconnect() }
+        }
         password = ""
         pendingProbedCertificate = nil
         repoInfo = nil
@@ -1145,7 +1148,7 @@ final class AppModel: ObservableObject {
             } catch {
                 guard !Task.isCancelled, self.selectedEntry?.path == entry.path else { return }
                 let msg = (error as? VCSError)?.errorDescription ?? "\(error)"
-                self.errorText = msg
+                self.errorText = SVNURLSanitizer.redactCredentials(inMessage: msg)
             }
         }
     }
@@ -1243,17 +1246,30 @@ final class AppModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "检出到此目录"
         if panel.runModal() == .OK, let folder = panel.url {
-            let subName: String
+            let rawSubName: String
             if let e = entry, e.kind == .directory {
-                subName = e.name
+                rawSubName = e.name
             } else if !currentPath.isEmpty {
-                subName = currentPath.split(separator: "/").last.map(String.init) ?? "working-copy"
+                rawSubName = currentPath.split(separator: "/").last.map(String.init) ?? "working-copy"
             } else if let repoLast = URL(string: normalizedRepoURL(repoURLString))?.lastPathComponent, !repoLast.isEmpty {
-                subName = repoLast
+                rawSubName = repoLast
             } else {
-                subName = "working-copy"
+                rawSubName = "working-copy"
             }
-            let dest = folder.appendingPathComponent(subName)
+            let trimmedSub = rawSubName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isSafeSubName = !trimmedSub.isEmpty
+                && trimmedSub != "."
+                && trimmedSub != ".."
+                && !trimmedSub.contains("/")
+                && !trimmedSub.contains("\\")
+                && !trimmedSub.contains("\0")
+            let subName = isSafeSubName ? trimmedSub : "working-copy"
+            let dest = folder.appendingPathComponent(subName).standardizedFileURL
+            let folderStd = folder.standardizedFileURL.path
+            guard dest.path.hasPrefix(folderStd + "/") else {
+                errorText = "检出目标子目录不合法"
+                return
+            }
             run {
                 let url = try await self.checkoutCore(entry: entry, destination: dest)
                 self.sidebarTab = .changes
@@ -1315,25 +1331,51 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // 未纳入版本控制的新文件：在后台任务中检查大小（超过 2 MB 直接按二进制/大文件处理）并读取本地文件内容合成新增预览
+        // 未纳入版本控制的新文件：禁止跟随符号链接并做有界分块读取（超过 2 MB 直接按二进制/大文件处理）
         if status.kind == .unversioned {
-            let fileURL = URL(fileURLWithPath: workingCopyPath).appendingPathComponent(status.path)
+            let wcRootURL = URL(fileURLWithPath: workingCopyPath).standardizedFileURL
+            let fileURL = wcRootURL.appendingPathComponent(status.path).standardizedFileURL
             let statusPath = status.path
+            guard !statusPath.isEmpty,
+                  !statusPath.contains("\0"),
+                  !statusPath.hasPrefix("/"),
+                  !statusPath.split(separator: "/").contains(".."),
+                  fileURL.path.hasPrefix(wcRootURL.path + "/") else {
+                workingDiffState = .idle
+                return
+            }
             workingDiffState = .loading
             workingDiffTask = Task { [weak self] in
                 guard let self else { return }
                 let loadedState: FileDiffLoadState = await Task.detached(priority: .userInitiated) {
-                    let maxPreviewBytes: Int64 = 2 * 1024 * 1024
-                    if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                       let fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? (attrs[.size] as? Int64),
-                       fileSize > maxPreviewBytes {
-                        return .binary(path: statusPath, size: fileSize)
+                    let maxPreviewBytes = 2 * 1024 * 1024
+                    let fd = Darwin.open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+                    guard fd >= 0 else { return .idle }
+                    defer { Darwin.close(fd) }
+
+                    var st = stat()
+                    guard Darwin.fstat(fd, &st) == 0 else { return .idle }
+                    guard (st.st_mode & S_IFMT) == S_IFREG else {
+                        return .binary(path: statusPath, size: nil)
                     }
-                    guard let data = try? Data(contentsOf: fileURL) else {
-                        return .idle
+                    if Int64(st.st_size) > Int64(maxPreviewBytes) {
+                        return .binary(path: statusPath, size: Int64(st.st_size))
                     }
-                    if Int64(data.count) > maxPreviewBytes || SVNClient.looksBinaryData(data) {
-                        return .binary(path: statusPath, size: Int64(data.count))
+
+                    var data = Data()
+                    data.reserveCapacity(min(Int(st.st_size), maxPreviewBytes))
+                    var buffer = [UInt8](repeating: 0, count: 16_384)
+                    while data.count <= maxPreviewBytes {
+                        let toRead = min(buffer.count, (maxPreviewBytes + 1) - data.count)
+                        let n = Darwin.read(fd, &buffer, toRead)
+                        if n > 0 {
+                            data.append(contentsOf: buffer[..<n])
+                        } else {
+                            break
+                        }
+                    }
+                    if data.count > maxPreviewBytes || SVNClient.looksBinaryData(data) {
+                        return .binary(path: statusPath, size: Int64(st.st_size))
                     }
                     guard let text = SVNClient.decodeText(data) else {
                         return .binary(path: statusPath, size: Int64(data.count))
@@ -1392,7 +1434,7 @@ final class AppModel: ObservableObject {
             } catch {
                 guard !Task.isCancelled, self.selectedStatus?.path == status.path else { return }
                 let msg = (error as? VCSError)?.errorDescription ?? "\(error)"
-                self.workingDiffState = .failed(msg)
+                self.workingDiffState = .failed(SVNURLSanitizer.redactCredentials(inMessage: msg))
             }
         }
     }
@@ -1453,7 +1495,7 @@ final class AppModel: ObservableObject {
                     return
                 }
                 let msg = (error as? VCSError)?.errorDescription ?? "\(error)"
-                self.errorText = msg
+                self.errorText = SVNURLSanitizer.redactCredentials(inMessage: msg)
             }
         }
     }
@@ -1578,7 +1620,7 @@ final class AppModel: ObservableObject {
                 let detail = try await body()
                 checks.append(SelfTestCheck(name: name, passed: true, detail: detail))
             } catch {
-                checks.append(SelfTestCheck(name: name, passed: false, detail: String(describing: error)))
+                checks.append(SelfTestCheck(name: name, passed: false, detail: SVNURLSanitizer.redactCredentials(inMessage: String(describing: error))))
             }
         }
 
@@ -1918,8 +1960,42 @@ extension AppModel {
     }
 
     func openConflictFile(_ status: WorkingCopyStatus) {
-        guard !status.resolutions.isEmpty else { return }
-        let url = URL(fileURLWithPath: workingCopyPath).appendingPathComponent(status.path)
-        if !NSWorkspace.shared.open(url) { errorText = "无法打开工作文件" }
+        guard !status.resolutions.isEmpty, !workingCopyPath.isEmpty else { return }
+        guard !status.path.isEmpty,
+              !status.path.contains("\0"),
+              !status.path.hasPrefix("/"),
+              !status.path.split(separator: "/").contains("..") else {
+            errorText = "冲突文件路径不合法"
+            return
+        }
+        let wcRoot = URL(fileURLWithPath: workingCopyPath).standardizedFileURL
+        let url = wcRoot.appendingPathComponent(status.path).standardizedFileURL
+        guard url.path.hasPrefix(wcRoot.path + "/") else {
+            errorText = "冲突文件超出当前工作副本范围"
+            return
+        }
+        var st = stat()
+        guard Darwin.lstat(url.path, &st) == 0 else {
+            errorText = "找不到冲突工作文件"
+            return
+        }
+        // 拒绝直接通过 LaunchServices 打开可执行脚本/包/符号链接；普通文件显式以纯文本编辑器打开，否则仅在 Finder 中定位。
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            return
+        }
+        let textEditURL = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        if FileManager.default.fileExists(atPath: textEditURL.path) {
+            let config = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open([url], withApplicationAt: textEditURL, configuration: config) { [weak self] _, err in
+                if err != nil {
+                    DispatchQueue.main.async {
+                        self?.errorText = "无法以文本编辑器打开工作文件"
+                    }
+                }
+            }
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
     }
 }

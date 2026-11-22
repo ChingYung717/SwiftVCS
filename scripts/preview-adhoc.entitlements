@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Interim entitlement for ad-hoc CI preview builds ONLY: allows loading the 22 bundled
+         @rpath Homebrew dylibs under Hardened Runtime without a shared Team ID, while still
+         blocking DYLD_INSERT_LIBRARIES and debugger attachment. Removed automatically when
+         signing with a Developer ID / Apple Development identity. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

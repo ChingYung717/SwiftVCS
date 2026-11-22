@@ -9,9 +9,17 @@ public struct SVNOrigin: Hashable, Sendable {
     public let port: Int
 
     public init?(_ url: URL) {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host,
-              !host.isEmpty, !host.contains("/"), url.password == nil,
+        guard let scheme = url.scheme?.lowercased(), let rawHost = url.host,
+              !rawHost.isEmpty, !rawHost.contains("/"), !rawHost.contains("\0"),
+              url.password == nil,
               url.user == nil || scheme == "svn+ssh" else { return nil }
+        let cleanHost = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        guard !cleanHost.isEmpty, !cleanHost.hasPrefix("-"),
+              cleanHost.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              cleanHost.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
+        if let user = url.user {
+            guard !user.isEmpty, !user.hasPrefix("-"), !user.contains("\0") else { return nil }
+        }
         let defaultPort: Int
         switch scheme {
         case "https": defaultPort = 443
@@ -23,7 +31,7 @@ public struct SVNOrigin: Hashable, Sendable {
         let port = url.port ?? defaultPort
         guard (1...65535).contains(port) else { return nil }
         self.scheme = scheme
-        self.host = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        self.host = cleanHost
         self.port = port
     }
 
@@ -162,12 +170,15 @@ public final class TrustStore: Sendable {
     }
 
     public func removeCertificate(name: String) throws {
-        guard name == URL(fileURLWithPath: name).lastPathComponent, !name.isEmpty else {
+        guard name == URL(fileURLWithPath: name).lastPathComponent,
+              !name.isEmpty, !name.contains("\0"), name != ".", name != ".." else {
             throw TrustStoreError.notACertificate
         }
-        let dest = certsDir.appendingPathComponent("\(name).crt")
-        if FileManager.default.fileExists(atPath: dest.path) {
-            try FileManager.default.removeItem(at: dest)
+        for ext in ["crt", "pem"] {
+            let dest = certsDir.appendingPathComponent("\(name).\(ext)")
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
         }
     }
 
@@ -186,7 +197,13 @@ public final class TrustStore: Sendable {
 
     /// 预抓取服务器证书并提取主体摘要与 SHA-256 指纹，但不写入信任库（供界面展示指纹并由用户确认后再信任）。
     public func probeCertificate(host: String, port: Int = 443) throws -> ProbedCertificate {
-        guard !host.isEmpty, !host.hasPrefix("-"), (1...65535).contains(port) else {
+        guard !host.isEmpty,
+              !host.hasPrefix("-"),
+              !host.contains("\0"),
+              !host.contains("/"),
+              host.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              host.rangeOfCharacter(from: .controlCharacters) == nil,
+              (1...65535).contains(port) else {
             throw TrustStoreError.cannotFetchCertificate
         }
         let address = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
@@ -217,7 +234,7 @@ public final class TrustStore: Sendable {
     }
 
     @discardableResult
-    private func runOpenssl(_ args: [String]) throws -> String {
+    private func runOpenssl(_ args: [String], maxOutputBytes: Int = 256 * 1024) throws -> String {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
         task.arguments = args
@@ -232,9 +249,31 @@ public final class TrustStore: Sendable {
             if task.isRunning { task.terminate() }
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: timeoutWork)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        // 有界分块读取，防止恶意 TLS 服务端持续灌入数据造成 OOM。
+        let reader = pipe.fileHandleForReading
+        var data = Data()
+        var exceeded = false
+        while true {
+            let chunk = (try? reader.read(upToCount: 16_384)) ?? Data()
+            if chunk.isEmpty { break }
+            let remaining = maxOutputBytes - data.count
+            if chunk.count > remaining {
+                if remaining > 0 {
+                    data.append(chunk.prefix(remaining))
+                }
+                exceeded = true
+                if task.isRunning { task.terminate() }
+                break
+            }
+            data.append(chunk)
+        }
+        try? reader.close()
         task.waitUntilExit()
         timeoutWork.cancel()
+        if exceeded && data.isEmpty {
+            throw TrustStoreError.cannotFetchCertificate
+        }
         return String(decoding: data, as: UTF8.self)
     }
 }
@@ -418,7 +457,8 @@ public enum SVNURLSanitizer {
             }
             components.percentEncodedPath = path
             guard let url = components.url, url.isFileURL,
-                  url.user == nil, url.password == nil else {
+                  url.user == nil, url.password == nil,
+                  (url.host?.isEmpty ?? true) else {
                 return nil
             }
             return url.absoluteString
@@ -429,6 +469,7 @@ public enum SVNURLSanitizer {
             if scheme == "svn+ssh" {
                 if let user = components.user {
                     if user.isEmpty ||
+                       user.hasPrefix("-") ||
                        user.contains(":") ||
                        user.contains("@") ||
                        user.contains("/") ||
@@ -441,6 +482,9 @@ public enum SVNURLSanitizer {
                 }
             } else {
                 components.percentEncodedUser = nil
+            }
+            if let host = components.host, host.hasPrefix("-") {
+                return nil
             }
 
             // 校验去除 userinfo 后的原始主机写法（非 IPv6 字面量不得含额外冒号）

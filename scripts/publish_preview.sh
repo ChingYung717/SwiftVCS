@@ -98,9 +98,10 @@ if [[ "$(jq -r '.draft' <<< "$release")" == true ]]; then
                 continue
             fi
         fi
-        curl --fail-with-body --silent --show-error \
-            --header "Authorization: Bearer ${GH_TOKEN:?}" --header "Content-Type: application/octet-stream" \
-            --data-binary "@$asset" "$upload_url?name=$asset" |
+        printf 'header = "Authorization: Bearer %s"\n' "${GH_TOKEN:?}" |
+            curl --config - --fail-with-body --silent --show-error \
+                --header "Content-Type: application/octet-stream" \
+                --data-binary "@$asset" "$upload_url?name=$asset" |
             jq -e --arg digest "$expected" '.state == "uploaded" and .digest == $digest' > /dev/null
     done
     [[ "$(tag_commit)" == "$sha" ]] || fail "Tag changed during upload"

@@ -257,6 +257,74 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
         )
         assert both_res.returncode != 0 and not hits, (both_res.stderr, hits)
 
+    # S-01: --ca MUST be scoped strictly to the target host (never [global]);
+    # an HTTP 301 redirect from 127.0.0.1 to localhost must NOT trust the same private CA on localhost.
+    localhost_conf = root / "localhost-ops.cnf"
+    localhost_conf.write_text(
+        "[ca]\ndefault_ca=myca\n"
+        "[myca]\n"
+        f"new_certs_dir={ca_dir}\ndatabase={ca_dir / 'index.txt'}\nserial={ca_dir / 'serial'}\n"
+        "default_md=sha256\npolicy=pol\nx509_extensions=v3_leaf\n"
+        "[pol]\ncommonName=supplied\n"
+        "[req]\ndistinguished_name=dn\nprompt=no\n"
+        "[dn]\nCN=localhost\n"
+        "[v3_leaf]\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n"
+    )
+    lh_cert, lh_key, lh_csr = root / "localhost.crt", root / "localhost.key", root / "localhost.csr"
+    subprocess.run(
+        ["/usr/bin/openssl", "req", "-newkey", "rsa:2048", "-nodes",
+         "-config", str(localhost_conf), "-keyout", str(lh_key), "-out", str(lh_csr)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["/usr/bin/openssl", "ca", "-batch", "-notext", "-config", str(localhost_conf),
+         "-cert", str(ca_cert), "-keyfile", str(ca_key),
+         "-in", str(lh_csr), "-out", str(lh_cert), "-days", "1"],
+        check=True, capture_output=True,
+    )
+    with endpoint(lh_cert, lh_key) as (lh_url, lh_hits):
+        target_loc = lh_url.replace("127.0.0.1", "localhost")
+        redir_hits = []
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def __getattr__(self, name):
+                if name.startswith("do_"):
+                    return self.reply
+                raise AttributeError(name)
+
+            def reply(self):
+                redir_hits.append(self.command)
+                self.send_response(301)
+                self.send_header("Location", target_loc)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        with ReusableThreadingHTTPServer((loopback, 0), RedirectHandler) as redir_srv:
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(leaf_cert, leaf_key)
+            redir_srv.socket = tls.wrap_socket(redir_srv.socket, server_side=True)
+            t = threading.Thread(target=redir_srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                redir_url = f"https://{loopback}:{redir_srv.server_port}/repo"
+                for subcmd in (["log", redir_url], ["proplist", redir_url]):
+                    redir_hits.clear()
+                    lh_hits.clear()
+                    res = subprocess.run(
+                        [binary, *subcmd, "--ca", str(ca_cert), "--user", user, "--password-stdin"],
+                        env=env, input=password + "\n", capture_output=True, text=True, timeout=25,
+                    )
+                    assert res.returncode != 0, (subcmd, res.stdout, res.stderr)
+                    assert redir_hits, (subcmd, "expected initial request to 127.0.0.1")
+                    assert not lh_hits, (subcmd, "private --ca leaked across 301 redirect to localhost!", lh_hits)
+            finally:
+                redir_srv.shutdown()
+                t.join()
+
     # A merge into a file:// working copy must reject an HTTP source before issuing requests.
     admin = shutil.which("svnadmin")
     svn = shutil.which("svn")

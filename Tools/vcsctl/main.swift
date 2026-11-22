@@ -90,7 +90,11 @@ func resolvePassword(_ args: Args) throws -> String? {
         }
         return line
     }
-    return args.string("password")
+    if let pw = args.string("password") {
+        FileHandle.standardError.write(Data("警告：--password 会暴露在进程参数中，建议改用 --password-stdin\n".utf8))
+        return pw
+    }
+    return nil
 }
 
 func printPropertyChanges(_ changes: [PropertyChange]) {
@@ -112,7 +116,9 @@ func printPropertyChanges(_ changes: [PropertyChange]) {
 
 func requireURL(_ raw: String) -> URL {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let url = URL(string: trimmed), (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+    guard let url = URL(string: trimmed),
+          (url.isFileURL && url.user == nil && url.password == nil && (url.host?.isEmpty ?? true))
+            || SVNOrigin(url) != nil else {
         die("非法的仓库 URL，请通过独立选项传递认证凭据")
     }
     return url
