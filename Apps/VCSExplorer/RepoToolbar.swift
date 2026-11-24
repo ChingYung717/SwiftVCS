@@ -179,8 +179,10 @@ struct RepoToolbar: View {
 
             // 右侧快捷状态与连接设置按钮
             HStack(spacing: 10) {
-                if let host = URL(string: model.repoURLString).flatMap(SVNOrigin.init)?.endpoint,
-                   model.trustedHosts.contains(host) {
+                if let origin = URL(string: model.repoURLString).flatMap(SVNOrigin.init),
+                   origin.scheme == "https",
+                   model.trustedHosts.contains(origin.endpoint) {
+                    let host = origin.endpoint
                     HStack(spacing: 5) {
                         Image(systemName: "checkmark.shield.fill")
                             .foregroundStyle(.green)
@@ -281,8 +283,10 @@ struct RepoToolbar: View {
                 model.showConnectSheet = true
             }
 
-            if let host = URL(string: model.repoURLString).flatMap(SVNOrigin.init)?.endpoint,
-               (!model.trustedHosts.contains(host) || model.certificateIssue != nil) {
+            if let origin = URL(string: model.repoURLString).flatMap(SVNOrigin.init),
+               origin.scheme == "https",
+               (!model.trustedHosts.contains(origin.endpoint) || model.certificateIssue != nil) {
+                let host = origin.endpoint
                 PopoverActionRow(icon: "checkmark.shield", iconColor: .orange, title: "信任 \(host) 证书并连接") {
                     model.showRepoPopover = false
                     model.trustServerCertificateAndConnect()

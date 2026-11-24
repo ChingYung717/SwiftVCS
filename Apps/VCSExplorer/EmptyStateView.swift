@@ -24,7 +24,10 @@ enum BundledImageLoader {
             return img
         }
 
-        // 开发态直接运行可执行文件时的本地回退路径（含当前目录与可执行文件上溯路径）
+        // 仅在开发态直接运行裸可执行文件时允许当前目录与父目录回退加载，打包为 .app 后禁止回退至外部目录。
+        guard Bundle.main.bundleURL.pathExtension.lowercased() != "app" else {
+            return nil
+        }
         var candidateRoots: [URL] = [
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         ]

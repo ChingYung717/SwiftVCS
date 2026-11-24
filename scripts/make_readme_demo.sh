@@ -16,13 +16,17 @@ else
     exit 1
 fi
 
-BASE="${1:-/tmp/swiftvcs-demo}"
+if [ $# -ge 1 ]; then
+    BASE="$1"
+else
+    BASE="$(mktemp -d "${TMPDIR:-/tmp}/swiftvcs-demo.XXXXXX")"
+fi
 if [ -z "$BASE" ] || [ -L "$BASE" ]; then
     echo "错误：输出目录不能为空或符号链接" >&2
     exit 1
 fi
 mkdir -p "$BASE"
-BASE="$(cd "$BASE" && pwd -P)"
+BASE="$(cd -P -- "$BASE" && pwd -P)"
 if [ "$BASE" = "/" ] || [ "$BASE" = "${HOME:-}" ]; then
     echo "错误：不能将根目录或用户主目录直接作为演示输出目录" >&2
     exit 1

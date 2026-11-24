@@ -256,7 +256,7 @@ struct DiffViewer<TrailingActions: View>: View {
         case .loaded(let diff, let isTruncated):
             if !diff.propertyChanges.isEmpty { propertyDiff(diff.propertyChanges) }
             if !diff.hunks.isEmpty, let notice = diff.statusNotice {
-                Text(notice).font(.caption).foregroundStyle(.secondary)
+                Text(verbatim: notice).font(.caption).foregroundStyle(.secondary)
             }
             if diff.isBinary || (diff.hunks.isEmpty && FileIcon.isKnownBinaryExtension(filePath)) {
                 binaryPlaceholderCard(path: filePath, size: nil)
@@ -282,9 +282,9 @@ struct DiffViewer<TrailingActions: View>: View {
                 Text("SVN 属性变更").font(.headline)
                 ForEach(changes) { change in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(change.name).font(.subheadline.bold())
-                        Text("− \(propertyValue(change.oldValue))").foregroundStyle(Theme.delFG)
-                        Text("+ \(propertyValue(change.newValue))").foregroundStyle(Theme.addFG)
+                        Text(verbatim: change.name).font(.subheadline.bold())
+                        Text(verbatim: "− \(propertyValue(change.oldValue))").foregroundStyle(Theme.delFG)
+                        Text(verbatim: "+ \(propertyValue(change.newValue))").foregroundStyle(Theme.addFG)
                     }
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)

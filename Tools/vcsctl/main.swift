@@ -1,5 +1,6 @@
 import CVCSKit
 import CSVNKit
+import Darwin
 import Foundation
 
 // MARK: - 极简参数解析
@@ -46,7 +47,7 @@ struct Args {
                         setFlag(rawKey, "")
                         i += 1
                     }
-                } else if ["dry-run", "exact", "raw", "inherited", "parents", "all", "remember", "password-stdin"].contains(rawKey) {
+                } else if ["dry-run", "exact", "raw", "inherited", "parents", "all", "remember", "password-stdin", "remote-base"].contains(rawKey) {
                     setFlag(rawKey, "true")
                     i += 1
                 } else if i + 1 < argv.count, !argv[i + 1].hasPrefix("-") {
@@ -74,9 +75,84 @@ func parseArgs(_ argv: [String]) -> Args {
 
 // MARK: - 输出
 
+func sanitizeTerminalControlChars(_ text: String) -> String {
+    var out = ""
+    out.reserveCapacity(text.count)
+    for scalar in text.unicodeScalars {
+        let v = scalar.value
+        if v == 0x0A || v == 0x09 {
+            out.unicodeScalars.append(scalar)
+        } else if v < 0x20 || v == 0x7F || (v >= 0x80 && v <= 0x9F) {
+            out += String(format: "\\x%02X", v)
+        } else if (v >= 0x202A && v <= 0x202E) ||
+                  (v >= 0x2066 && v <= 0x2069) ||
+                  v == 0x200E || v == 0x200F || v == 0x061C ||
+                  v == 0x2028 || v == 0x2029 {
+            out += String(format: "\\u{%04X}", v)
+        } else {
+            out.unicodeScalars.append(scalar)
+        }
+    }
+    return out
+}
+
+func readBoundedLocalFile(_ path: String, maxBytes: Int = 8 * 1024 * 1024) throws -> Data {
+    guard !path.isEmpty, !path.contains("\0") else {
+        throw VCSError.invalidArgument("文件路径不合法")
+    }
+    let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else {
+        let err = errno
+        if err == ELOOP {
+            throw VCSError.invalidArgument("不支持从符号链接读取属性值文件")
+        }
+        throw VCSError.invalidArgument("无法打开属性值文件（errno=\(err)）")
+    }
+    defer { Darwin.close(fd) }
+
+    var st = stat()
+    guard Darwin.fstat(fd, &st) == 0 else {
+        throw VCSError.invalidArgument("无法读取属性值文件元数据")
+    }
+    guard (st.st_mode & S_IFMT) == S_IFREG else {
+        throw VCSError.invalidArgument("属性值文件必须为常规文件")
+    }
+    guard st.st_size >= 0, st.st_size <= Int64(maxBytes) else {
+        throw VCSError.invalidArgument("属性值文件超出大小上限（最大 \(maxBytes / (1024 * 1024)) MiB）")
+    }
+
+    var data = Data()
+    data.reserveCapacity(min(Int(st.st_size), maxBytes))
+    var buffer = [UInt8](repeating: 0, count: 16_384)
+    while true {
+        let remaining = (maxBytes + 1) - data.count
+        let toRead = min(buffer.count, remaining)
+        let n = Darwin.read(fd, &buffer, toRead)
+        if n > 0 {
+            data.append(contentsOf: buffer[..<n])
+            if data.count > maxBytes {
+                throw VCSError.invalidArgument("属性值文件超出大小上限（最大 \(maxBytes / (1024 * 1024)) MiB）")
+            }
+        } else if n == 0 {
+            break
+        } else if errno == EINTR {
+            continue
+        } else {
+            throw VCSError.invalidArgument("读取属性值文件失败（errno=\(errno)）")
+        }
+    }
+    return data
+}
+
+func sanitizeForTerminal(_ text: String, fd: Int32) -> String {
+    guard isatty(fd) != 0 else { return text }
+    return sanitizeTerminalControlChars(text)
+}
+
 func die(_ message: String) -> Never {
     let redacted = SVNURLSanitizer.redactCredentials(inMessage: message)
-    FileHandle.standardError.write(Data(("错误：\(redacted)\n").utf8))
+    let safe = sanitizeForTerminal(redacted, fd: STDERR_FILENO)
+    FileHandle.standardError.write(Data(("错误：\(safe)\n").utf8))
     exit(1)
 }
 
@@ -117,14 +193,15 @@ func printPropertyChanges(_ changes: [PropertyChange]) {
 func requireURL(_ raw: String) -> URL {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let url = URL(string: trimmed),
-          (url.isFileURL && url.user == nil && url.password == nil && (url.host?.isEmpty ?? true))
-            || SVNOrigin(url) != nil else {
+          SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil else {
         die("非法的仓库 URL，请通过独立选项传递认证凭据")
     }
     return url
 }
 
-func out(_ s: String) { print(s) }
+func out(_ s: String) {
+    print(sanitizeForTerminal(s, fd: STDOUT_FILENO))
+}
 
 func makeClient(_ args: Args, url: String? = nil, workingCopyPath: String? = nil,
                 rememberBeforeOperation: Bool = true) async throws -> SVNClient {
@@ -132,13 +209,24 @@ func makeClient(_ args: Args, url: String? = nil, workingCopyPath: String? = nil
     if let url, url.contains("://") {
         repository = requireURL(url)
     } else if let wc = workingCopyPath ?? url {
-        repository = SVNClient.workingCopyURL(at: URL(fileURLWithPath: wc))
+        switch SVNClient.inspectWorkingCopyURL(at: URL(fileURLWithPath: wc)) {
+        case .valid(let wcURL):
+            repository = wcURL
+        case .invalidURL:
+            throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝继续操作")
+        case .unavailable:
+            repository = nil
+        }
     } else {
         repository = nil
     }
 
     if let host = args.string("server"), repository.flatMap(SVNOrigin.init)?.host != host.lowercased() {
         throw VCSError.invalidArgument("--server 必须与实际仓库的主机一致")
+    }
+
+    if args.string("trust-bundle") != nil && args.string("ca") != nil {
+        throw VCSError.invalidArgument("--trust-bundle 与 --ca 不能同时使用")
     }
 
     let password = try resolvePassword(args)
@@ -226,7 +314,7 @@ func nodeCommand(_ command: String, _ args: Args) async throws {
         if command == "propdel" {
             value = nil
         } else if let file {
-            value = try Data(contentsOf: URL(fileURLWithPath: file))
+            value = try readBoundedLocalFile(file)
         } else {
             value = Data(args.positional[2].utf8)
         }
@@ -266,7 +354,7 @@ guard let command = rawArgs.first else {
       vcsctl update    <工作副本目录>                同步到最新
       vcsctl status    <工作副本目录>                查看本地改动
       vcsctl add       <工作副本目录> [路径...]      将新文件纳入版本控制
-      vcsctl diff      <工作副本目录> [路径...]      查看差异
+      vcsctl diff      <工作副本目录> [路径...]      查看差异（默认严格离线；可用 --remote-base 允许远端替换基线查询）
       vcsctl commit    <工作副本目录> -m "说明"      提交
       vcsctl revert    <工作副本目录> [路径...]      回滚本地改动
       vcsctl log       <工作副本目录|URL> [路径]     查看提交日志
@@ -366,8 +454,11 @@ do {
         let repoURL = requireURL(urlString)
         let client = try await makeClient(args, url: urlString)
         _ = try await client.connect(to: repoURL, credentials: nil)
-        let data = try await client.cat(path: filePath, revision: args.int("revision") ?? args.int("r"))
-        FileHandle.standardOutput.write(data)
+        try await client.cat(
+            path: filePath,
+            revision: args.int("revision") ?? args.int("r"),
+            writingTo: STDOUT_FILENO
+        )
 
     case "checkout":
         guard args.positional.count >= 2 else { die("需要 <url> <本地目录> [子路径]") }
@@ -425,7 +516,11 @@ do {
         guard let wc = args.positional.first else { die("需要工作副本目录") }
         let client = try await makeClient(args, workingCopyPath: wc)
         let paths = Array(args.positional.dropFirst())
-        let diffs = try await client.diff(workingCopy: URL(fileURLWithPath: wc), paths: paths)
+        let diffs = try await client.diff(
+            workingCopy: URL(fileURLWithPath: wc),
+            paths: paths,
+            allowRemoteReplacedBase: args.bool("remote-base")
+        )
         if diffs.isEmpty { out("无差异。") }
         for d in diffs {
             out("=== \(d.path)  (+\(d.addedCount) -\(d.removedCount)) ===")

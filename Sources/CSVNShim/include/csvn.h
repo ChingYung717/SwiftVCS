@@ -120,6 +120,8 @@ int csvn_properties(csvn_ctx *ctx, const char *root, const char *path_or_url,
 void csvn_free_properties(csvn_property *items, int count);
 int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int replaced,
                               csvn_property **output, int *count);
+int csvn_wc_property_snapshot_ex(csvn_ctx *ctx, const char *path, int pristine, int replaced,
+                                 int allow_remote, csvn_property **output, int *count);
 int csvn_set_property(csvn_ctx *ctx, const char *root, const char *relative,
                       const char *name, const void *data, size_t length, int remove);
 int csvn_default_ignores(csvn_ctx *ctx, char ***output, int *count);
@@ -271,6 +273,12 @@ int csvn_wc_url(csvn_ctx *ctx,
                 char *out_url,
                 int out_url_len);
 
+/* 10b. 读取工作副本所关联的仓库根 URL（纯本地元数据，不发起任何网络请求） */
+int csvn_wc_repos_root(csvn_ctx *ctx,
+                       const char *wc_path,
+                       char *out_url,
+                       int out_url_len);
+
 /* 11. 将未版本控制的文件/目录纳入版本控制（svn add） */
 int csvn_add(csvn_ctx *ctx,
              const char *const *paths,
@@ -290,6 +298,14 @@ int csvn_cat_capped(csvn_ctx *ctx,
                     char **out_data,
                     long *out_len,
                     int *out_truncated);
+
+typedef int (*csvn_stream_write_cb)(void *baton, const char *data, size_t len);
+
+int csvn_cat_stream(csvn_ctx *ctx,
+                    const char *path_or_url,
+                    int revision,
+                    csvn_stream_write_cb write_cb,
+                    void *baton);
 
 /* ---- 访问器（避免 Swift 侧处理定长字符数组）---- */
 static inline const char *csvn_entry_path_p(const csvn_entry *e) { return e->path; }

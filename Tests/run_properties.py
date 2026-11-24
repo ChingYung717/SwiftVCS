@@ -115,6 +115,16 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-properties-") as temporary:
         assert svn("status", pending.parent).startswith(b"?")
     assert not svn("status", embedded)
 
+    # SV-V02: 对已版本化工作副本根目录或已版本化子目录执行递归 add 时，必须拦截未版本化符号链接与嵌套 .svn。
+    vcs("add", add_wc, ok=False)
+    assert svn("status", pending.parent).startswith(b"?")
+    ver_dir = add_wc / "parent"
+    ver_link = ver_dir / "unversioned_symlink"
+    ver_link.symlink_to(file)
+    vcs("add", add_wc, "parent", ok=False)
+    assert svn("status", ver_link).startswith(b"?")
+    ver_link.unlink()
+
     vcs("propset", wc, "project:history", "new", *at_file)
     assert vcs("propget", wc, "project:history", *at_file, "--revision", 1, "--raw").stdout == b"old"
     vcs("propset", wc, "svn:mergeinfo", "/trunk:1", *at_file, ok=False)

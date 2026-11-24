@@ -18,6 +18,14 @@ else
     VERSION="1.0.0"
     BUILD_NUMBER="1"
 fi
+if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*([-.][A-Za-z0-9.]+)?$ ]]; then
+    echo "错误：非法的版本号格式 SWIFTVCS_VERSION=$VERSION" >&2
+    exit 1
+fi
+if ! [[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "错误：非法的构建号格式 SWIFTVCS_BUILD_NUMBER=$BUILD_NUMBER" >&2
+    exit 1
+fi
 SIGN_IDENTITY="${SWIFTVCS_SIGN_IDENTITY:--}"
 NOTARY_PROFILE="${SWIFTVCS_NOTARY_PROFILE:-}"
 source "$HERE/scripts/svn_build_env.sh"
@@ -88,16 +96,12 @@ bundle_dylibs() {
 
     for target in "$main_bin" "$fw_dir"/*.dylib; do
         while IFS= read -r rpath_entry; do
-            case "$rpath_entry" in
-                "$brew_prefix"/*|/Library/Developer/CommandLineTools/*|/opt/homebrew/*|/usr/local/*)
-                    install_name_tool -delete_rpath "$rpath_entry" "$target"
-                    ;;
-            esac
-        done < <(otool -l "$target" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
+            if [ -n "$rpath_entry" ]; then
+                install_name_tool -delete_rpath "$rpath_entry" "$target"
+            fi
+        done < <(otool -l "$target" | awk '/cmd LC_RPATH/{f=1;next} f && /path /{print $2; f=0}')
     done
-    if ! otool -l "$main_bin" | awk '/cmd LC_RPATH/{getline; getline; if ($2 == "@executable_path/../Frameworks") found=1} END {exit !found}'; then
-        install_name_tool -add_rpath "@executable_path/../Frameworks" "$main_bin"
-    fi
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$main_bin"
 }
 
 echo "==> 收集并重写内置动态库 (Frameworks)"
@@ -174,8 +178,9 @@ fi
 codesign --verify --deep --strict --verbose=1 "$APP"
 
 ZIP_OUT="$OUT/VCSExplorer-$ARCH.zip"
-ZIP_TMP="$OUT/.VCSExplorer-$ARCH-$$.zip"
-trap 'rm -f "$ZIP_TMP"' EXIT
+ZIP_TMP_DIR="$(mktemp -d "$OUT/.VCSExplorer-$ARCH.XXXXXX")"
+ZIP_TMP="$ZIP_TMP_DIR/VCSExplorer-$ARCH.zip"
+trap 'rm -rf "$ZIP_TMP_DIR"' EXIT
 ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
 if [ -n "$NOTARY_PROFILE" ]; then
     xcrun notarytool submit "$ZIP_TMP" --keychain-profile "$NOTARY_PROFILE" --wait

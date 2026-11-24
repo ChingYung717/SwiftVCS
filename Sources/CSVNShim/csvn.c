@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -101,84 +102,359 @@ static int csvn_is_url_token_stop_char(char c)
 {
     return c == '\0' ||
            c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
-           c == '>' || c == '<' || c == '"' || c == '\'' ||
-           c == ')' || c == ',' || c == ';' || c == ']';
+           c == '>' || c == '<';
+}
+
+static int csvn_is_trailing_url_punct(char c)
+{
+    return c == ')' || c == ',' || c == ';' || c == ']' || c == '\'' || c == '"';
+}
+
+static int csvn_starts_with_scheme(const char *p)
+{
+    if (!p) return 0;
+    unsigned char first = (unsigned char)*p;
+    if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z'))) {
+        return 0;
+    }
+    p++;
+    while (*p) {
+        if (p[0] == ':' && p[1] == '/' && p[2] == '/') {
+            return 1;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+            return 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int csvn_is_host_char(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '.';
 }
 
 static int csvn_looks_like_host_after_at(const char *after_at, const char *token_end)
 {
     const char *p = after_at;
-    if (p >= token_end) return 0;
-    if (*p == '[') return 1;
-    if ((size_t)(token_end - p) >= 9 && strncmp(p, "localhost", 9) == 0 &&
-        (p + 9 == token_end || p[9] == ':' || p[9] == '/' || p[9] == '?' || p[9] == '#')) {
+    const char *end = token_end;
+    while (end > after_at && csvn_is_trailing_url_punct(end[-1])) {
+        end--;
+    }
+    if (p >= end) return 0;
+    if (*p == '[') {
+        const char *q = p + 1;
+        while (q < end && *q != ']') {
+            unsigned char c = (unsigned char)*q;
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F') || c == ':' || c == '.' || c == '%')) {
+                return 0;
+            }
+            q++;
+        }
+        if (q <= p + 1 || q >= end || *q != ']') return 0;
+        q++;
+        return (q == end || *q == ':' || *q == '/' || *q == '?' || *q == '#');
+    }
+    if ((size_t)(end - p) >= 9 && strncasecmp(p, "localhost", 9) == 0 &&
+        (p + 9 == end || p[9] == ':' || p[9] == '/' || p[9] == '?' || p[9] == '#')) {
         return 1;
     }
-    while (p < token_end && *p != '/' && *p != '?' && *p != '#') {
-        if (*p == '.' || *p == ':') return 1;
+    int has_dot = 0;
+    while (p < end && *p != '/' && *p != ':' && *p != '?' && *p != '#') {
+        if (!csvn_is_host_char((unsigned char)*p)) {
+            return 0;
+        }
+        if (*p == '.') has_dot = 1;
         p++;
     }
-    if (p < token_end && *p == '/' && p > after_at) {
-        return 1;
+    if (p == after_at) return 0;
+    if (p < end && *p == ':') {
+        const char *d = p + 1;
+        if (d >= end || *d < '0' || *d > '9') return 0;
+        while (d < end && *d >= '0' && *d <= '9') d++;
+        return (d == end || *d == '/' || *d == '?' || *d == '#');
+    }
+    if (has_dot) return 1;
+    if (p < end && *p == '/') return 1;
+    return 0;
+}
+
+static char *csvn_redact_url_authority(char *msg, size_t cap, char *auth_start, int require_host)
+{
+    static const char *marker = "<redacted>";
+    const size_t marker_len = 10;
+    char *token_end = auth_start;
+    char *first_slash = NULL;
+    char *first_colon = NULL;
+    char *last_at_before_slash = NULL;
+    char *last_at_with_host = NULL;
+    char *redact_at = NULL;
+
+    while (!csvn_is_url_token_stop_char(*token_end)) {
+        if (csvn_is_trailing_url_punct(*token_end)) {
+            const char *next = token_end + 1;
+            while (csvn_is_trailing_url_punct(*next)) {
+                next++;
+            }
+            if (csvn_starts_with_scheme(next) || (next[0] == '/' && next[1] == '/' && next[2] != '/')) {
+                break;
+            }
+        }
+        token_end++;
+    }
+
+    for (char *p = auth_start; p < token_end; p++) {
+        if (*p == '/' && !first_slash) {
+            first_slash = p;
+        }
+        if (*p == ':' && !first_colon && !first_slash) {
+            first_colon = p;
+        }
+        if (*p == '@') {
+            if (!first_slash) {
+                if (!require_host || csvn_looks_like_host_after_at(p + 1, token_end)) {
+                    last_at_before_slash = p;
+                }
+            } else if (first_colon) {
+                if (csvn_looks_like_host_after_at(p + 1, token_end)) {
+                    last_at_with_host = p;
+                }
+            }
+        }
+    }
+
+    if (last_at_with_host) {
+        redact_at = last_at_with_host;
+    } else if (last_at_before_slash) {
+        redact_at = last_at_before_slash;
+    }
+
+    if (redact_at && redact_at >= auth_start) {
+        size_t userinfo_len = (size_t)(redact_at - auth_start);
+        size_t tail_len = strlen(redact_at); /* 含 '@' */
+        size_t prefix_len = (size_t)(auth_start - msg);
+        if (prefix_len + marker_len + tail_len < cap) {
+            memmove(auth_start + marker_len, redact_at, tail_len + 1);
+            memcpy(auth_start, marker, marker_len);
+            return auth_start + marker_len + 1;
+        } else if (userinfo_len > 0) {
+            memset(auth_start, '*', userinfo_len);
+            return redact_at + 1;
+        }
+    }
+    return token_end;
+}
+
+static int csvn_is_header_boundary_before(const char *msg, const char *p)
+{
+    if (p == msg) return 1;
+    unsigned char prev = (unsigned char)p[-1];
+    if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+        (prev >= '0' && prev <= '9') || prev == '_' || prev == '-') {
+        return 0;
+    }
+    return 1;
+}
+
+static void csvn_redact_auth_headers_in_place(char *msg, size_t cap)
+{
+    static const char *marker = "<redacted>";
+    const size_t marker_len = 10;
+    char *p = msg;
+
+    while (*p) {
+        size_t hdr_len = 0;
+        if (csvn_is_header_boundary_before(msg, p)) {
+            if (strncasecmp(p, "Proxy-Authorization:", 20) == 0) {
+                hdr_len = 20;
+            } else if (strncasecmp(p, "Authorization:", 14) == 0) {
+                hdr_len = 14;
+            }
+        }
+        if (hdr_len == 0) {
+            p++;
+            continue;
+        }
+        char close_delim = '\0';
+        if (p > msg) {
+            if (p[-1] == '(') close_delim = ')';
+            else if (p[-1] == '[') close_delim = ']';
+            else if (p[-1] == '\'') close_delim = '\'';
+            else if (p[-1] == '"') close_delim = '"';
+        }
+        char *val_start = p + hdr_len;
+        while (*val_start == ' ' || *val_start == '\t') {
+            val_start++;
+        }
+        char *val_end = val_start;
+        while (*val_end != '\0' && *val_end != '\r' && *val_end != '\n' &&
+               (!close_delim || *val_end != close_delim)) {
+            val_end++;
+        }
+        if (val_end > val_start) {
+            size_t val_len = (size_t)(val_end - val_start);
+            size_t tail_len = strlen(val_end);
+            size_t prefix_len = (size_t)(val_start - msg);
+            if (prefix_len + marker_len + tail_len < cap) {
+                memmove(val_start + marker_len, val_end, tail_len + 1);
+                memcpy(val_start, marker, marker_len);
+                p = val_start + marker_len;
+                continue;
+            } else {
+                memset(val_start, '*', val_len);
+                p = val_end;
+                continue;
+            }
+        }
+        p = val_end;
+    }
+}
+
+/*
+ * SV-13 / SV-V10: 脱敏错误消息中可能携带的 URL 内嵌凭据（含 scheme://、//user:pass@host、
+ * 带引号或 '/' 口令与尾随 peg revision）及 Authorization / Proxy-Authorization 请求头。
+ * 显式接收缓冲区容量 cap，避免对小缓冲越界。
+ */
+static void csvn_redact_credentials_in_place(char *msg, size_t cap)
+{
+    char *scan = msg;
+    if (!msg || cap == 0) return;
+    if (strnlen(msg, cap) == cap) {
+        msg[cap - 1] = '\0';
+    }
+
+    while ((scan = strstr(scan, "://")) != NULL) {
+        scan = csvn_redact_url_authority(msg, cap, scan + 3, 0);
+    }
+
+    scan = msg;
+    while ((scan = strstr(scan, "//")) != NULL) {
+        int valid_before = (scan == msg) ||
+                           scan[-1] == ' ' || scan[-1] == '\t' || scan[-1] == '\r' || scan[-1] == '\n' ||
+                           scan[-1] == '(' || scan[-1] == '[' || scan[-1] == '<' ||
+                           scan[-1] == ',' || scan[-1] == ';' || scan[-1] == '\'' ||
+                           scan[-1] == '"' || scan[-1] == '=';
+        if (!valid_before || scan[2] == '/' || csvn_is_url_token_stop_char(scan[2])) {
+            scan += 2;
+            continue;
+        }
+        scan = csvn_redact_url_authority(msg, cap, scan + 2, 1);
+    }
+
+    csvn_redact_auth_headers_in_place(msg, cap);
+}
+
+static int csvn_contains_percent_nul(const char *s, size_t len)
+{
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (s[i] == '%' && s[i + 1] == '0' && s[i + 2] == '0') {
+            return 1;
+        }
     }
     return 0;
 }
 
-/*
- * SV-13: 脱敏错误消息中可能携带的 URL 内嵌凭据（如 https://user:pass@host/repo）。
- */
-static void csvn_redact_credentials_in_place(char *msg)
+static int csvn_is_hex_digit(char c)
 {
-    static const char *marker = "<redacted>";
-    const size_t marker_len = 10;
-    char *scan = msg;
-    if (!msg) return;
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
 
-    while ((scan = strstr(scan, "://")) != NULL) {
-        char *auth_start = scan + 3;
-        char *token_end = auth_start;
-        char *first_slash = NULL;
-        char *first_colon = NULL;
-        char *last_at_before_slash = NULL;
-        char *last_at_with_host = NULL;
-        char *redact_at = NULL;
-
-        while (!csvn_is_url_token_stop_char(*token_end)) {
-            if (*token_end == '/' && !first_slash) {
-                first_slash = token_end;
+static int csvn_has_valid_percent_escapes(const char *s, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '%') {
+            if (i + 2 >= len || !csvn_is_hex_digit(s[i + 1]) || !csvn_is_hex_digit(s[i + 2])) {
+                return 0;
             }
-            if (*token_end == ':' && !first_colon && !first_slash) {
-                first_colon = token_end;
-            }
-            if (*token_end == '@') {
-                if (!first_slash) {
-                    last_at_before_slash = token_end;
-                } else if (first_colon) {
-                    last_at_with_host = token_end;
-                }
-            }
-            token_end++;
+            i += 2;
         }
-        if (last_at_with_host && csvn_looks_like_host_after_at(last_at_with_host + 1, token_end)) {
-            redact_at = last_at_with_host;
-        } else {
-            redact_at = last_at_before_slash;
-        }
-        if (redact_at && redact_at >= auth_start) {
-            size_t userinfo_len = (size_t)(redact_at - auth_start);
-            size_t tail_len = strlen(redact_at); /* 含 '@' */
-            size_t prefix_len = (size_t)(auth_start - msg);
-            if (prefix_len + marker_len + tail_len < sizeof(((csvn_ctx *)0)->errmsg)) {
-                memmove(auth_start + marker_len, redact_at, tail_len + 1);
-                memcpy(auth_start, marker, marker_len);
-                scan = auth_start + marker_len + 1;
-                continue;
-            } else if (userinfo_len > 0) {
-                memset(auth_start, '*', userinfo_len);
-            }
-        }
-        scan = token_end;
     }
+    return 1;
+}
+
+static svn_error_t *csvn_validate_remote_authority(const char *auth,
+                                                   size_t auth_len,
+                                                   int allow_user,
+                                                   apr_pool_t *pool)
+{
+    if (auth_len == 0) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 缺少主机名");
+    }
+    if (!csvn_has_valid_percent_escapes(auth, auth_len) ||
+        csvn_contains_percent_nul(auth, auth_len)) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 主机或用户信息包含非法编码");
+    }
+
+    const char *at = (const char *)memchr(auth, '@', auth_len);
+    const char *hostport = auth;
+    size_t hostport_len = auth_len;
+
+    if (at) {
+        if (!allow_user) {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 不允许内嵌用户信息");
+        }
+        size_t user_len = (size_t)(at - auth);
+        if (user_len == 0) {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "svn+ssh:// 仓库 URL 用户名不能为空");
+        }
+        /* 禁止 authority 中出现多重 '@' */
+        if (memchr(at + 1, '@', auth_len - user_len - 1) != NULL) {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "svn+ssh:// 仓库 URL 包含非法用户信息");
+        }
+        const char *raw_user = apr_pstrndup(pool, auth, user_len);
+        const char *dec_user = svn_path_uri_decode(raw_user, pool);
+        if (!dec_user || !*dec_user || dec_user[0] == '-') {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "svn+ssh:// 仓库 URL 包含非法用户名");
+        }
+        for (const unsigned char *p = (const unsigned char *)dec_user; *p; p++) {
+            if (*p <= 0x20 || *p == 0x7f || *p == ':' || *p == '@' || *p == '/') {
+                return svn_error_create(SVN_ERR_BAD_URL, NULL, "svn+ssh:// 仓库 URL 包含非法用户名");
+            }
+        }
+        hostport = at + 1;
+        hostport_len = auth_len - user_len - 1;
+    }
+
+    if (hostport_len == 0) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 缺少主机名");
+    }
+
+    const char *raw_host_start = hostport;
+    size_t raw_host_len = hostport_len;
+    if (hostport[0] == '[') {
+        const char *close_br = (const char *)memchr(hostport + 1, ']', hostport_len - 1);
+        if (!close_br || close_br <= hostport + 1) {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL IPv6 主机格式无效");
+        }
+        raw_host_start = hostport + 1;
+        raw_host_len = (size_t)(close_br - raw_host_start);
+    } else {
+        const char *colon = (const char *)memchr(hostport, ':', hostport_len);
+        if (colon) {
+            raw_host_len = (size_t)(colon - hostport);
+        }
+    }
+    if (raw_host_len == 0) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 缺少主机名");
+    }
+    const char *raw_host = apr_pstrndup(pool, raw_host_start, raw_host_len);
+    const char *dec_host = svn_path_uri_decode(raw_host, pool);
+    if (!dec_host || !*dec_host || dec_host[0] == '-') {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 包含非法主机名");
+    }
+    for (const unsigned char *p = (const unsigned char *)dec_host; *p; p++) {
+        if (*p <= 0x20 || *p == 0x7f || *p == '/' || *p == '@') {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "仓库 URL 包含非法主机名");
+        }
+    }
+    return SVN_NO_ERROR;
 }
 
 static svn_error_t *csvn_canon_url_safe(const char **out, const char *url, apr_pool_t *pool)
@@ -186,6 +462,15 @@ static svn_error_t *csvn_canon_url_safe(const char **out, const char *url, apr_p
     *out = NULL;
     if (!url || !*url) {
         return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
+    }
+    size_t url_len = strlen(url);
+    if (csvn_contains_percent_nul(url, url_len)) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
+    }
+    for (const unsigned char *p = (const unsigned char *)url; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '?' || *p == '#') {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
+        }
     }
     const char *canonical = NULL;
     const char *non_canon = NULL;
@@ -195,6 +480,33 @@ static svn_error_t *csvn_canon_url_safe(const char **out, const char *url, apr_p
             return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
         }
         return err;
+    }
+    size_t canon_len = strlen(canonical);
+    if (csvn_contains_percent_nul(canonical, canon_len)) {
+        return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
+    }
+    for (const unsigned char *p = (const unsigned char *)canonical; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '?' || *p == '#') {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "无效的仓库 URL");
+        }
+    }
+    if (strncasecmp(canonical, "file://", 7) == 0) {
+        if (canonical[7] != '/') {
+            return svn_error_create(SVN_ERR_BAD_URL, NULL, "本地 file:// 仓库 URL 不允许指定主机名");
+        }
+    } else if (strncasecmp(canonical, "svn+ssh://", 10) == 0) {
+        const char *auth = canonical + 10;
+        const char *auth_end = strchr(auth, '/');
+        if (!auth_end) auth_end = auth + strlen(auth);
+        SVN_ERR(csvn_validate_remote_authority(auth, (size_t)(auth_end - auth), 1, pool));
+    } else if (strncasecmp(canonical, "https://", 8) == 0 ||
+               strncasecmp(canonical, "http://", 7) == 0 ||
+               strncasecmp(canonical, "svn://", 6) == 0) {
+        const char *sep = strstr(canonical, "://");
+        const char *auth = sep + 3;
+        const char *auth_end = strchr(auth, '/');
+        if (!auth_end) auth_end = auth + strlen(auth);
+        SVN_ERR(csvn_validate_remote_authority(auth, (size_t)(auth_end - auth), 0, pool));
     }
     *out = canonical;
     return SVN_NO_ERROR;
@@ -263,7 +575,7 @@ static void csvn_set_error(csvn_ctx *ctx, svn_error_t *err)
         }
     }
 
-    csvn_redact_credentials_in_place(ctx->errmsg);
+    csvn_redact_credentials_in_place(ctx->errmsg, sizeof(ctx->errmsg));
 
     if (getenv("CSVN_DEBUG")) {
         fprintf(stderr, "[csvn] error: %s\n", ctx->errmsg);
@@ -474,7 +786,8 @@ static int csvn_host_is_exact_pattern(const char *host)
 {
     if (!host || !*host) return 0;
     for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
-        if (*p <= 0x20 || *p == 0x7f || *p == '*' || *p == '?' || *p == '[' || *p == ']' || *p == ',' || *p == ';') {
+        if (*p <= 0x20 || *p == 0x7f || *p == '*' || *p == '?' || *p == '[' || *p == ']' ||
+            *p == ',' || *p == ';' || *p == '%' || *p == '\\') {
             return 0;
         }
     }
@@ -485,11 +798,57 @@ static int csvn_ca_path_is_safe(const char *ca_path)
 {
     if (!ca_path || !*ca_path) return 0;
     for (const unsigned char *p = (const unsigned char *)ca_path; *p; p++) {
-        if (*p < 0x20 || *p == 0x7f || *p == ';') {
+        if (*p < 0x20 || *p == 0x7f || *p == ';' || *p == '%') {
             return 0;
         }
     }
     return 1;
+}
+
+static char *csvn_ascii_lower_dup(const char *s, apr_pool_t *pool)
+{
+    size_t n = strlen(s);
+    char *out = (char *)apr_palloc(pool, n + 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+    }
+    out[n] = '\0';
+    return out;
+}
+
+typedef struct {
+    apr_array_header_t *names;
+    apr_pool_t *result_pool;
+    const char *target_group;
+} csvn_cfg_section_collect_baton;
+
+static svn_boolean_t csvn_collect_matching_section(const char *name,
+                                                   void *baton,
+                                                   apr_pool_t *scratch_pool)
+{
+    (void)scratch_pool;
+    csvn_cfg_section_collect_baton *cb = (csvn_cfg_section_collect_baton *)baton;
+    if (name && cb->target_group && strcasecmp(name, cb->target_group) == 0) {
+        APR_ARRAY_PUSH(cb->names, const char *) = apr_pstrdup(cb->result_pool, name);
+    }
+    return TRUE;
+}
+
+static void csvn_copy_svn_error(csvn_ctx *ctx, svn_error_t *err, char *errbuf, size_t errcap)
+{
+    char tmpbuf[2048];
+    tmpbuf[0] = '\0';
+    const char *best = svn_err_best_message(err, tmpbuf, sizeof(tmpbuf));
+    if (best && *best) {
+        csvn_copy_str(ctx->errmsg, sizeof(ctx->errmsg), best);
+        csvn_redact_credentials_in_place(ctx->errmsg, sizeof(ctx->errmsg));
+        csvn_copy_str(errbuf, errcap, ctx->errmsg);
+        svn_error_clear(err);
+    } else {
+        csvn_set_error(ctx, err);
+        csvn_copy_str(errbuf, errcap, ctx->errmsg);
+    }
 }
 
 static svn_error_t *csvn_scope_ca_to_host(svn_config_t *servers,
@@ -499,36 +858,65 @@ static svn_error_t *csvn_scope_ca_to_host(svn_config_t *servers,
 {
     static const char *kScopedGroup = "__swiftvcs_scoped_ca__";
     if (!csvn_ca_path_is_safe(ca_path)) {
-        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "CA 证书路径包含非法字符（不允许分号或控制字符）");
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL,
+                                "CA 证书路径包含非法字符（不允许分号、百分号或控制字符）");
     }
     if (!csvn_host_is_exact_pattern(host)) {
         return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "自定义 CA 绑定主机名不合法");
     }
 
-    const char *existing_group = svn_config_find_group(servers, host,
-                                                       SVN_CONFIG_SECTION_GROUPS, pool);
-
-    /* 收集原 [groups] 映射，将精确主机组排到最前，避免被既有通配组抢先匹配或污染 [global]。 */
-    csvn_cfg_collect_baton groups_cb = {
-        apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
-        pool
-    };
-    svn_config_enumerate2(servers, SVN_CONFIG_SECTION_GROUPS,
-                          csvn_collect_cfg_option, &groups_cb, pool);
-    for (int i = 0; i < groups_cb.items->nelts; i++) {
-        csvn_cfg_kv kv = APR_ARRAY_IDX(groups_cb.items, i, csvn_cfg_kv);
-        svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, NULL);
+    struct stat ca_st;
+    if (stat(ca_path, &ca_st) != 0 || !S_ISREG(ca_st.st_mode) || access(ca_path, R_OK) != 0) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "CA 证书路径必须为可读的常规文件");
     }
-    svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kScopedGroup, host);
-    for (int i = 0; i < groups_cb.items->nelts; i++) {
-        csvn_cfg_kv kv = APR_ARRAY_IDX(groups_cb.items, i, csvn_cfg_kv);
-        if (strcmp(kv.name, kScopedGroup) != 0) {
-            svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, kv.value);
+
+    /* 先彻底清空任何大小写变体的 [__swiftvcs_scoped_ca__] 节与 [groups] 映射，避免配置文件残留污染。 */
+    {
+        csvn_cfg_collect_baton pre_groups_cb = {
+            apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
+            pool
+        };
+        svn_config_enumerate2(servers, SVN_CONFIG_SECTION_GROUPS,
+                              csvn_collect_cfg_option, &pre_groups_cb, pool);
+        for (int i = 0; i < pre_groups_cb.items->nelts; i++) {
+            csvn_cfg_kv kv = APR_ARRAY_IDX(pre_groups_cb.items, i, csvn_cfg_kv);
+            if (kv.name && strcasecmp(kv.name, kScopedGroup) == 0) {
+                svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, NULL);
+            }
+        }
+        svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kScopedGroup, NULL);
+
+        csvn_cfg_section_collect_baton sec_cb = {
+            apr_array_make(pool, 4, sizeof(const char *)),
+            pool,
+            kScopedGroup
+        };
+        svn_config_enumerate_sections2(servers, csvn_collect_matching_section, &sec_cb, pool);
+        for (int s = 0; s < sec_cb.names->nelts; s++) {
+            const char *sec_name = APR_ARRAY_IDX(sec_cb.names, s, const char *);
+            csvn_cfg_collect_baton stale_cb = {
+                apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
+                pool
+            };
+            svn_config_enumerate2(servers, sec_name,
+                                  csvn_collect_cfg_option, &stale_cb, pool);
+            for (int i = 0; i < stale_cb.items->nelts; i++) {
+                csvn_cfg_kv kv = APR_ARRAY_IDX(stale_cb.items, i, csvn_cfg_kv);
+                svn_config_set(servers, sec_name, kv.name, NULL);
+            }
         }
     }
 
-    /* 若此前命中了某个用户分组，将其配置复制到专属精确组，保持代理/超时等用户配置不变。 */
-    if (existing_group && strcmp(existing_group, kScopedGroup) != 0) {
+    const char *lower_host = csvn_ascii_lower_dup(host, pool);
+    const char *existing_group = svn_config_find_group(servers, lower_host,
+                                                       SVN_CONFIG_SECTION_GROUPS, pool);
+    if (!existing_group && strcmp(lower_host, host) != 0) {
+        existing_group = svn_config_find_group(servers, host,
+                                               SVN_CONFIG_SECTION_GROUPS, pool);
+    }
+
+    /* 若此前命中了某个用户分组，先将其有效选项复制到专属精确组，保持代理/超时等用户配置不变。 */
+    if (existing_group && strcasecmp(existing_group, kScopedGroup) != 0) {
         csvn_cfg_collect_baton opts_cb = {
             apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
             pool
@@ -537,18 +925,92 @@ static svn_error_t *csvn_scope_ca_to_host(svn_config_t *servers,
                               csvn_collect_cfg_option, &opts_cb, pool);
         for (int i = 0; i < opts_cb.items->nelts; i++) {
             csvn_cfg_kv kv = APR_ARRAY_IDX(opts_cb.items, i, csvn_cfg_kv);
-            svn_config_set(servers, kScopedGroup, kv.name, kv.value);
+            if (kv.value) {
+                svn_config_set(servers, kScopedGroup, kv.name, kv.value);
+            }
         }
     }
 
+    /*
+     * SV-V01: apr_hash_t 遍历无序，不能靠插入顺序覆盖通配组。
+     * 枚举所有 [groups] 条目，拆分逗号分隔的 glob 列表，剔除所有匹配目标 host 的模式，
+     * 使 [groups] 中仅 kScopedGroup 匹配规范化小写主机名，同时不影响其他主机的配置。
+     */
+    csvn_cfg_collect_baton groups_cb = {
+        apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
+        pool
+    };
+    svn_config_enumerate2(servers, SVN_CONFIG_SECTION_GROUPS,
+                          csvn_collect_cfg_option, &groups_cb, pool);
+    for (int i = 0; i < groups_cb.items->nelts; i++) {
+        csvn_cfg_kv kv = APR_ARRAY_IDX(groups_cb.items, i, csvn_cfg_kv);
+        if (strcasecmp(kv.name, kScopedGroup) == 0) {
+            svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, NULL);
+            continue;
+        }
+        if (!kv.value || !*kv.value) {
+            svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, NULL);
+            continue;
+        }
+        apr_array_header_t *patterns = svn_cstring_split(kv.value, ",", TRUE, pool);
+        apr_array_header_t *kept = apr_array_make(pool, patterns->nelts, sizeof(const char *));
+        apr_array_header_t *single = apr_array_make(pool, 1, sizeof(const char *));
+        APR_ARRAY_PUSH(single, const char *) = "";
+        for (int j = 0; j < patterns->nelts; j++) {
+            const char *pat = APR_ARRAY_IDX(patterns, j, const char *);
+            if (!pat || !*pat) continue;
+            APR_ARRAY_IDX(single, 0, const char *) = pat;
+            if (svn_cstring_match_glob_list(host, single) ||
+                svn_cstring_match_glob_list(lower_host, single)) {
+                continue;
+            }
+            APR_ARRAY_PUSH(kept, const char *) = pat;
+        }
+        if (kept->nelts == 0) {
+            svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, NULL);
+        } else {
+            const char *updated = apr_array_pstrcat(pool, kept, ',');
+            svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kv.name, updated);
+        }
+    }
+
+    svn_config_set(servers, SVN_CONFIG_SECTION_GROUPS, kScopedGroup, lower_host);
+
     const char *base_ca = NULL;
     svn_config_get(servers, &base_ca, kScopedGroup, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, NULL);
-    if (!base_ca) {
+    if (!base_ca || !*base_ca) {
         svn_config_get(servers, &base_ca, SVN_CONFIG_SECTION_GLOBAL,
                        SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, NULL);
     }
-    svn_config_set(servers, kScopedGroup, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES,
-                   base_ca ? apr_pstrcat(pool, base_ca, ";", ca_path, NULL) : ca_path);
+    const char *scoped_ca_val = (base_ca && *base_ca)
+        ? apr_pstrcat(pool, base_ca, ";", ca_path, NULL)
+        : ca_path;
+    svn_config_set(servers, kScopedGroup, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, scoped_ca_val);
+
+    /* Fail-Closed 断言：确保规范化小写主机名 100% 命中专属隔离组，且该组实际承载目标 CA。 */
+    const char *matched = svn_config_find_group(servers, lower_host, SVN_CONFIG_SECTION_GROUPS, pool);
+    if (!matched || strcasecmp(matched, kScopedGroup) != 0) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "自定义 CA 无法严格隔离至目标主机");
+    }
+    if (strcmp(matched, kScopedGroup) != 0) {
+        csvn_cfg_collect_baton mirror_cb = {
+            apr_array_make(pool, 8, sizeof(csvn_cfg_kv)),
+            pool
+        };
+        svn_config_enumerate2(servers, kScopedGroup,
+                              csvn_collect_cfg_option, &mirror_cb, pool);
+        for (int i = 0; i < mirror_cb.items->nelts; i++) {
+            csvn_cfg_kv kv = APR_ARRAY_IDX(mirror_cb.items, i, csvn_cfg_kv);
+            if (kv.value) {
+                svn_config_set(servers, matched, kv.name, kv.value);
+            }
+        }
+    }
+    const char *verify_ca = NULL;
+    svn_config_get(servers, &verify_ca, matched, SVN_CONFIG_OPTION_SSL_AUTHORITY_FILES, NULL);
+    if (!verify_ca || !strstr(verify_ca, ca_path)) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "自定义 CA 无法严格隔离至目标主机");
+    }
     return SVN_NO_ERROR;
 }
 
@@ -593,10 +1055,7 @@ csvn_ctx *csvn_context_create(const char *username,
 
     err = svn_client_create_context2(&ctx->client, NULL, pool);
     if (err) {
-        svn_err_best_message(err, ctx->errmsg, sizeof(ctx->errmsg));
-        csvn_redact_credentials_in_place(ctx->errmsg);
-        csvn_copy_str(errbuf, errcap, ctx->errmsg);
-        svn_error_clear(err);
+        csvn_copy_svn_error(ctx, err, errbuf, errcap);
         apr_pool_destroy(pool);
         return NULL;
     }
@@ -638,6 +1097,8 @@ csvn_ctx *csvn_context_create(const char *username,
                     err = csvn_scope_ca_to_host(servers, host, ca_path, pool);
                 }
             }
+        } else if (ca_path) {
+            err = svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "无法加载 Subversion servers 配置以隔离自定义 CA");
         }
         if (!err) {
 
@@ -664,10 +1125,7 @@ csvn_ctx *csvn_context_create(const char *username,
         }
     }
     if (err) {
-        svn_err_best_message(err, ctx->errmsg, sizeof(ctx->errmsg));
-        csvn_redact_credentials_in_place(ctx->errmsg);
-        csvn_copy_str(errbuf, errcap, ctx->errmsg);
-        svn_error_clear(err);
+        csvn_copy_svn_error(ctx, err, errbuf, errcap);
         if (ctx->password) {
             csvn_secure_zero(ctx->password, ctx->password_len);
             free(ctx->password);
@@ -871,6 +1329,11 @@ int csvn_get_repos_root(csvn_ctx *ctx,
 /* 2. 浏览                                                              */
 /* ------------------------------------------------------------------ */
 
+#define CSVN_MAX_LIST_ENTRIES   200000
+#define CSVN_MAX_STATUS_ENTRIES 200000
+#define CSVN_MAX_LOG_ENTRIES    50000
+#define CSVN_HARD_MAX_CAT_BYTES (64L * 1024L * 1024L)
+
 typedef struct {
     csvn_entry *entries;
     int count;
@@ -900,8 +1363,15 @@ list_cb(void *baton,
         return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "修订号超出 32 位整数支持范围");
     }
 
+    if (lb->count >= CSVN_MAX_LIST_ENTRIES) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库目录条目数量超出安全上限");
+    }
     if (lb->count == lb->cap) {
+        if (lb->cap > INT_MAX / 2) {
+            return svn_error_create(APR_ENOMEM, NULL, "目录条目容量溢出");
+        }
         int ncap = lb->cap ? lb->cap * 2 : 32;
+        if (ncap > CSVN_MAX_LIST_ENTRIES) ncap = CSVN_MAX_LIST_ENTRIES;
         csvn_entry *n = (csvn_entry *)realloc(lb->entries, sizeof(csvn_entry) * (size_t)ncap);
         if (!n) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
         lb->entries = n;
@@ -1047,6 +1517,8 @@ typedef struct {
     int deleted;
 } update_baton;
 
+#define CSVN_MAX_UPDATE_CONFLICTS 65536
+
 static void update_notify_cb(void *baton, const svn_wc_notify_t *notify, apr_pool_t *pool)
 {
     update_baton *ub = (update_baton *)baton;
@@ -1071,7 +1543,7 @@ static void update_notify_cb(void *baton, const svn_wc_notify_t *notify, apr_poo
     if (notify->content_state == svn_wc_notify_state_conflicted ||
         notify->prop_state == svn_wc_notify_state_conflicted ||
         notify->action == svn_wc_notify_tree_conflict) {
-        if (notify->path) {
+        if (notify->path && ub->paths->nelts < CSVN_MAX_UPDATE_CONFLICTS) {
             APR_ARRAY_PUSH(ub->paths, const char *) = apr_pstrdup(ub->pool, notify->path);
         }
     }
@@ -1148,19 +1620,41 @@ int csvn_update(csvn_ctx *ctx,
     if (out_added) *out_added = ub.added;
     if (out_deleted) *out_deleted = ub.deleted;
 
-    {
+    if (out_conflicts && ub.paths->nelts > 0) {
         const char **items = (const char **)ub.paths->elts;
-        char *text = NULL;
+        size_t total_len = 0;
         int i;
         for (i = 0; i < ub.paths->nelts; i++) {
-            if (i == 0) text = apr_pstrdup(scratch, items[i]);
-            else text = apr_pstrcat(scratch, text, "\n", items[i], NULL);
+            size_t item_len = strlen(items[i]);
+            size_t extra = (i > 0 ? 1 : 0);
+            if (total_len > ((size_t)-1) - 1 - extra ||
+                item_len > ((size_t)-1) - 1 - extra - total_len) {
+                int rc = csvn_classify(ctx, svn_error_create(APR_ENOMEM, NULL, "冲突路径列表大小溢出"));
+                svn_pool_destroy(scratch);
+                apr_thread_mutex_unlock(ctx->mutex);
+                return rc;
+            }
+            total_len += item_len + extra;
         }
-        /* 必须用 strdup 分配在堆上，因为上层用 csvn_free_string (free) 释放，
-         * 且 scratch 池紧接着就会销毁 */
-        if (out_conflicts) *out_conflicts = text ? strdup(text) : NULL;
-        if (out_conflict_count) *out_conflict_count = ub.paths->nelts;
+        /* 一次性分配堆缓冲并检查 OOM，消除 O(N^2) apr_pstrcat 与静默忽略 strdup 失败。 */
+        char *buf = (char *)malloc(total_len + 1);
+        if (!buf) {
+            int rc = csvn_classify(ctx, svn_error_create(APR_ENOMEM, NULL, "内存分配失败"));
+            svn_pool_destroy(scratch);
+            apr_thread_mutex_unlock(ctx->mutex);
+            return rc;
+        }
+        char *dst = buf;
+        for (i = 0; i < ub.paths->nelts; i++) {
+            if (i > 0) *dst++ = '\n';
+            size_t item_len = strlen(items[i]);
+            memcpy(dst, items[i], item_len);
+            dst += item_len;
+        }
+        *dst = '\0';
+        *out_conflicts = buf;
     }
+    if (out_conflict_count) *out_conflict_count = ub.paths->nelts;
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);
     return 0;
@@ -1242,8 +1736,15 @@ status_cb(void *baton, const char *path, const svn_client_status_t *status,
         return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "修订号超出 32 位整数支持范围");
     }
 
+    if (sb->count >= CSVN_MAX_STATUS_ENTRIES) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "工作副本状态条目数量超出安全上限");
+    }
     if (sb->count == sb->cap) {
+        if (sb->cap > INT_MAX / 2) {
+            return svn_error_create(APR_ENOMEM, NULL, "状态条目容量溢出");
+        }
         int ncap = sb->cap ? sb->cap * 2 : 64;
+        if (ncap > CSVN_MAX_STATUS_ENTRIES) ncap = CSVN_MAX_STATUS_ENTRIES;
         csvn_status_item *n = (csvn_status_item *)realloc(sb->items,
                                                           sizeof(csvn_status_item) * (size_t)ncap);
         if (!n) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
@@ -1397,6 +1898,9 @@ static svn_error_t *bounded_diff_stream_write(void *baton, const char *data, apr
 
     if (bs->ctx && csvn_is_cancelled(bs->ctx)) {
         return svn_error_create(SVN_ERR_CANCELLED, NULL, "操作已取消");
+    }
+    if (incoming == 0) {
+        return SVN_NO_ERROR;
     }
 
     if (bs->max_bytes > 0) {
@@ -1581,6 +2085,9 @@ int csvn_diff(csvn_ctx *ctx,
 
 typedef struct {
     csvn_ctx *ctx;
+    apr_pool_t *pool;
+    apr_hash_t *path_bytes;
+    size_t *cur_path_bytes;
     csvn_diff_section *sections;
     size_t *caps;
     int count;
@@ -1645,17 +2152,26 @@ static svn_error_t *diff_start_section(diff_stream_baton *db, const char *path, 
     if (!sec->path) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
     if (path_len > 0) memcpy(sec->path, path, path_len);
     sec->path[path_len] = '\0';
+    if (db->path_bytes && db->pool) {
+        size_t *counter = (size_t *)apr_hash_get(db->path_bytes, sec->path, APR_HASH_KEY_STRING);
+        if (!counter) {
+            counter = (size_t *)apr_pcalloc(db->pool, sizeof(size_t));
+            apr_hash_set(db->path_bytes, apr_pstrdup(db->pool, sec->path), APR_HASH_KEY_STRING, counter);
+        }
+        db->cur_path_bytes = counter;
+    } else {
+        db->cur_path_bytes = NULL;
+    }
     db->count++;
     return SVN_NO_ERROR;
 }
 
 static svn_error_t *diff_append_bytes(diff_stream_baton *db, const char *bytes, size_t len)
 {
-    int idx, k;
+    int idx;
     csvn_diff_section *sec;
     size_t allowed = len;
     size_t needed;
-    size_t prior_len = 0;
 
     if (len == 0) return SVN_NO_ERROR;
     if (db->count == 0) {
@@ -1667,12 +2183,17 @@ static svn_error_t *diff_append_bytes(diff_stream_baton *db, const char *bytes, 
     sec = &db->sections[idx];
 
     if (db->max_bytes > 0) {
-        for (k = 0; k < idx; k++) {
-            if (db->sections[k].path && sec->path && strcmp(db->sections[k].path, sec->path) == 0) {
-                prior_len += (size_t)db->sections[k].length;
+        size_t used = 0;
+        if (db->cur_path_bytes) {
+            used = *db->cur_path_bytes;
+        } else {
+            for (int k = 0; k < idx; k++) {
+                if (db->sections[k].path && sec->path && strcmp(db->sections[k].path, sec->path) == 0) {
+                    used += (size_t)db->sections[k].length;
+                }
             }
+            used += (size_t)sec->length;
         }
-        size_t used = prior_len + (size_t)sec->length;
         if (used >= db->max_bytes) {
             sec->truncated = 1;
             return SVN_NO_ERROR;
@@ -1727,6 +2248,9 @@ static svn_error_t *diff_append_bytes(diff_stream_baton *db, const char *bytes, 
     memcpy(sec->text + sec->length, bytes, allowed);
     sec->length += (long)allowed;
     sec->text[sec->length] = '\0';
+    if (db->cur_path_bytes) {
+        *db->cur_path_bytes += allowed;
+    }
     db->total_retained_bytes += allowed;
 
     if (db->total_truncated) {
@@ -1792,13 +2316,17 @@ static svn_error_t *diff_finish_index_line(diff_stream_baton *db, int has_newlin
 
 static svn_error_t *diff_stream_write(void *baton, const char *data, apr_size_t *len)
 {
-    static const char index_prefix[7] = "Index: ";
+    static const char index_prefix[] = "Index: ";
+    const size_t index_prefix_len = sizeof(index_prefix) - 1;
     diff_stream_baton *db = (diff_stream_baton *)baton;
     const char *p = data;
     size_t rem = *len;
 
     if (db->ctx && csvn_is_cancelled(db->ctx)) {
         return svn_error_create(SVN_ERR_CANCELLED, NULL, "操作已取消");
+    }
+    if (rem == 0) {
+        return SVN_NO_ERROR;
     }
 
     if (db->max_stream_bytes > 0) {
@@ -1820,7 +2348,7 @@ static svn_error_t *diff_stream_write(void *baton, const char *data, apr_size_t 
                 db->prefix_buf[db->prefix_len++] = c;
                 p++;
                 rem--;
-                if (db->prefix_len == 7) {
+                if (db->prefix_len == index_prefix_len) {
                     db->state = 1;
                     db->index_len = 0;
                 }
@@ -1942,6 +2470,8 @@ int csvn_diff_sections_ex(csvn_ctx *ctx,
 
     memset(&db, 0, sizeof(db));
     db.ctx = ctx;
+    db.pool = scratch;
+    db.path_bytes = apr_hash_make(scratch);
     db.max_bytes = (size_t)max_bytes_per_file;
     db.max_total_bytes = effective_total;
     db.max_sections = max_sections > 0 ? max_sections : CSVN_DEFAULT_MAX_DIFF_SECTIONS;
@@ -2353,8 +2883,15 @@ log_cb(void *baton, svn_log_entry_t *log_entry, apr_pool_t *pool)
         return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "修订号超出 32 位整数支持范围");
     }
 
+    if (lb->count >= CSVN_MAX_LOG_ENTRIES) {
+        return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "日志条目数量超出安全上限");
+    }
     if (lb->count == lb->cap) {
+        if (lb->cap > INT_MAX / 2) {
+            return svn_error_create(APR_ENOMEM, NULL, "日志条目容量溢出");
+        }
         int ncap = lb->cap ? lb->cap * 2 : 32;
+        if (ncap > CSVN_MAX_LOG_ENTRIES) ncap = CSVN_MAX_LOG_ENTRIES;
         csvn_log_entry *n = (csvn_log_entry *)realloc(lb->items, sizeof(csvn_log_entry) * (size_t)ncap);
         if (!n) return svn_error_create(APR_ENOMEM, NULL, "内存分配失败");
         lb->items = n;
@@ -2564,6 +3101,54 @@ int csvn_log(csvn_ctx *ctx,
 /* 10. 工作副本 URL / 11. 新增 (add) / 12. 文件内容 (cat)                 */
 /* ------------------------------------------------------------------ */
 
+static svn_error_t *csvn_dirent_get_absolute_safe(const char **out, const char *path, apr_pool_t *pool);
+static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
+                                          const char *root, const char *target,
+                                          svn_depth_t depth, svn_boolean_t adding, apr_pool_t *pool);
+
+typedef struct {
+    apr_pool_t *pool;
+    const char *repos_root;
+} local_info_root_baton;
+
+static svn_error_t *local_info_root_cb(void *baton,
+                                       const char *abspath_or_url,
+                                       const svn_client_info2_t *info,
+                                       apr_pool_t *scratch_pool)
+{
+    (void)abspath_or_url;
+    (void)scratch_pool;
+    local_info_root_baton *b = (local_info_root_baton *)baton;
+    if (info && info->repos_root_URL && *info->repos_root_URL && !b->repos_root) {
+        b->repos_root = apr_pstrdup(b->pool, info->repos_root_URL);
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *csvn_local_wc_repos_root(const char **out_repos_root,
+                                             csvn_ctx *ctx,
+                                             const char *abs_path,
+                                             apr_pool_t *pool)
+{
+    *out_repos_root = NULL;
+    local_info_root_baton b = { pool, NULL };
+    /* Both peg_revision and revision are NULL => strictly local WC metadata, zero network access. */
+    SVN_ERR(svn_client_info4(abs_path,
+                             NULL,
+                             NULL,
+                             svn_depth_empty,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             NULL,
+                             local_info_root_cb,
+                             &b,
+                             ctx->client,
+                             pool));
+    *out_repos_root = b.repos_root;
+    return SVN_NO_ERROR;
+}
+
 int csvn_wc_url(csvn_ctx *ctx,
                 const char *wc_path,
                 char *out_url,
@@ -2604,12 +3189,53 @@ int csvn_wc_url(csvn_ctx *ctx,
     return 0;
 }
 
+int csvn_wc_repos_root(csvn_ctx *ctx,
+                       const char *wc_path,
+                       char *out_url,
+                       int out_url_len)
+{
+    svn_error_t *err;
+    apr_pool_t *scratch;
+    const char *abs_path = NULL;
+    const char *wc_root = NULL;
+    const char *repos_root = NULL;
+
+    if (!ctx || !wc_path || !out_url || out_url_len <= 0) return -100;
+    out_url[0] = '\0';
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+
+    scratch = svn_pool_create(ctx->pool);
+    err = csvn_cancel_check(ctx);
+    if (!err) err = csvn_dirent_get_absolute_safe(&abs_path, wc_path, scratch);
+    if (!err) err = svn_client_get_wc_root(&wc_root, abs_path, ctx->client, scratch, scratch);
+    if (!err) err = csvn_local_wc_repos_root(&repos_root, ctx, wc_root, scratch);
+    if (err || !repos_root || !*repos_root) {
+        int rc = err ? csvn_classify(ctx, err) : -5;
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
+
+    if (strlen(repos_root) >= (size_t)out_url_len) {
+        int rc = csvn_classify(ctx, svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "仓库根 URL 超出缓冲区长度"));
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
+    csvn_copy_str(out_url, (size_t)out_url_len, repos_root);
+    svn_pool_destroy(scratch);
+    apr_thread_mutex_unlock(ctx->mutex);
+    return 0;
+}
+
 int csvn_add(csvn_ctx *ctx,
              const char *const *paths,
              int path_count)
 {
     svn_error_t *err = SVN_NO_ERROR;
     apr_pool_t *scratch;
+    const char **validated_paths = NULL;
     int i;
 
     if (!ctx || !paths || path_count <= 0) return -100;
@@ -2617,12 +3243,27 @@ int csvn_add(csvn_ctx *ctx,
     csvn_clear_error(ctx);
 
     scratch = svn_pool_create(ctx->pool);
+    validated_paths = (const char **)apr_pcalloc(scratch, sizeof(const char *) * (size_t)path_count);
     err = csvn_cancel_check(ctx);
+
+    /* SV-V02: 在同一互斥锁内先全量校验所有目标（含目录树 openat/O_NOFOLLOW 遍历），避免锁外 TOCTOU。 */
     for (i = 0; !err && i < path_count; i++) {
-        const char *canon = csvn_canon_dirent(paths[i], scratch);
+        const char *abs_target = NULL;
+        const char *wc_root = NULL;
+        err = csvn_cancel_check(ctx);
+        if (!err) err = csvn_dirent_get_absolute_safe(&abs_target, paths[i], scratch);
+        if (!err) err = svn_client_get_wc_root(&wc_root, abs_target, ctx->client, scratch, scratch);
+        if (!err) {
+            err = validate_write_target(ctx, wc_root, wc_root, abs_target,
+                                        svn_depth_empty, TRUE, scratch);
+        }
+        validated_paths[i] = abs_target;
+    }
+
+    for (i = 0; !err && i < path_count; i++) {
         err = csvn_cancel_check(ctx);
         if (!err) {
-            err = svn_client_add5(canon,
+            err = svn_client_add5(validated_paths[i],
                                   svn_depth_infinity,
                                   TRUE /* force */,
                                   FALSE /* no_ignore */,
@@ -2661,6 +3302,9 @@ static svn_error_t *cat_stream_write(void *baton, const char *data, apr_size_t *
 
     if (csvn_is_cancelled(cb->ctx)) {
         return svn_error_create(SVN_ERR_CANCELLED, NULL, "操作已取消");
+    }
+    if (incoming == 0) {
+        return SVN_NO_ERROR;
     }
 
     if (cb->max_bytes > 0) {
@@ -2746,7 +3390,7 @@ int csvn_cat_capped(csvn_ctx *ctx,
 
     memset(&cb, 0, sizeof(cb));
     cb.ctx = ctx;
-    cb.max_bytes = (size_t)max_bytes;
+    cb.max_bytes = max_bytes > 0 ? (size_t)max_bytes : (size_t)CSVN_HARD_MAX_CAT_BYTES;
     stream = svn_stream_create(&cb, scratch);
     svn_stream_set_write(stream, cat_stream_write);
 
@@ -2764,6 +3408,9 @@ int csvn_cat_capped(csvn_ctx *ctx,
     }
     if (!err && csvn_is_cancelled(ctx)) {
         err = csvn_cancel_check(ctx);
+    }
+    if (!err && max_bytes == 0 && cb.truncated) {
+        err = svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, "文件内容超过 64 MB 内存读取上限，请改用流式读取");
     }
 
     if (err) {
@@ -2785,6 +3432,87 @@ int csvn_cat_capped(csvn_ctx *ctx,
     *out_data = cb.buf;
     if (out_len) *out_len = (long)cb.len;
     if (out_truncated) *out_truncated = cb.truncated;
+
+    svn_pool_destroy(scratch);
+    apr_thread_mutex_unlock(ctx->mutex);
+    return 0;
+}
+
+typedef struct {
+    csvn_ctx *ctx;
+    csvn_stream_write_cb write_cb;
+    void *user_baton;
+} cat_callback_baton;
+
+static svn_error_t *cat_callback_stream_write(void *baton, const char *data, apr_size_t *len)
+{
+    cat_callback_baton *cb = (cat_callback_baton *)baton;
+    if (csvn_is_cancelled(cb->ctx)) {
+        return svn_error_create(SVN_ERR_CANCELLED, NULL, "操作已取消");
+    }
+    if (*len > 0) {
+        if (cb->write_cb(cb->user_baton, data, (size_t)*len) != 0) {
+            return svn_error_create(SVN_ERR_IO_WRITE_ERROR, NULL, "写入输出流失败");
+        }
+    }
+    return SVN_NO_ERROR;
+}
+
+int csvn_cat_stream(csvn_ctx *ctx,
+                    const char *path_or_url,
+                    int revision,
+                    csvn_stream_write_cb write_cb,
+                    void *baton)
+{
+    svn_error_t *err;
+    apr_pool_t *scratch;
+    const char *canon_target;
+    svn_opt_revision_t peg, rev_opt;
+    svn_stream_t *stream;
+    cat_callback_baton cb;
+
+    if (!ctx || !path_or_url || !write_cb) return -100;
+    apr_thread_mutex_lock(ctx->mutex);
+    csvn_clear_error(ctx);
+
+    scratch = svn_pool_create(ctx->pool);
+    canon_target = NULL;
+    err = csvn_cancel_check(ctx);
+    if (!err) err = csvn_canon_target_safe(&canon_target, path_or_url, scratch);
+
+    if (!err && svn_path_is_url(canon_target)) {
+        peg = (revision > 0) ? csvn_rev_number(revision) : csvn_rev_kind(svn_opt_revision_head);
+        rev_opt = peg;
+    } else {
+        peg = csvn_rev_kind(svn_opt_revision_working);
+        rev_opt = (revision > 0) ? csvn_rev_number(revision) : csvn_rev_kind(svn_opt_revision_working);
+    }
+
+    memset(&cb, 0, sizeof(cb));
+    cb.ctx = ctx;
+    cb.write_cb = write_cb;
+    cb.user_baton = baton;
+    stream = svn_stream_create(&cb, scratch);
+    svn_stream_set_write(stream, cat_callback_stream_write);
+
+    if (!err) {
+        err = svn_client_cat3(NULL, stream, canon_target, &peg, &rev_opt,
+                              TRUE /* expand_keywords */,
+                              ctx->client, scratch, scratch);
+        if (!err) {
+            err = svn_stream_close(stream);
+        }
+    }
+    if (!err && csvn_is_cancelled(ctx)) {
+        err = csvn_cancel_check(ctx);
+    }
+
+    if (err) {
+        int rc = csvn_classify(ctx, err);
+        svn_pool_destroy(scratch);
+        apr_thread_mutex_unlock(ctx->mutex);
+        return rc;
+    }
 
     svn_pool_destroy(scratch);
     apr_thread_mutex_unlock(ctx->mutex);
@@ -2849,11 +3577,24 @@ static svn_error_t *invalid_wc(const char *message)
     return svn_error_create(SVN_ERR_INCORRECT_PARAMS, NULL, message);
 }
 
+static svn_error_t *csvn_dirent_get_absolute_safe(const char **out, const char *path, apr_pool_t *pool)
+{
+    *out = NULL;
+    if (!path || !*path || svn_path_is_url(path)) {
+        return invalid_wc("需要本地工作副本路径，不能传入 URL");
+    }
+    const char *canon = svn_dirent_canonicalize(path, pool);
+    if (!canon || !*canon || svn_path_is_url(canon)) {
+        return invalid_wc("需要本地工作副本路径，不能传入 URL");
+    }
+    return svn_dirent_get_absolute(out, canon, pool);
+}
+
 static svn_error_t *validate_root(const char **root, csvn_ctx *ctx, const char *path,
                                   apr_pool_t *pool)
 {
     const char *actual;
-    SVN_ERR(svn_dirent_get_absolute(root, path, pool));
+    SVN_ERR(csvn_dirent_get_absolute_safe(root, path, pool));
     SVN_ERR(svn_client_get_wc_root(&actual, *root, ctx->client, pool, pool));
     if (strcmp(*root, actual) != 0)
         return invalid_wc("请选择实际的 SVN 工作副本根目录");
@@ -2914,6 +3655,8 @@ static svn_error_t *validate_file(const char **absolute, csvn_ctx *ctx, const ch
 static svn_error_t *ordinary_file_status(void *baton, const char *path,
                                          const svn_client_status_t *status, apr_pool_t *pool)
 {
+    (void)path;
+    (void)pool;
     if (status->file_external || status->switched || status->conflicted)
         return invalid_wc("此操作暂不支持外部文件、已切换文件或冲突文件");
     if (baton && status->node_status != svn_wc_status_normal)
@@ -2941,46 +3684,299 @@ static int finish_wc_operation(csvn_ctx *ctx, svn_error_t *err, apr_pool_t *pool
 static svn_error_t *reject_file_external(void *baton, const char *path,
                                          const svn_client_status_t *status, apr_pool_t *pool)
 {
+    (void)baton;
+    (void)pool;
     if (!status->file_external) return SVN_NO_ERROR;
     return svn_error_createf(SVN_ERR_INCORRECT_PARAMS, NULL, "操作范围包含外部文件：%s", path);
 }
 
-static svn_error_t *validate_unversioned_add_tree(csvn_ctx *ctx, const char *dir_path,
-                                                  int depth, apr_pool_t *pool)
+static void csvn_append_ignore_prop(apr_array_header_t *patterns,
+                                    const svn_string_t *prop,
+                                    apr_pool_t *pool)
 {
-    SVN_ERR(csvn_cancel_check(ctx));
+    if (!patterns || !prop || !prop->data || prop->len == 0) return;
+    svn_cstring_split_append(patterns, prop->data, "\n\r", FALSE, pool);
+}
+
+typedef struct {
+    apr_array_header_t *patterns;
+    apr_pool_t *result_pool;
+} csvn_global_ignores_baton;
+
+static svn_error_t *csvn_collect_global_ignores_cb(void *baton,
+                                                   const char *path,
+                                                   apr_hash_t *prop_hash,
+                                                   apr_array_header_t *inherited_props,
+                                                   apr_pool_t *scratch_pool)
+{
+    (void)path;
+    (void)scratch_pool;
+    csvn_global_ignores_baton *gb = (csvn_global_ignores_baton *)baton;
+    if (inherited_props) {
+        for (int i = 0; i < inherited_props->nelts; i++) {
+            const svn_prop_inherited_item_t *item =
+                APR_ARRAY_IDX(inherited_props, i, const svn_prop_inherited_item_t *);
+            if (item && item->prop_hash) {
+                const svn_string_t *val = apr_hash_get(item->prop_hash,
+                                                       SVN_PROP_INHERITABLE_IGNORES,
+                                                       APR_HASH_KEY_STRING);
+                csvn_append_ignore_prop(gb->patterns, val, gb->result_pool);
+            }
+        }
+    }
+    if (prop_hash) {
+        const svn_string_t *val = apr_hash_get(prop_hash,
+                                               SVN_PROP_INHERITABLE_IGNORES,
+                                               APR_HASH_KEY_STRING);
+        csvn_append_ignore_prop(gb->patterns, val, gb->result_pool);
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *csvn_collect_dir_externals(csvn_ctx *ctx,
+                                               const char *dir_path,
+                                               apr_hash_t *externals_set,
+                                               apr_pool_t *result_pool,
+                                               apr_pool_t *scratch_pool)
+{
+    const svn_string_t *ext_prop = NULL;
+    svn_error_t *err = svn_wc_prop_get2(&ext_prop, ctx->client->wc_ctx, dir_path,
+                                        SVN_PROP_EXTERNALS, scratch_pool, scratch_pool);
+    if (err) {
+        if (svn_error_find_cause(err, SVN_ERR_CANCELLED)) return err;
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+    if (!ext_prop || !ext_prop->data || ext_prop->len == 0) return SVN_NO_ERROR;
+
+    apr_array_header_t *externals = NULL;
+    err = svn_wc_parse_externals_description3(&externals, dir_path, ext_prop->data,
+                                              FALSE, scratch_pool);
+    if (err) {
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+    for (int i = 0; externals && i < externals->nelts; i++) {
+        const svn_wc_external_item2_t *item =
+            APR_ARRAY_IDX(externals, i, const svn_wc_external_item2_t *);
+        if (!item || !item->target_dir || !*item->target_dir) continue;
+        const char *rel = svn_relpath_canonicalize(item->target_dir, scratch_pool);
+        if (!rel || !*rel || strcmp(rel, ".") == 0 || strcmp(rel, "..") == 0 ||
+            strncmp(rel, "../", 3) == 0 || strstr(rel, "/../") != NULL) {
+            continue;
+        }
+        const char *ext_abs = svn_dirent_join(dir_path, rel, scratch_pool);
+        if (!svn_dirent_skip_ancestor(dir_path, ext_abs)) continue;
+        apr_hash_set(externals_set, apr_pstrdup(result_pool, ext_abs), APR_HASH_KEY_STRING, "1");
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *validate_add_tree(csvn_ctx *ctx,
+                                      const char *root,
+                                      const char *dir_path,
+                                      int dir_fd,
+                                      const apr_array_header_t *global_ignores,
+                                      apr_hash_t *externals_set,
+                                      apr_pool_t *externals_pool,
+                                      int depth,
+                                      apr_pool_t *pool)
+{
+    svn_error_t *err = csvn_cancel_check(ctx);
+    if (err) {
+        close(dir_fd);
+        return err;
+    }
     if (depth > 64) {
+        close(dir_fd);
         return invalid_wc("新增目录嵌套层级过深");
     }
-    DIR *dp = opendir(dir_path);
+
+    DIR *dp = fdopendir(dir_fd);
     if (!dp) {
-        return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法遍历待新增目录");
+        int saved_errno = errno;
+        close(dir_fd);
+        return svn_error_wrap_apr(APR_FROM_OS_ERROR(saved_errno), "无法遍历待新增目录");
     }
+
+    const apr_array_header_t *next_global_ignores = global_ignores;
+    const apr_array_header_t *effective_ignores = global_ignores;
+
+    svn_node_kind_t dir_kind = svn_node_none;
+    err = svn_wc_read_kind2(&dir_kind, ctx->client->wc_ctx, dir_path, FALSE, FALSE, pool);
+    if (!err && dir_kind == svn_node_dir) {
+        if (depth > 0) {
+            const svn_string_t *gprop = NULL;
+            svn_error_t *gerr = svn_wc_prop_get2(&gprop, ctx->client->wc_ctx, dir_path,
+                                                 SVN_PROP_INHERITABLE_IGNORES, pool, pool);
+            if (gerr) {
+                if (svn_error_find_cause(gerr, SVN_ERR_CANCELLED)) {
+                    closedir(dp);
+                    return gerr;
+                }
+                svn_error_clear(gerr);
+            } else if (gprop && gprop->len > 0) {
+                apr_array_header_t *copy = apr_array_copy(pool, global_ignores);
+                csvn_append_ignore_prop(copy, gprop, pool);
+                next_global_ignores = copy;
+                effective_ignores = copy;
+            }
+            err = csvn_collect_dir_externals(ctx, dir_path, externals_set, externals_pool, pool);
+        }
+        if (!err) {
+            const svn_string_t *lprop = NULL;
+            svn_error_t *lerr = svn_wc_prop_get2(&lprop, ctx->client->wc_ctx, dir_path,
+                                                 SVN_PROP_IGNORE, pool, pool);
+            if (lerr) {
+                if (svn_error_find_cause(lerr, SVN_ERR_CANCELLED)) {
+                    closedir(dp);
+                    return lerr;
+                }
+                svn_error_clear(lerr);
+            } else if (lprop && lprop->len > 0) {
+                apr_array_header_t *copy = apr_array_copy(pool, next_global_ignores);
+                csvn_append_ignore_prop(copy, lprop, pool);
+                effective_ignores = copy;
+            }
+        }
+    }
+
+    int cur_fd = dirfd(dp);
+    apr_pool_t *iterpool = svn_pool_create(pool);
     struct dirent *ent;
-    svn_error_t *err = SVN_NO_ERROR;
     while (!err && (ent = readdir(dp)) != NULL) {
         const char *name = ent->d_name;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        svn_pool_clear(iterpool);
+        err = csvn_cancel_check(ctx);
+        if (err) break;
         if (strcasecmp(name, ".svn") == 0) {
+            /* 仅跳过工作副本根目录自身的顶层 .svn；其余任何子目录下的 .svn 一律拒绝。 */
+            if (strcmp(dir_path, root) == 0 && strcmp(name, ".svn") == 0) {
+                continue;
+            }
             err = invalid_wc("待新增目录包含嵌套 .svn 元数据");
             break;
         }
-        const char *child = svn_dirent_join(dir_path, name, pool);
         struct stat st;
-        if (lstat(child, &st) != 0) {
+        if (fstatat(cur_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             err = svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法检查待新增目录项");
             break;
         }
+        const char *child = svn_dirent_join(dir_path, name, iterpool);
+        /* SV-V02: 仅当 externals_set 中的条目确实是已检出的独立外部工作副本根目录（wc_root == child != root）时跳过，
+         * 防止未检出或伪造空 .svn 的目录绕过未版本化符号链接与嵌套 .svn 检查。 */
+        if (externals_set && S_ISDIR(st.st_mode) &&
+            apr_hash_get(externals_set, child, APR_HASH_KEY_STRING) != NULL) {
+            const char *ext_wc_root = NULL;
+            svn_error_t *ext_err = svn_client_get_wc_root(&ext_wc_root, child, ctx->client,
+                                                          iterpool, iterpool);
+            if (ext_err) {
+                if (svn_error_find_cause(ext_err, SVN_ERR_CANCELLED)) {
+                    err = ext_err;
+                    break;
+                }
+                svn_error_clear(ext_err);
+            } else if (ext_wc_root && strcmp(ext_wc_root, child) == 0 &&
+                       strcmp(ext_wc_root, root) != 0) {
+                continue;
+            }
+        }
+        svn_node_kind_t child_kind = svn_node_none;
+        err = svn_wc_read_kind2(&child_kind, ctx->client->wc_ctx, child, FALSE, TRUE, iterpool);
+        if (err) break;
+        /* SV-V02: 与 csvn_add (no_ignore=FALSE) 一致，跳过会被 svn_client_add5 忽略的未版本化路径。 */
+        if (child_kind == svn_node_none && effective_ignores &&
+            svn_wc_match_ignore_list(name, effective_ignores, iterpool)) {
+            continue;
+        }
         if (S_ISLNK(st.st_mode)) {
-            err = invalid_wc("待新增目录包含符号链接，请单独审核后再加入版本控制");
-            break;
+            if (child_kind == svn_node_none) {
+                err = invalid_wc("待新增目录包含符号链接，请单独审核后再加入版本控制");
+                break;
+            }
+            continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            err = validate_unversioned_add_tree(ctx, child, depth + 1, pool);
+            int child_fd = openat(cur_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child_fd < 0) {
+                if (errno == ELOOP || errno == ENOTDIR) {
+                    err = invalid_wc("待新增目录包含符号链接，请单独审核后再加入版本控制");
+                } else {
+                    err = svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法遍历待新增目录");
+                }
+                break;
+            }
+            err = validate_add_tree(ctx, root, child, child_fd, next_global_ignores,
+                                    externals_set, externals_pool, depth + 1, iterpool);
         }
     }
     closedir(dp);
+    svn_pool_destroy(iterpool);
     return err;
+}
+
+static svn_error_t *validate_add_directory(csvn_ctx *ctx, const char *root,
+                                           const char *dir_path, apr_pool_t *pool)
+{
+    int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0) {
+        if (errno == ENOTDIR || errno == ELOOP) {
+            return SVN_NO_ERROR;
+        }
+        return svn_error_wrap_apr(APR_FROM_OS_ERROR(errno), "无法遍历待新增目录");
+    }
+
+    apr_array_header_t *global_ignores = NULL;
+    svn_error_t *err = svn_wc_get_default_ignores(&global_ignores, ctx->client->config, pool);
+    if (!err && !global_ignores) {
+        global_ignores = apr_array_make(pool, 4, sizeof(const char *));
+    }
+
+    /* 收集从 root 到 dir_path 沿途已版本化目录的 svn:externals，并读取最近已版本化祖先的继承 svn:global-ignores。 */
+    apr_hash_t *externals_set = apr_hash_make(pool);
+    const char *nearest_versioned = root;
+    if (!err) {
+        const char *cur = root;
+        err = csvn_collect_dir_externals(ctx, cur, externals_set, pool, pool);
+        const char *rel = svn_dirent_skip_ancestor(root, dir_path);
+        while (!err && rel && *rel) {
+            const char *slash = strchr(rel, '/');
+            const char *part = slash ? apr_pstrndup(pool, rel, (size_t)(slash - rel)) : rel;
+            cur = svn_dirent_join(cur, part, pool);
+            svn_node_kind_t k = svn_node_none;
+            err = svn_wc_read_kind2(&k, ctx->client->wc_ctx, cur, FALSE, FALSE, pool);
+            if (!err && k == svn_node_dir) {
+                nearest_versioned = cur;
+                err = csvn_collect_dir_externals(ctx, cur, externals_set, pool, pool);
+            } else {
+                break;
+            }
+            if (!slash) break;
+            rel = slash + 1;
+        }
+    }
+    if (!err && nearest_versioned) {
+        svn_opt_revision_t working = csvn_rev_kind(svn_opt_revision_working);
+        csvn_global_ignores_baton gb = { global_ignores, pool };
+        svn_error_t *perr = svn_client_proplist4(nearest_versioned, &working, &working,
+                                                 svn_depth_empty, NULL, TRUE,
+                                                 csvn_collect_global_ignores_cb, &gb,
+                                                 ctx->client, pool);
+        if (perr) {
+            if (svn_error_find_cause(perr, SVN_ERR_CANCELLED)) {
+                close(dir_fd);
+                return perr;
+            }
+            svn_error_clear(perr);
+        }
+    }
+    if (err) {
+        close(dir_fd);
+        return err;
+    }
+    return validate_add_tree(ctx, root, dir_path, dir_fd, global_ignores,
+                             externals_set, pool, 0, pool);
 }
 
 static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
@@ -3019,15 +4015,14 @@ static svn_error_t *validate_write_target(csvn_ctx *ctx, const char *anchor,
         relative = slash + 1;
     }
     if (adding) {
-        // 路径已逐段验证。没有任何 WC 元数据的真实节点，若是目录则递归检查嵌套 .svn 与符号链接后再交给 add_parents；
-        // 有记录的节点仍走状态检查（包括文件 external）。
+        /*
+         * SV-V02: svn_client_add5 以 svn_depth_infinity + force=TRUE + no_ignore=FALSE 执行，
+         * 使用 openat/O_NOFOLLOW/fdopendir 递归检查有效子树，拦截未忽略符号链接与嵌套 .svn。
+         */
+        SVN_ERR(validate_add_directory(ctx, root, path, pool));
         svn_node_kind_t kind;
         SVN_ERR(svn_wc_read_kind2(&kind, ctx->client->wc_ctx, path, TRUE, TRUE, pool));
         if (kind == svn_node_none) {
-            struct stat st;
-            if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-                SVN_ERR(validate_unversioned_add_tree(ctx, path, 0, pool));
-            }
             return SVN_NO_ERROR;
         }
     }
@@ -3044,9 +4039,9 @@ int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
     apr_thread_mutex_lock(ctx->mutex);
     csvn_clear_error(ctx);
     apr_pool_t *pool = svn_pool_create(ctx->pool);
-    const char *anchor, *root;
+    const char *anchor = NULL, *root = NULL;
     svn_error_t *err = csvn_cancel_check(ctx);
-    if (!err) err = svn_dirent_get_absolute(&anchor, root_path, pool);
+    if (!err) err = csvn_dirent_get_absolute_safe(&anchor, root_path, pool);
     if (!err) err = svn_client_get_wc_root(&root, anchor, ctx->client, pool, pool);
     svn_node_kind_t anchor_kind;
     if (!err) err = svn_wc_read_kind2(&anchor_kind, ctx->client->wc_ctx, anchor, FALSE, FALSE, pool);
@@ -3058,7 +4053,7 @@ int csvn_validate_write_targets(csvn_ctx *ctx, const char *root_path,
             break;
         }
         const char *abs_target = NULL;
-        err = svn_dirent_get_absolute(&abs_target, targets[i], pool);
+        err = csvn_dirent_get_absolute_safe(&abs_target, targets[i], pool);
         if (!err) {
             err = validate_write_target(ctx, anchor, root, abs_target,
                                         recursive_revert ? svn_depth_infinity : svn_depth_empty, adding, pool);
@@ -3161,6 +4156,7 @@ typedef struct {
 static svn_error_t *validate_merge_status(void *baton, const char *path,
                                           const svn_client_status_t *status, apr_pool_t *pool)
 {
+    (void)path;
     merge_preflight *state = baton;
     if (status->node_status == svn_wc_status_ignored) return SVN_NO_ERROR;
     if (status->conflicted || status->node_status != svn_wc_status_normal ||
@@ -3191,6 +4187,7 @@ typedef struct {
 
 static void merge_notify(void *baton, const svn_wc_notify_t *notify, apr_pool_t *pool)
 {
+    (void)pool;
     merge_notifications *notes = baton;
     if (!notify->path) return;
     const char *relative = svn_dirent_skip_ancestor(notes->root, notify->path);
@@ -3400,6 +4397,7 @@ static void collect_properties(apr_array_header_t *rows, apr_hash_t *properties,
 static svn_error_t *receive_properties(void *baton, const char *path, apr_hash_t *properties,
                                        apr_array_header_t *inherited, apr_pool_t *scratch)
 {
+    (void)path;
     apr_array_header_t *rows = baton;
     collect_properties(rows, properties, NULL, scratch);
     if (inherited) {
@@ -3498,6 +4496,9 @@ static svn_error_t *report_base_path(void *baton, const char *path, svn_revnum_t
                                       svn_depth_t depth, svn_boolean_t empty,
                                       const char *lock_token, apr_pool_t *pool)
 {
+    (void)depth;
+    (void)lock_token;
+    (void)pool;
     wc_base_report *base = baton;
     if (!*path && !empty) base->revision = revision;
     return SVN_NO_ERROR;
@@ -3507,6 +4508,9 @@ static svn_error_t *report_base_link(void *baton, const char *path, const char *
                                       svn_revnum_t revision, svn_depth_t depth,
                                       svn_boolean_t empty, const char *lock_token, apr_pool_t *pool)
 {
+    (void)depth;
+    (void)lock_token;
+    (void)pool;
     wc_base_report *base = baton;
     if (!*path && !empty) {
         base->url = apr_pstrdup(base->pool, url);
@@ -3517,6 +4521,7 @@ static svn_error_t *report_base_link(void *baton, const char *path, const char *
 
 static svn_error_t *report_base_delete(void *baton, const char *path, apr_pool_t *pool)
 {
+    (void)pool;
     wc_base_report *base = baton;
     if (!*path) base->revision = SVN_INVALID_REVNUM;
     return SVN_NO_ERROR;
@@ -3524,11 +4529,402 @@ static svn_error_t *report_base_delete(void *baton, const char *path, apr_pool_t
 
 static svn_error_t *finish_base_report(void *baton, apr_pool_t *pool)
 {
+    (void)baton;
+    (void)pool;
     return SVN_NO_ERROR;
 }
 
-int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int replaced,
-                              csvn_property **output, int *count)
+static int csvn_extract_origin_from_url(const char *raw_url,
+                                        const char *canon_url,
+                                        int *out_is_file,
+                                        char *out_origin,
+                                        size_t out_origin_cap)
+{
+    if (!raw_url || !*raw_url || !canon_url || !*canon_url || !out_is_file || !out_origin || out_origin_cap == 0) {
+        return 0;
+    }
+    *out_is_file = 0;
+    out_origin[0] = '\0';
+
+    for (const unsigned char *p = (const unsigned char *)raw_url; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '?' || *p == '#') return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)canon_url; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '?' || *p == '#') return 0;
+    }
+
+    const char *raw_sep = strstr(raw_url, "://");
+    const char *canon_sep = strstr(canon_url, "://");
+    if (!raw_sep || !canon_sep || raw_sep == raw_url || canon_sep == canon_url) {
+        return 0;
+    }
+
+    const char *raw_auth = raw_sep + 3;
+    const char *raw_auth_end = strchr(raw_auth, '/');
+    if (!raw_auth_end) raw_auth_end = raw_auth + strlen(raw_auth);
+    for (const char *p = raw_auth; p < raw_auth_end; p++) {
+        if (*p == '@' || (unsigned char)*p <= 0x20) return 0;
+    }
+
+    const char *canon_auth = canon_sep + 3;
+    const char *canon_auth_end = strchr(canon_auth, '/');
+    if (!canon_auth_end) canon_auth_end = canon_auth + strlen(canon_auth);
+    for (const char *p = canon_auth; p < canon_auth_end; p++) {
+        if (*p == '@' || (unsigned char)*p <= 0x20) return 0;
+    }
+
+    size_t scheme_len = (size_t)(canon_sep - canon_url);
+    if (scheme_len == 0 || scheme_len >= 16) return 0;
+    char scheme[16];
+    for (size_t i = 0; i < scheme_len; i++) {
+        unsigned char c = (unsigned char)canon_url[i];
+        scheme[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+    }
+    scheme[scheme_len] = '\0';
+
+    if (strcmp(scheme, "file") == 0) {
+        /* 仅允许空主机的本地 file:/// URL（拒绝 file://host/...）。 */
+        if (raw_auth != raw_auth_end || canon_auth != canon_auth_end) {
+            return 0;
+        }
+        if (canon_auth_end[0] != '/') {
+            return 0;
+        }
+        *out_is_file = 1;
+        return 1;
+    }
+
+    int default_port = 0;
+    if (strcmp(scheme, "https") == 0) default_port = 443;
+    else if (strcmp(scheme, "http") == 0) default_port = 80;
+    else if (strcmp(scheme, "svn") == 0) default_port = 3690;
+    else return 0; /* 明确禁止 svn+ssh:// 及其他未知协议 */
+
+    size_t auth_len = (size_t)(canon_auth_end - canon_auth);
+    if (auth_len == 0) return 0;
+
+    const char *host_start = NULL;
+    size_t host_len = 0;
+    int port = default_port;
+
+    if (canon_auth[0] == '[') {
+        const char *close_br = (const char *)memchr(canon_auth + 1, ']', auth_len - 1);
+        if (!close_br || close_br <= canon_auth + 1) return 0;
+        host_start = canon_auth + 1;
+        host_len = (size_t)(close_br - host_start);
+        const char *after = close_br + 1;
+        if (after < canon_auth_end) {
+            if (*after != ':' || after + 1 >= canon_auth_end) return 0;
+            long parsed = 0;
+            for (const char *d = after + 1; d < canon_auth_end; d++) {
+                if (*d < '0' || *d > '9') return 0;
+                parsed = parsed * 10 + (*d - '0');
+                if (parsed > 65535) return 0;
+            }
+            if (parsed < 1) return 0;
+            port = (int)parsed;
+        }
+    } else {
+        const char *colon = (const char *)memchr(canon_auth, ':', auth_len);
+        if (colon) {
+            host_start = canon_auth;
+            host_len = (size_t)(colon - canon_auth);
+            if (colon + 1 >= canon_auth_end) return 0;
+            long parsed = 0;
+            for (const char *d = colon + 1; d < canon_auth_end; d++) {
+                if (*d < '0' || *d > '9') return 0;
+                parsed = parsed * 10 + (*d - '0');
+                if (parsed > 65535) return 0;
+            }
+            if (parsed < 1) return 0;
+            port = (int)parsed;
+        } else {
+            host_start = canon_auth;
+            host_len = auth_len;
+        }
+    }
+
+    if (host_len == 0 || host_len >= 512 || host_start[0] == '-') return 0;
+    char host_lower[512];
+    for (size_t i = 0; i < host_len; i++) {
+        unsigned char c = (unsigned char)host_start[i];
+        if (c <= 0x20 || c >= 0x7f || c == '/' || c == '@') return 0;
+        host_lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+    }
+    host_lower[host_len] = '\0';
+
+    int written = strchr(host_lower, ':') != NULL
+        ? snprintf(out_origin, out_origin_cap, "%s://[%s]:%d", scheme, host_lower, port)
+        : snprintf(out_origin, out_origin_cap, "%s://%s:%d", scheme, host_lower, port);
+    if (written <= 0 || (size_t)written >= out_origin_cap) return 0;
+    return 1;
+}
+
+typedef struct {
+    apr_array_header_t *rows;
+    int captured;
+} replaced_base_diff_baton;
+
+static void collect_regular_properties(apr_array_header_t *rows, apr_hash_t *properties,
+                                       apr_pool_t *scratch)
+{
+    if (!properties) return;
+    for (apr_hash_index_t *i = apr_hash_first(scratch, properties); i; i = apr_hash_next(i)) {
+        const void *key;
+        void *value;
+        apr_hash_this(i, &key, NULL, &value);
+        const char *name = (const char *)key;
+        if (!name || svn_property_kind2(name) != svn_prop_regular_kind) continue;
+        property_row *row = apr_array_push(rows);
+        row->name = apr_pstrdup(rows->pool, name);
+        row->source = NULL;
+        row->value = svn_string_dup((const svn_string_t *)value, rows->pool);
+    }
+}
+
+static svn_error_t *replaced_diff_file_opened(svn_boolean_t *tree_conflicted,
+                                              svn_boolean_t *skip,
+                                              const char *path,
+                                              svn_revnum_t rev,
+                                              void *diff_baton,
+                                              apr_pool_t *scratch_pool)
+{
+    (void)path; (void)rev; (void)diff_baton; (void)scratch_pool;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    if (skip) *skip = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_file_changed(svn_wc_notify_state_t *contentstate,
+                                               svn_wc_notify_state_t *propstate,
+                                               svn_boolean_t *tree_conflicted,
+                                               const char *path,
+                                               const char *tmpfile1,
+                                               const char *tmpfile2,
+                                               svn_revnum_t rev1,
+                                               svn_revnum_t rev2,
+                                               const char *mimetype1,
+                                               const char *mimetype2,
+                                               const apr_array_header_t *propchanges,
+                                               apr_hash_t *originalprops,
+                                               void *diff_baton,
+                                               apr_pool_t *scratch_pool)
+{
+    (void)path; (void)tmpfile1; (void)tmpfile2; (void)rev1; (void)rev2;
+    (void)mimetype1; (void)mimetype2; (void)propchanges;
+    if (contentstate) *contentstate = svn_wc_notify_state_unchanged;
+    if (propstate) *propstate = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    replaced_base_diff_baton *b = (replaced_base_diff_baton *)diff_baton;
+    if (!b->captured) {
+        collect_regular_properties(b->rows, originalprops, scratch_pool);
+        b->captured = 1;
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_file_added(svn_wc_notify_state_t *contentstate,
+                                             svn_wc_notify_state_t *propstate,
+                                             svn_boolean_t *tree_conflicted,
+                                             const char *path,
+                                             const char *tmpfile1,
+                                             const char *tmpfile2,
+                                             svn_revnum_t rev1,
+                                             svn_revnum_t rev2,
+                                             const char *mimetype1,
+                                             const char *mimetype2,
+                                             const char *copyfrom_path,
+                                             svn_revnum_t copyfrom_revision,
+                                             const apr_array_header_t *propchanges,
+                                             apr_hash_t *originalprops,
+                                             void *diff_baton,
+                                             apr_pool_t *scratch_pool)
+{
+    (void)path; (void)tmpfile1; (void)tmpfile2; (void)rev1; (void)rev2;
+    (void)mimetype1; (void)mimetype2; (void)copyfrom_path; (void)copyfrom_revision;
+    (void)propchanges; (void)originalprops; (void)diff_baton; (void)scratch_pool;
+    if (contentstate) *contentstate = svn_wc_notify_state_unchanged;
+    if (propstate) *propstate = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_file_deleted(svn_wc_notify_state_t *state,
+                                               svn_boolean_t *tree_conflicted,
+                                               const char *path,
+                                               const char *tmpfile1,
+                                               const char *tmpfile2,
+                                               const char *mimetype1,
+                                               const char *mimetype2,
+                                               apr_hash_t *originalprops,
+                                               void *diff_baton,
+                                               apr_pool_t *scratch_pool)
+{
+    (void)path; (void)tmpfile1; (void)tmpfile2; (void)mimetype1; (void)mimetype2;
+    if (state) *state = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    replaced_base_diff_baton *b = (replaced_base_diff_baton *)diff_baton;
+    if (!b->captured) {
+        collect_regular_properties(b->rows, originalprops, scratch_pool);
+        b->captured = 1;
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_dir_deleted(svn_wc_notify_state_t *state,
+                                              svn_boolean_t *tree_conflicted,
+                                              const char *path,
+                                              void *diff_baton,
+                                              apr_pool_t *scratch_pool)
+{
+    (void)path; (void)diff_baton; (void)scratch_pool;
+    if (state) *state = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_dir_opened(svn_boolean_t *tree_conflicted,
+                                             svn_boolean_t *skip,
+                                             svn_boolean_t *skip_children,
+                                             const char *path,
+                                             svn_revnum_t rev,
+                                             void *diff_baton,
+                                             apr_pool_t *scratch_pool)
+{
+    (void)path; (void)rev; (void)diff_baton; (void)scratch_pool;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    if (skip) *skip = FALSE;
+    if (skip_children) *skip_children = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_dir_added(svn_wc_notify_state_t *state,
+                                            svn_boolean_t *tree_conflicted,
+                                            svn_boolean_t *skip,
+                                            svn_boolean_t *skip_children,
+                                            const char *path,
+                                            svn_revnum_t rev,
+                                            const char *copyfrom_path,
+                                            svn_revnum_t copyfrom_revision,
+                                            void *diff_baton,
+                                            apr_pool_t *scratch_pool)
+{
+    (void)path; (void)rev; (void)copyfrom_path; (void)copyfrom_revision;
+    (void)diff_baton; (void)scratch_pool;
+    if (state) *state = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    if (skip) *skip = FALSE;
+    if (skip_children) *skip_children = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_dir_props_changed(svn_wc_notify_state_t *propstate,
+                                                    svn_boolean_t *tree_conflicted,
+                                                    const char *path,
+                                                    svn_boolean_t dir_was_added,
+                                                    const apr_array_header_t *propchanges,
+                                                    apr_hash_t *original_props,
+                                                    void *diff_baton,
+                                                    apr_pool_t *scratch_pool)
+{
+    (void)path; (void)propchanges;
+    if (propstate) *propstate = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    replaced_base_diff_baton *b = (replaced_base_diff_baton *)diff_baton;
+    if (!dir_was_added && !b->captured) {
+        collect_regular_properties(b->rows, original_props, scratch_pool);
+        b->captured = 1;
+    }
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *replaced_diff_dir_closed(svn_wc_notify_state_t *contentstate,
+                                             svn_wc_notify_state_t *propstate,
+                                             svn_boolean_t *tree_conflicted,
+                                             const char *path,
+                                             svn_boolean_t dir_was_added,
+                                             void *diff_baton,
+                                             apr_pool_t *scratch_pool)
+{
+    (void)path; (void)dir_was_added; (void)diff_baton; (void)scratch_pool;
+    if (contentstate) *contentstate = svn_wc_notify_state_unchanged;
+    if (propstate) *propstate = svn_wc_notify_state_unchanged;
+    if (tree_conflicted) *tree_conflicted = FALSE;
+    return SVN_NO_ERROR;
+}
+
+static svn_error_t *csvn_validate_replaced_base_url(csvn_ctx *ctx,
+                                                    const char *abs_path,
+                                                    const char *raw_url,
+                                                    int allow_remote,
+                                                    const char **out_canon_url,
+                                                    int *out_allowed,
+                                                    apr_pool_t *pool)
+{
+    *out_canon_url = NULL;
+    *out_allowed = 0;
+
+    /* SV-V04: 离线模式（allow_remote == 0）严禁任何远端或外部 file:/// 仓库回退读取。 */
+    if (!allow_remote) {
+        return SVN_NO_ERROR;
+    }
+
+    const char *canon_url = NULL;
+    svn_error_t *err = csvn_canon_url_safe(&canon_url, raw_url, pool);
+    if (err || !canon_url) {
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+
+    int is_file = 0;
+    char url_origin[1024];
+    if (!csvn_extract_origin_from_url(raw_url, canon_url, &is_file, url_origin, sizeof(url_origin))) {
+        return SVN_NO_ERROR;
+    }
+
+    if (!is_file) {
+        if (!ctx->origin || !ctx->origin[0]) {
+            return SVN_NO_ERROR;
+        }
+        if (strcasecmp(url_origin, ctx->origin) != 0) {
+            return SVN_NO_ERROR;
+        }
+    }
+
+    const char *wc_root = NULL;
+    const char *wc_repos_root = NULL;
+    err = svn_client_get_wc_root(&wc_root, abs_path, ctx->client, pool, pool);
+    if (err) {
+        if (svn_error_find_cause(err, SVN_ERR_CANCELLED)) return err;
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+    err = csvn_local_wc_repos_root(&wc_repos_root, ctx, wc_root, pool);
+    if (err) {
+        if (svn_error_find_cause(err, SVN_ERR_CANCELLED)) return err;
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+    if (!wc_repos_root || !*wc_repos_root) {
+        return SVN_NO_ERROR;
+    }
+    const char *canon_repos_root = NULL;
+    err = csvn_canon_url_safe(&canon_repos_root, wc_repos_root, pool);
+    if (err || !canon_repos_root) {
+        svn_error_clear(err);
+        return SVN_NO_ERROR;
+    }
+    if (!svn_uri_skip_ancestor(canon_repos_root, canon_url, pool)) {
+        return SVN_NO_ERROR;
+    }
+
+    *out_canon_url = canon_url;
+    *out_allowed = 1;
+    return SVN_NO_ERROR;
+}
+
+int csvn_wc_property_snapshot_ex(csvn_ctx *ctx, const char *path, int pristine, int replaced,
+                                 int allow_remote, csvn_property **output, int *count)
 {
     if (!ctx || !path || !output || !count) return -100;
     *output = NULL;
@@ -3538,36 +4934,71 @@ int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int
     apr_pool_t *pool = svn_pool_create(ctx->pool);
     const char *abs_path = NULL;
     svn_error_t *err = csvn_cancel_check(ctx);
-    if (!err) err = svn_dirent_get_absolute(&abs_path, path, pool);
+    if (!err) err = csvn_dirent_get_absolute_safe(&abs_path, path, pool);
     if (err) return finish_wc_operation(ctx, err, pool);
     if (pristine && replaced) {
-        // 更新报告读取隐藏在替换节点下的 BASE，关闭文件恢复且只收集元数据。
-        wc_base_report base = {NULL, SVN_INVALID_REVNUM, pool};
-        const svn_ra_reporter3_t reporter = {
-            report_base_path, report_base_delete, report_base_link,
-            finish_base_report, finish_base_report
+        /* 优先纯离线通过 svn_wc_diff7 直接从本地 .svn/wc.db 提取被替换节点的 BASE 原始属性（零网络/零外部仓库读取）。 */
+        apr_array_header_t *offline_rows = apr_array_make(pool, 8, sizeof(property_row));
+        replaced_base_diff_baton diff_baton = { offline_rows, 0 };
+        const svn_wc_diff_callbacks4_t diff_cbs = {
+            replaced_diff_file_opened,
+            replaced_diff_file_changed,
+            replaced_diff_file_added,
+            replaced_diff_file_deleted,
+            replaced_diff_dir_deleted,
+            replaced_diff_dir_opened,
+            replaced_diff_dir_added,
+            replaced_diff_dir_props_changed,
+            replaced_diff_dir_closed
         };
-        err = svn_client_url_from_path2(&base.url, abs_path, ctx->client, pool, pool);
-        if (!err) err = svn_wc_crawl_revisions6(ctx->client->wc_ctx, abs_path, &reporter, &base,
-                                               FALSE, svn_depth_empty, TRUE, FALSE, FALSE,
-                                               ctx->client->cancel_func, ctx->client->cancel_baton,
-                                               NULL, NULL, pool);
-        if (!err) err = csvn_cancel_check(ctx);
-        if (!err && base.url && SVN_IS_VALID_REVNUM(base.revision)) {
-            svn_opt_revision_t rev = csvn_rev_number(base.revision);
-            apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
-            err = svn_client_proplist4(base.url, &rev, &rev, svn_depth_empty, NULL, FALSE,
-                                       receive_properties, rows, ctx->client, pool);
-            if (!err) {
-                err = export_properties(output, count, rows);
-                return finish_wc_operation(ctx, err, pool);
-            }
+        err = svn_wc_diff7(ctx->client->wc_ctx, abs_path, &diff_cbs, &diff_baton,
+                           svn_depth_empty, FALSE, FALSE, FALSE, NULL,
+                           ctx->client->cancel_func, ctx->client->cancel_baton, pool);
+        if (!err && diff_baton.captured) {
+            err = export_properties(output, count, offline_rows);
+            return finish_wc_operation(ctx, err, pool);
         }
         if (err && svn_error_find_cause(err, SVN_ERR_CANCELLED)) {
             return finish_wc_operation(ctx, err, pool);
         }
         svn_error_clear(err);
         err = NULL;
+
+        if (allow_remote) {
+            // 仅在显式允许回退时，经严格同源与本地 WC 仓库根校验后再查询 BASE 历史属性。
+            wc_base_report base = {NULL, SVN_INVALID_REVNUM, pool};
+            const svn_ra_reporter3_t reporter = {
+                report_base_path, report_base_delete, report_base_link,
+                finish_base_report, finish_base_report
+            };
+            err = svn_client_url_from_path2(&base.url, abs_path, ctx->client, pool, pool);
+            if (!err) err = svn_wc_crawl_revisions6(ctx->client->wc_ctx, abs_path, &reporter, &base,
+                                                   FALSE, svn_depth_empty, TRUE, FALSE, FALSE,
+                                                   ctx->client->cancel_func, ctx->client->cancel_baton,
+                                                   NULL, NULL, pool);
+            if (!err) err = csvn_cancel_check(ctx);
+            if (!err && base.url && SVN_IS_VALID_REVNUM(base.revision)) {
+                const char *safe_base_url = NULL;
+                int allowed = 0;
+                err = csvn_validate_replaced_base_url(ctx, abs_path, base.url, allow_remote,
+                                                      &safe_base_url, &allowed, pool);
+                if (!err && allowed && safe_base_url) {
+                    svn_opt_revision_t rev = csvn_rev_number(base.revision);
+                    apr_array_header_t *rows = apr_array_make(pool, 8, sizeof(property_row));
+                    err = svn_client_proplist4(safe_base_url, &rev, &rev, svn_depth_empty, NULL, FALSE,
+                                               receive_properties, rows, ctx->client, pool);
+                    if (!err) {
+                        err = export_properties(output, count, rows);
+                        return finish_wc_operation(ctx, err, pool);
+                    }
+                }
+            }
+            if (err && svn_error_find_cause(err, SVN_ERR_CANCELLED)) {
+                return finish_wc_operation(ctx, err, pool);
+            }
+            svn_error_clear(err);
+            err = NULL;
+        }
     }
     apr_hash_t *properties = NULL;
     svn_node_kind_t kind;
@@ -3585,6 +5016,12 @@ int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int
         err = export_properties(output, count, rows);
     }
     return finish_wc_operation(ctx, err, pool);
+}
+
+int csvn_wc_property_snapshot(csvn_ctx *ctx, const char *path, int pristine, int replaced,
+                              csvn_property **output, int *count)
+{
+    return csvn_wc_property_snapshot_ex(ctx, path, pristine, replaced, 0, output, count);
 }
 
 static svn_boolean_t editable_property(const char *name)

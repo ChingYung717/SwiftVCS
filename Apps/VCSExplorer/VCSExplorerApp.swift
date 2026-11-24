@@ -26,7 +26,7 @@ struct VCSExplorerApp: App {
                 }
                 exit(checks.allSatisfy(\.passed) ? 0 : 1)
             }
-        } else if !Bundle.main.bundlePath.hasSuffix(".app") {
+        } else if Bundle.main.bundleURL.pathExtension.lowercased() != "app" {
             // 直接通过 swift run VCSExplorer 启动裸二进制时，显式升级为常规前台应用以获取 Dock 图标与键盘焦点
             NSApplication.shared.setActivationPolicy(.regular)
             DispatchQueue.main.async {
@@ -261,10 +261,26 @@ final class AppModel: ObservableObject {
         guard !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else {
             return nil
         }
-        guard (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+        guard SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil else {
             return nil
         }
         return url
+    }
+
+    nonisolated private static func createSecureTempCheckoutDirectory() throws -> URL {
+        var base = NSTemporaryDirectory()
+        while base.count > 1 && base.hasSuffix("/") {
+            base.removeLast()
+        }
+        let template = base + "/swiftvcs-checkout.XXXXXX"
+        var buf = Array(template.utf8CString)
+        guard let dirPath = buf.withUnsafeMutableBufferPointer({ ptr -> String? in
+            guard let created = Darwin.mkdtemp(ptr.baseAddress) else { return nil }
+            return String(cString: created)
+        }) else {
+            throw VCSError.underlying("无法创建安全的临时检出目录")
+        }
+        return URL(fileURLWithPath: dirPath)
     }
 
     nonisolated private static func persistSettingsSnapshot(
@@ -368,35 +384,43 @@ final class AppModel: ObservableObject {
 
         await refreshTrustedCertificatesAsync()
 
-        let (createdClient, discoveredWCURL) = try await Task.detached(priority: .userInitiated) { () -> (SVNClient, URL?) in
+        let createdClient = try await Task.detached(priority: .userInitiated) { () -> SVNClient in
             var resolvedRepoURL = snapInfoURL
-            var foundWCURL: URL? = nil
             if resolvedRepoURL == nil, !snapWC.isEmpty {
-                if let wcURL = SVNClient.workingCopyURL(at: URL(fileURLWithPath: snapWC)) {
+                switch SVNClient.inspectWorkingCopyURL(at: URL(fileURLWithPath: snapWC)) {
+                case .valid(let wcURL):
                     resolvedRepoURL = wcURL
-                    foundWCURL = wcURL
+                case .invalidURL:
+                    throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝操作")
+                case .unavailable:
+                    break
                 }
             }
             if resolvedRepoURL == nil {
                 resolvedRepoURL = Self.validatedRepoURL(snapRepoURL)
             }
-            let c = try SVNClient(
+            return try SVNClient(
                 username: snapUser.isEmpty ? nil : snapUser,
                 password: resolvedRepoURL?.absoluteString == snapRepoURL && !snapPass.isEmpty
                     ? snapPass : nil,
                 baseURL: resolvedRepoURL,
                 useSavedCredentials: snapRemember
             )
-            return (c, foundWCURL)
         }.value
 
-        guard normalizedRepoURL(repoURLString) == snapRepoURL || (repoURLString.isEmpty && discoveredWCURL != nil),
+        guard normalizedRepoURL(repoURLString) == snapRepoURL,
               username == snapUser,
-              password == snapPass else {
+              password == snapPass,
+              workingCopyPath == snapWC,
+              repoInfo?.url == snapInfoURL else {
+            createdClient.requestCancel()
+            Task { await createdClient.disconnect() }
             throw VCSError.invalidArgument("连接设置已更改，请重新操作")
         }
-        if repoURLString.isEmpty, let discoveredWCURL {
-            repoURLString = discoveredWCURL.absoluteString
+        if let existing = client {
+            createdClient.requestCancel()
+            Task { await createdClient.disconnect() }
+            return existing
         }
         client = createdClient
         return createdClient
@@ -410,18 +434,28 @@ final class AppModel: ObservableObject {
         let wc = URL(fileURLWithPath: snapWC)
 
         let separateClient = try await Task.detached(priority: .userInitiated) { () -> SVNClient? in
-            if let url = SVNClient.workingCopyURL(at: wc),
-               url.absoluteString != snapRepoURL {
-                return try SVNClient(
-                    username: snapUser.isEmpty ? nil : snapUser,
-                    baseURL: url,
-                    useSavedCredentials: snapRemember
-                )
+            switch SVNClient.inspectWorkingCopyURL(at: wc) {
+            case .valid(let url):
+                if url.absoluteString != snapRepoURL {
+                    return try SVNClient(
+                        username: snapUser.isEmpty ? nil : snapUser,
+                        baseURL: url,
+                        useSavedCredentials: snapRemember
+                    )
+                }
+            case .invalidURL:
+                throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝操作")
+            case .unavailable:
+                break
             }
             return nil
         }.value
 
         guard workingCopyPath == snapWC, username == snapUser else {
+            if let separateClient {
+                separateClient.requestCancel()
+                Task { await separateClient.disconnect() }
+            }
             throw VCSError.invalidArgument("工作副本或认证设置已更改，请重试")
         }
         if let separateClient {
@@ -444,7 +478,8 @@ final class AppModel: ObservableObject {
 
     func connectCore() async throws -> RepositoryInfo {
         let cleanURL = normalizedRepoURL(repoURLString)
-        guard let url = URL(string: cleanURL), (url.isFileURL && url.user == nil && url.password == nil) || SVNOrigin(url) != nil else {
+        guard let url = URL(string: cleanURL),
+              SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil else {
             throw VCSError.invalidArgument("请输入合法的仓库 URL，并在认证栏填写凭据")
         }
 
@@ -464,12 +499,24 @@ final class AppModel: ObservableObject {
             let info = try await c.connect(to: url, credentials: nil)
             guard normalizedRepoURL(repoURLString) == cleanURL,
                   username == submittedUser, password == submittedPassword else {
+                c.requestCancel()
+                Task { await c.disconnect() }
                 throw VCSError.invalidArgument("连接设置已更改，请重新连接")
             }
             diffTask?.cancel()
+            workingDiffTask?.cancel()
             previewTask?.cancel()
             revisionDiffCache.removeAll()
             revisionDiffCacheOrder.removeAll()
+            logs = []
+            entries = []
+            currentPath = ""
+            selectedEntry = nil
+            propertyInspection = nil
+            nodeProperties = []
+            nodeIgnoreRules = nil
+            hasMoreLogs = false
+            isLoadingMoreLogs = false
             customLogPath = nil
             selectedRevision = nil
             selectedChangedItem = nil
@@ -478,7 +525,12 @@ final class AppModel: ObservableObject {
             previewTitle = nil
             isPreviewLoading = false
 
+            let oldClient = client
             client = c
+            if let oldClient {
+                oldClient.requestCancel()
+                Task { await oldClient.disconnect() }
+            }
             repoInfo = info
             certificateIssue = nil
             logGeneration += 1
@@ -497,6 +549,10 @@ final class AppModel: ObservableObject {
             _ = try await browseCore(path: nil)
             return info
         } catch {
+            if client !== c {
+                c.requestCancel()
+                Task { await c.disconnect() }
+            }
             let rawDesc = (error as? VCSError)?.errorDescription ?? "\(error)"
             let desc = SVNURLSanitizer.redactCredentials(inMessage: rawDesc)
             if desc.localizedCaseInsensitiveContains("certificate") ||
@@ -549,8 +605,8 @@ final class AppModel: ObservableObject {
 
     func checkoutCore(entry: RepositoryEntry?, destination: URL? = nil) async throws -> URL {
         let c = try await ensureClient()
-        let dest = destination ?? URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("checkout-\(UUID().uuidString.prefix(6))")
+        let createdTempDir = (destination == nil)
+        let dest = try destination ?? Self.createSecureTempCheckoutDirectory()
 
         var path: String? = nil
         if let e = entry {
@@ -569,7 +625,15 @@ final class AppModel: ObservableObject {
             path = currentPath
         }
 
-        let url = try await c.checkout(path: path, to: dest, revision: nil)
+        let url: URL
+        do {
+            url = try await c.checkout(path: path, to: dest, revision: nil)
+        } catch {
+            if createdTempDir {
+                try? FileManager.default.removeItem(at: dest)
+            }
+            throw error
+        }
         workingCopyPath = url.path
         await saveCurrentSettingsAsync()
         try await refreshStatusCore()
@@ -634,7 +698,32 @@ final class AppModel: ObservableObject {
         if paths.isEmpty && specificPaths == nil {
             return []
         }
-        return try await c.diff(workingCopy: URL(fileURLWithPath: workingCopyPath), paths: paths)
+        let wcURL = URL(fileURLWithPath: workingCopyPath)
+        let allowRemote: Bool
+        if let connected = repoInfo {
+            let connectedRoot = connected.rootURL ?? connected.url
+            let wcReposRoot = await Task.detached(priority: .userInitiated) {
+                SVNClient.workingCopyReposRoot(at: wcURL)
+            }.value
+            if let wcReposRoot,
+               SVNClient.isURL(wcReposRoot, insideOrEqualTo: connectedRoot),
+               SVNClient.isURL(connectedRoot, insideOrEqualTo: wcReposRoot) {
+                if let connectedOrigin = SVNOrigin(connected.url) {
+                    allowRemote = (c.currentOrigin == connectedOrigin)
+                } else {
+                    allowRemote = SVNOrigin.isValidLocalFileURL(connected.url)
+                }
+            } else {
+                allowRemote = false
+            }
+        } else {
+            allowRemote = false
+        }
+        return try await c.diff(
+            workingCopy: wcURL,
+            paths: paths,
+            allowRemoteReplacedBase: allowRemote
+        )
     }
 
     func logCore(customPath: String? = nil, limit: Int = 50, startRevision: Int? = nil) async throws -> [LogEntry] {
@@ -876,8 +965,24 @@ final class AppModel: ObservableObject {
         sidebarTab = tab
         switch tab {
         case .history:
-            if logs.isEmpty && (repoInfo != nil || !workingCopyPath.isEmpty) {
-                showLog(customPath: customLogPath)
+            if logs.isEmpty {
+                if repoInfo != nil {
+                    showLog(customPath: customLogPath)
+                } else if !workingCopyPath.isEmpty {
+                    let wcPath = workingCopyPath
+                    Task { [weak self] in
+                        let isLocalWC = await Task.detached(priority: .userInitiated) {
+                            SVNClient.workingCopyURL(at: URL(fileURLWithPath: wcPath))
+                                .map(SVNOrigin.isValidLocalFileURL) ?? false
+                        }.value
+                        guard let self, isLocalWC,
+                              self.sidebarTab == .history,
+                              self.repoInfo == nil,
+                              self.workingCopyPath == wcPath,
+                              self.logs.isEmpty else { return }
+                        self.showLog(customPath: self.customLogPath)
+                    }
+                }
             }
         case .changes:
             if !workingCopyPath.isEmpty && statuses.isEmpty {
@@ -1068,13 +1173,18 @@ final class AppModel: ObservableObject {
     func refreshAll() {
         run {
             var remoteError: Error? = nil
-            if self.repoInfo != nil || !self.repoURLString.isEmpty {
+            if self.repoInfo != nil {
                 do {
-                    if self.repoInfo == nil {
-                        _ = try await self.connectCore()
-                    } else {
-                        _ = try? await self.browseCore(path: self.currentPath.isEmpty ? nil : self.currentPath)
-                    }
+                    _ = try? await self.browseCore(path: self.currentPath.isEmpty ? nil : self.currentPath)
+                    _ = try await self.logCore(customPath: self.customLogPath)
+                } catch {
+                    remoteError = error
+                }
+            } else if !self.repoURLString.isEmpty,
+                      let candidate = Self.validatedRepoURL(self.normalizedRepoURL(self.repoURLString)),
+                      SVNOrigin.isValidLocalFileURL(candidate) {
+                do {
+                    _ = try await self.connectCore()
                     _ = try await self.logCore(customPath: self.customLogPath)
                 } catch {
                     remoteError = error
@@ -1090,7 +1200,7 @@ final class AppModel: ObservableObject {
             }
             self.now = Date()
             self.lastRefresh = self.now
-            self.statusText = "已刷新最新仓库历史与状态"
+            self.statusText = self.repoInfo != nil ? "已刷新最新仓库历史与状态" : "已刷新本地工作副本状态"
         }
     }
 
@@ -1300,11 +1410,16 @@ final class AppModel: ObservableObject {
 
     func revealStatusItemInFinder(_ item: WorkingCopyStatus) {
         guard !workingCopyPath.isEmpty else { return }
-        let fullURL = URL(fileURLWithPath: workingCopyPath).appendingPathComponent(item.path)
-        if FileManager.default.fileExists(atPath: fullURL.path) {
-            NSWorkspace.shared.activateFileViewerSelecting([fullURL])
-        } else {
+        do {
+            let verifiedPath = try WorkingCopyFileAccess.resolveConfinedPathForReveal(
+                relativePath: item.path,
+                inRoot: workingCopyPath
+            )
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: verifiedPath)])
+        } catch WorkingCopyFileError.openFailed(let code) where code == ENOENT {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: workingCopyPath)
+        } catch {
+            errorText = "目标路径不合法或包含不允许的符号链接，无法在 Finder 中显示"
         }
     }
 
@@ -1331,16 +1446,15 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // 未纳入版本控制的新文件：禁止跟随符号链接并做有界分块读取（超过 2 MB 直接按二进制/大文件处理）
+        // 未纳入版本控制的新文件：逐段 openat(..., O_NOFOLLOW) 阻止中间目录与末级符号链接，并做有界分块读取
         if status.kind == .unversioned {
-            let wcRootURL = URL(fileURLWithPath: workingCopyPath).standardizedFileURL
-            let fileURL = wcRootURL.appendingPathComponent(status.path).standardizedFileURL
+            let wcRootPath = workingCopyPath
             let statusPath = status.path
-            guard !statusPath.isEmpty,
+            guard !wcRootPath.isEmpty,
+                  !statusPath.isEmpty,
                   !statusPath.contains("\0"),
                   !statusPath.hasPrefix("/"),
-                  !statusPath.split(separator: "/").contains(".."),
-                  fileURL.path.hasPrefix(wcRootURL.path + "/") else {
+                  !statusPath.split(separator: "/").contains("..") else {
                 workingDiffState = .idle
                 return
             }
@@ -1349,57 +1463,62 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 let loadedState: FileDiffLoadState = await Task.detached(priority: .userInitiated) {
                     let maxPreviewBytes = 2 * 1024 * 1024
-                    let fd = Darwin.open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-                    guard fd >= 0 else { return .idle }
-                    defer { Darwin.close(fd) }
-
-                    var st = stat()
-                    guard Darwin.fstat(fd, &st) == 0 else { return .idle }
-                    guard (st.st_mode & S_IFMT) == S_IFREG else {
-                        return .binary(path: statusPath, size: nil)
-                    }
-                    if Int64(st.st_size) > Int64(maxPreviewBytes) {
-                        return .binary(path: statusPath, size: Int64(st.st_size))
-                    }
-
-                    var data = Data()
-                    data.reserveCapacity(min(Int(st.st_size), maxPreviewBytes))
-                    var buffer = [UInt8](repeating: 0, count: 16_384)
-                    while data.count <= maxPreviewBytes {
-                        let toRead = min(buffer.count, (maxPreviewBytes + 1) - data.count)
-                        let n = Darwin.read(fd, &buffer, toRead)
-                        if n > 0 {
-                            data.append(contentsOf: buffer[..<n])
-                        } else {
-                            break
+                    do {
+                        return try WorkingCopyFileAccess.withConfinedRegularFile(
+                            relativePath: statusPath,
+                            inRoot: wcRootPath
+                        ) { opened in
+                            if opened.fileSize > Int64(maxPreviewBytes) {
+                                return .binary(path: statusPath, size: opened.fileSize)
+                            }
+                            var data = Data()
+                            data.reserveCapacity(max(0, min(Int(opened.fileSize), maxPreviewBytes)))
+                            var buffer = [UInt8](repeating: 0, count: 16_384)
+                            while data.count <= maxPreviewBytes {
+                                let toRead = min(buffer.count, (maxPreviewBytes + 1) - data.count)
+                                let n = Darwin.read(opened.fileDescriptor, &buffer, toRead)
+                                if n > 0 {
+                                    data.append(contentsOf: buffer[..<n])
+                                } else if n == 0 {
+                                    break
+                                } else if errno == EINTR {
+                                    continue
+                                } else {
+                                    throw WorkingCopyFileError.openFailed(errno)
+                                }
+                            }
+                            if data.count > maxPreviewBytes || SVNClient.looksBinaryData(data) {
+                                return .binary(path: statusPath, size: opened.fileSize)
+                            }
+                            guard let text = SVNClient.decodeText(data) else {
+                                return .binary(path: statusPath, size: Int64(data.count))
+                            }
+                            let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                            let lines = rawLines.enumerated().map { idx, lineText in
+                                FileDiff.Hunk.Line(kind: .addition, text: lineText, oldLine: nil, newLine: idx + 1)
+                            }
+                            let hunk = FileDiff.Hunk(
+                                oldStart: 0,
+                                oldCount: 0,
+                                newStart: 1,
+                                newCount: lines.count,
+                                header: "@@ -0,0 +1,\(lines.count) @@ (未版本控制新文件预览)",
+                                lines: lines
+                            )
+                            let diff = FileDiff(
+                                id: statusPath,
+                                path: statusPath,
+                                localPath: URL(fileURLWithPath: opened.canonicalPath),
+                                isBinary: false,
+                                hunks: [hunk]
+                            )
+                            return .loaded(diff, isTruncated: false)
                         }
+                    } catch WorkingCopyFileError.notRegularFile {
+                        return .binary(path: statusPath, size: nil)
+                    } catch {
+                        return .idle
                     }
-                    if data.count > maxPreviewBytes || SVNClient.looksBinaryData(data) {
-                        return .binary(path: statusPath, size: Int64(st.st_size))
-                    }
-                    guard let text = SVNClient.decodeText(data) else {
-                        return .binary(path: statusPath, size: Int64(data.count))
-                    }
-                    let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-                    let lines = rawLines.enumerated().map { idx, lineText in
-                        FileDiff.Hunk.Line(kind: .addition, text: lineText, oldLine: nil, newLine: idx + 1)
-                    }
-                    let hunk = FileDiff.Hunk(
-                        oldStart: 0,
-                        oldCount: 0,
-                        newStart: 1,
-                        newCount: lines.count,
-                        header: "@@ -0,0 +1,\(lines.count) @@ (未版本控制新文件预览)",
-                        lines: lines
-                    )
-                    let diff = FileDiff(
-                        id: statusPath,
-                        path: statusPath,
-                        localPath: fileURL,
-                        isBinary: false,
-                        hunks: [hunk]
-                    )
-                    return .loaded(diff, isTruncated: false)
                 }.value
                 guard !Task.isCancelled, self.selectedStatus?.path == statusPath else { return }
                 self.workingDiffState = loadedState
@@ -1738,8 +1857,12 @@ extension AppModel {
 
     func inspectRepositoryProperties(_ entry: RepositoryEntry) {
         guard let base = repoInfo?.url, !isBusy else { return }
-        let url = entry.path.split(separator: "/").reduce(base) { $0.appendingPathComponent(String($1)) }
-        inspectProperties(PropertyInspection(target: .repository(url), isDirectory: entry.kind == .directory))
+        do {
+            let url = try SVNClient.buildRepoURL(root: base, repoRelativePath: entry.path)
+            inspectProperties(PropertyInspection(target: .repository(url), isDirectory: entry.kind == .directory))
+        } catch {
+            errorText = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)
+        }
     }
 
     private func inspectProperties(_ inspection: PropertyInspection) {
@@ -1961,33 +2084,45 @@ extension AppModel {
 
     func openConflictFile(_ status: WorkingCopyStatus) {
         guard !status.resolutions.isEmpty, !workingCopyPath.isEmpty else { return }
-        guard !status.path.isEmpty,
-              !status.path.contains("\0"),
-              !status.path.hasPrefix("/"),
-              !status.path.split(separator: "/").contains("..") else {
-            errorText = "冲突文件路径不合法"
+        let verifiedURL: URL
+        let hasUnsafeContent: Bool
+        do {
+            (verifiedURL, hasUnsafeContent) = try WorkingCopyFileAccess.withConfinedRegularFile(
+                relativePath: status.path,
+                inRoot: workingCopyPath
+            ) { opened in
+                let unsafe = WorkingCopyFileAccess.isUnsafeTextEditContent(fileDescriptor: opened.fileDescriptor)
+                return (URL(fileURLWithPath: opened.canonicalPath), unsafe)
+            }
+        } catch WorkingCopyFileError.notRegularFile {
+            do {
+                let verifiedPath = try WorkingCopyFileAccess.resolveConfinedPathForReveal(
+                    relativePath: status.path,
+                    inRoot: workingCopyPath
+                )
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: verifiedPath)])
+            } catch {
+                errorText = "冲突文件路径不合法或包含不允许的符号链接"
+            }
             return
-        }
-        let wcRoot = URL(fileURLWithPath: workingCopyPath).standardizedFileURL
-        let url = wcRoot.appendingPathComponent(status.path).standardizedFileURL
-        guard url.path.hasPrefix(wcRoot.path + "/") else {
-            errorText = "冲突文件超出当前工作副本范围"
-            return
-        }
-        var st = stat()
-        guard Darwin.lstat(url.path, &st) == 0 else {
+        } catch WorkingCopyFileError.openFailed(let code) where code == ENOENT {
             errorText = "找不到冲突工作文件"
             return
-        }
-        // 拒绝直接通过 LaunchServices 打开可执行脚本/包/符号链接；普通文件显式以纯文本编辑器打开，否则仅在 Finder 中定位。
-        guard (st.st_mode & S_IFMT) == S_IFREG else {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            errorText = "冲突文件路径不合法或包含符号链接"
             return
         }
+
+        // 拒绝直接用 TextEdit.app 渲染 HTML/SVG/RTF/XML/ODT/WordML 等富文本格式（扩展名或文件头任一命中均降级为 Finder 定位）。
+        if WorkingCopyFileAccess.isUnsafeForTextEdit(verifiedURL.path) || hasUnsafeContent {
+            NSWorkspace.shared.activateFileViewerSelecting([verifiedURL])
+            return
+        }
+
         let textEditURL = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
         if FileManager.default.fileExists(atPath: textEditURL.path) {
             let config = NSWorkspace.OpenConfiguration()
-            NSWorkspace.shared.open([url], withApplicationAt: textEditURL, configuration: config) { [weak self] _, err in
+            NSWorkspace.shared.open([verifiedURL], withApplicationAt: textEditURL, configuration: config) { [weak self] _, err in
                 if err != nil {
                     DispatchQueue.main.async {
                         self?.errorText = "无法以文本编辑器打开工作文件"
@@ -1995,7 +2130,7 @@ extension AppModel {
                 }
             }
         } else {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+            NSWorkspace.shared.activateFileViewerSelecting([verifiedURL])
         }
     }
 }

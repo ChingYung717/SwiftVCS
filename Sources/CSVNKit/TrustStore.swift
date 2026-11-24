@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -8,17 +9,86 @@ public struct SVNOrigin: Hashable, Sendable {
     public let host: String
     public let port: Int
 
+    /// 校验本地 `file://` 仓库 URL：要求主机与端口必须为空、无内嵌凭据/查询/片段且不含控制字符或 `%00`。
+    public static func isValidLocalFileURL(_ url: URL) -> Bool {
+        guard url.isFileURL,
+              url.user == nil,
+              url.password == nil,
+              url.port == nil,
+              url.query == nil,
+              url.fragment == nil,
+              (url.host?.isEmpty ?? true) else {
+            return false
+        }
+        let raw = url.absoluteString
+        guard raw.rangeOfCharacter(from: .controlCharacters) == nil,
+              !raw.lowercased().contains("%00") else {
+            return false
+        }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        guard components.user == nil,
+              components.percentEncodedUser == nil,
+              components.password == nil,
+              components.percentEncodedPassword == nil,
+              components.port == nil,
+              components.query == nil,
+              components.percentEncodedQuery == nil,
+              components.fragment == nil,
+              components.percentEncodedFragment == nil,
+              (components.host?.isEmpty ?? true),
+              components.path.hasPrefix("/"),
+              components.path.rangeOfCharacter(from: .controlCharacters) == nil,
+              !components.percentEncodedPath.lowercased().contains("%00") else {
+            return false
+        }
+        return !url.path.isEmpty && url.path.rangeOfCharacter(from: .controlCharacters) == nil
+    }
+
     public init?(_ url: URL) {
         guard let scheme = url.scheme?.lowercased(), let rawHost = url.host,
               !rawHost.isEmpty, !rawHost.contains("/"), !rawHost.contains("\0"),
               url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
               url.user == nil || scheme == "svn+ssh" else { return nil }
+        let raw = url.absoluteString
+        guard raw.rangeOfCharacter(from: .controlCharacters) == nil,
+              !raw.lowercased().contains("%00") else { return nil }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.query == nil,
+              components.percentEncodedQuery == nil,
+              components.fragment == nil,
+              components.percentEncodedFragment == nil,
+              components.password == nil,
+              components.percentEncodedPassword == nil else { return nil }
         let cleanHost = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
         guard !cleanHost.isEmpty, !cleanHost.hasPrefix("-"),
               cleanHost.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
               cleanHost.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
-        if let user = url.user {
-            guard !user.isEmpty, !user.hasPrefix("-"), !user.contains("\0") else { return nil }
+        if scheme == "svn+ssh" {
+            if let encUser = components.percentEncodedUser,
+               encUser.lowercased().contains("%00") {
+                return nil
+            }
+            if components.percentEncodedUser != nil && components.user == nil {
+                return nil
+            }
+            if let user = url.user {
+                guard !user.isEmpty,
+                      !user.hasPrefix("-"),
+                      !user.contains("\0"),
+                      !user.contains(":"),
+                      !user.contains("@"),
+                      !user.contains("/"),
+                      user.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+                      user.rangeOfCharacter(from: .controlCharacters) == nil else {
+                    return nil
+                }
+            }
+        } else if components.user != nil || components.percentEncodedUser != nil {
+            return nil
         }
         let defaultPort: Int
         switch scheme {
@@ -35,8 +105,10 @@ public struct SVNOrigin: Hashable, Sendable {
         self.port = port
     }
 
-    public var endpoint: String { "\(host):\(port)" }
-    var authPrefix: String { "\(scheme)://\(endpoint)" }
+    public var endpoint: String {
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+    public var authPrefix: String { "\(scheme)://\(endpoint)" }
 }
 
 /// 按 HTTPS 主机和端口保存人工核验过的叶证书。
@@ -79,25 +151,259 @@ public final class TrustStore: Sendable {
 
     public static let shared = TrustStore()
 
+    static let maxSecureReadBytes = 1024 * 1024
+
     public let root: URL
     private let certsDir: URL
 
-    private init() {
+    private convenience init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        root = home.appendingPathComponent(".config/vcs-explorer")
-        certsDir = root.appendingPathComponent("pinned-certs")
-        try? FileManager.default.createDirectory(
-            at: root,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
-        try? FileManager.default.createDirectory(
-            at: certsDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: certsDir.path)
+        self.init(rootDirectory: home.appendingPathComponent(".config/vcs-explorer"))
+    }
+
+    public init(rootDirectory: URL) {
+        root = rootDirectory
+        certsDir = rootDirectory.appendingPathComponent("pinned-certs")
+        try? Self.ensureSecureDirectory(at: root)
+        try? Self.ensureSecureDirectory(at: certsDir)
+    }
+
+    private static func trimTrailingSlashes(_ path: String) -> String {
+        var p = path
+        while p.count > 1 && p.hasSuffix("/") {
+            p.removeLast()
+        }
+        return p
+    }
+
+    private static func canonicalizeSystemPrefix(_ path: String) -> String {
+        for prefix in ["/var", "/tmp", "/etc"] {
+            if path == prefix {
+                return "/private" + prefix
+            }
+            if path.hasPrefix(prefix + "/") {
+                return "/private" + path
+            }
+        }
+        return path
+    }
+
+    private static func isSafeSingleFilename(_ name: String) -> Bool {
+        !name.isEmpty && !name.contains("/") && !name.contains("\0") && name != "." && name != ".."
+    }
+
+    /// 逐段以 `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` 打开并校验安全目录链，返回叶目录 FD（调用方负责 `close`）。
+    /// 当目标位于 `$HOME` 下时从 `realpath($HOME)` 开始逐段校验每个父目录（如 `~/.config`、`vcs-explorer`、`pinned-certs`）
+    /// 均非符号链接、属主为当前用户且无组/其他写权限 (`(st_mode & 0o022) == 0`)。
+    static func openSecureDirectoryFD(at dir: URL, create: Bool) throws -> Int32 {
+        let euid = Darwin.geteuid()
+        let rawDirPath = trimTrailingSlashes(dir.standardizedFileURL.path)
+        guard rawDirPath.hasPrefix("/"), !rawDirPath.contains("\0") else {
+            throw TrustStoreError.insecureStoragePath(dir.path)
+        }
+
+        let homeRaw = trimTrailingSlashes(FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path)
+        let homeReal: String? = Darwin.realpath(homeRaw, nil).map { ptr in
+            defer { free(ptr) }
+            return trimTrailingSlashes(String(cString: ptr))
+        }
+
+        let anchorPath: String
+        let relativeComponents: [String]
+        let strictAllAncestors: Bool
+
+        if let homeReal,
+           (rawDirPath == homeRaw || rawDirPath.hasPrefix(homeRaw + "/") ||
+            rawDirPath == homeReal || rawDirPath.hasPrefix(homeReal + "/")) {
+            let matchedBase = (rawDirPath == homeRaw || rawDirPath.hasPrefix(homeRaw + "/")) ? homeRaw : homeReal
+            let relStr = rawDirPath == matchedBase ? "" : String(rawDirPath.dropFirst(matchedBase.count + 1))
+            anchorPath = homeReal
+            relativeComponents = relStr.split(separator: "/").map(String.init)
+            strictAllAncestors = true
+        } else {
+            let mapped = canonicalizeSystemPrefix(rawDirPath)
+            anchorPath = "/"
+            relativeComponents = mapped.split(separator: "/").map(String.init)
+            strictAllAncestors = false
+        }
+
+        var curFD = Darwin.open(anchorPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard curFD >= 0 else {
+            throw TrustStoreError.insecureStoragePath(dir.path)
+        }
+        var curSt = stat()
+        guard Darwin.fstat(curFD, &curSt) == 0,
+              (curSt.st_mode & S_IFMT) == S_IFDIR else {
+            Darwin.close(curFD)
+            throw TrustStoreError.insecureStoragePath(dir.path)
+        }
+        if strictAllAncestors {
+            guard curSt.st_uid == euid, (curSt.st_mode & 0o022) == 0 else {
+                Darwin.close(curFD)
+                throw TrustStoreError.insecureStoragePath(dir.path)
+            }
+        }
+
+        for (idx, comp) in relativeComponents.enumerated() {
+            guard isSafeSingleFilename(comp) else {
+                Darwin.close(curFD)
+                throw TrustStoreError.insecureStoragePath(dir.path)
+            }
+            let isLeaf = (idx == relativeComponents.count - 1)
+            var nextFD = Darwin.openat(curFD, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if nextFD < 0 && errno == ENOENT && create {
+                if Darwin.mkdirat(curFD, comp, 0o700) != 0 && errno != EEXIST {
+                    Darwin.close(curFD)
+                    throw TrustStoreError.insecureStoragePath(dir.path)
+                }
+                nextFD = Darwin.openat(curFD, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard nextFD >= 0 else {
+                Darwin.close(curFD)
+                throw TrustStoreError.insecureStoragePath(dir.path)
+            }
+            Darwin.close(curFD)
+            curFD = nextFD
+
+            var st = stat()
+            guard Darwin.fstat(curFD, &st) == 0,
+                  (st.st_mode & S_IFMT) == S_IFDIR else {
+                Darwin.close(curFD)
+                throw TrustStoreError.insecureStoragePath(dir.path)
+            }
+            if strictAllAncestors || isLeaf {
+                guard st.st_uid == euid, (st.st_mode & 0o022) == 0 else {
+                    Darwin.close(curFD)
+                    throw TrustStoreError.insecureStoragePath(dir.path)
+                }
+            } else {
+                let ownerOK = (st.st_uid == euid || st.st_uid == 0)
+                let modeOK = (st.st_mode & 0o022) == 0 || (st.st_uid == 0 && (st.st_mode & S_ISVTX) != 0)
+                guard ownerOK && modeOK else {
+                    Darwin.close(curFD)
+                    throw TrustStoreError.insecureStoragePath(dir.path)
+                }
+            }
+        }
+
+        if create {
+            guard Darwin.fchmod(curFD, 0o700) == 0 else {
+                Darwin.close(curFD)
+                throw TrustStoreError.insecureStoragePath(dir.path)
+            }
+        }
+        return curFD
+    }
+
+    /// 在已校验的安全目录 FD 内以 `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` 有界读取普通文件（默认 1 MB 上限）。
+    static func readSecureRegularFile(
+        named fileName: String,
+        inDirFD dirFD: Int32,
+        maxBytes: Int = maxSecureReadBytes
+    ) -> Data? {
+        guard isSafeSingleFilename(fileName), maxBytes > 0 else { return nil }
+        let fd = Darwin.openat(dirFD, fileName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { Darwin.close(fd) }
+
+        var st = stat()
+        guard Darwin.fstat(fd, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFREG,
+              st.st_uid == Darwin.geteuid(),
+              (st.st_mode & 0o022) == 0,
+              st.st_nlink == 1,
+              st.st_size >= 0,
+              st.st_size <= Int64(maxBytes) else {
+            return nil
+        }
+
+        var data = Data()
+        data.reserveCapacity(min(Int(st.st_size), maxBytes))
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let remaining = (maxBytes + 1) - data.count
+            let toRead = min(buffer.count, remaining)
+            let n = Darwin.read(fd, &buffer, toRead)
+            if n > 0 {
+                data.append(contentsOf: buffer[..<n])
+                if data.count > maxBytes {
+                    return nil
+                }
+            } else if n == 0 {
+                break
+            } else if errno == EINTR {
+                continue
+            } else {
+                return nil
+            }
+        }
+        return data
+    }
+
+    static func ensureSecureDirectory(at dir: URL) throws {
+        let fd = try openSecureDirectoryFD(at: dir, create: true)
+        Darwin.close(fd)
+    }
+
+    static func writeSecureAtomically(_ data: Data, to dest: URL, in dir: URL) throws {
+        let fileName = dest.lastPathComponent
+        guard isSafeSingleFilename(fileName) else {
+            throw TrustStoreError.insecureStoragePath(dest.path)
+        }
+        let dirFD = try openSecureDirectoryFD(at: dir, create: true)
+        defer { Darwin.close(dirFD) }
+
+        var dstSt = stat()
+        if Darwin.fstatat(dirFD, fileName, &dstSt, AT_SYMLINK_NOFOLLOW) == 0 {
+            guard (dstSt.st_mode & S_IFMT) == S_IFREG,
+                  dstSt.st_uid == Darwin.geteuid(),
+                  (dstSt.st_mode & 0o022) == 0 else {
+                throw TrustStoreError.insecureStoragePath(dest.path)
+            }
+        } else if errno != ENOENT {
+            throw TrustStoreError.insecureStoragePath(dest.path)
+        }
+
+        let tempName = ".\(fileName)-\(UUID().uuidString).tmp"
+        let fd = Darwin.openat(dirFD, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw TrustStoreError.insecureStoragePath(dir.appendingPathComponent(tempName).path)
+        }
+        var closed = false
+        var renamed = false
+        defer {
+            if !closed { Darwin.close(fd) }
+            if !renamed { _ = Darwin.unlinkat(dirFD, tempName, 0) }
+        }
+
+        guard Darwin.fchmod(fd, 0o600) == 0 else {
+            throw TrustStoreError.insecureStoragePath(dir.appendingPathComponent(tempName).path)
+        }
+        try data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return }
+            var remaining = rawBuffer.count
+            var cursor = base
+            while remaining > 0 {
+                let written = Darwin.write(fd, cursor, remaining)
+                if written > 0 {
+                    remaining -= written
+                    cursor = cursor.advanced(by: written)
+                } else if written < 0 && errno == EINTR {
+                    continue
+                } else {
+                    throw TrustStoreError.insecureStoragePath(dir.appendingPathComponent(tempName).path)
+                }
+            }
+        }
+        let closeRC = Darwin.close(fd)
+        closed = true
+        guard closeRC == 0 else {
+            throw TrustStoreError.insecureStoragePath(dir.appendingPathComponent(tempName).path)
+        }
+        guard Darwin.renameat(dirFD, tempName, dirFD, fileName) == 0 else {
+            throw TrustStoreError.insecureStoragePath(dest.path)
+        }
+        renamed = true
     }
 
     /// 计算证书数据（PEM 或 DER）的 SHA-256 指纹（格式如 `AA:BB:CC:...`）。
@@ -115,15 +421,54 @@ public final class TrustStore: Sendable {
         return digest.map { String(format: "%02X", $0) }.joined(separator: ":")
     }
 
-    private static func extractPEMBlocks(from text: String) -> [String] {
-        var blocks: [String] = []
-        var searchRange = text.startIndex..<text.endIndex
+    private static func isValidBase64Line(_ line: Substring) -> Bool {
+        guard !line.isEmpty else { return false }
+        for byte in line.utf8 {
+            let ok = (byte >= 0x41 && byte <= 0x5A) // A-Z
+                || (byte >= 0x61 && byte <= 0x7A)   // a-z
+                || (byte >= 0x30 && byte <= 0x39)   // 0-9
+                || byte == 0x2B                     // +
+                || byte == 0x2F                     // /
+                || byte == 0x3D                     // =
+            if !ok { return false }
+        }
+        return true
+    }
+
+    /// 逐行严格匹配 PEM 边界（行锚定）并校验中间行均为合法 Base64，防止证书 Subject 文本内嵌 PEM 标记混淆。
+    public static func extractPEMBlocks(from text: String) -> [String] {
         let beginMarker = "-----BEGIN CERTIFICATE-----"
         let endMarker = "-----END CERTIFICATE-----"
-        while let begin = text.range(of: beginMarker, range: searchRange),
-              let end = text.range(of: endMarker, range: begin.upperBound..<text.endIndex) {
-            blocks.append(String(text[begin.lowerBound..<end.upperBound]))
-            searchRange = end.upperBound..<text.endIndex
+        var blocks: [String] = []
+        var inBlock = false
+        var bodyLines: [String] = []
+
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for rawLine in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
+            if !inBlock {
+                if rawLine == beginMarker {
+                    inBlock = true
+                    bodyLines.removeAll(keepingCapacity: true)
+                }
+                continue
+            }
+
+            if rawLine == endMarker {
+                let joined = bodyLines.joined()
+                if !joined.isEmpty, Data(base64Encoded: joined) != nil {
+                    blocks.append(([beginMarker] + bodyLines + [endMarker]).joined(separator: "\n"))
+                }
+                inBlock = false
+                bodyLines.removeAll(keepingCapacity: true)
+            } else if rawLine == beginMarker {
+                bodyLines.removeAll(keepingCapacity: true)
+            } else if isValidBase64Line(rawLine) {
+                bodyLines.append(String(rawLine))
+            } else {
+                inBlock = false
+                bodyLines.removeAll(keepingCapacity: true)
+            }
         }
         return blocks
     }
@@ -131,30 +476,59 @@ public final class TrustStore: Sendable {
     private static func derData(fromPEMBlock block: String) -> Data? {
         let beginMarker = "-----BEGIN CERTIFICATE-----"
         let endMarker = "-----END CERTIFICATE-----"
-        guard let begin = block.range(of: beginMarker),
-              let end = block.range(of: endMarker, range: begin.upperBound..<block.endIndex) else {
+        let lines = block.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count >= 3, lines.first == Substring(beginMarker), lines.last == Substring(endMarker) else {
             return nil
         }
-        let body = block[begin.upperBound..<end.lowerBound]
-            .components(separatedBy: .whitespacesAndNewlines)
-            .joined()
+        let middle = lines.dropFirst().dropLast()
+        guard middle.allSatisfy(isValidBase64Line) else { return nil }
+        let body = middle.joined()
         guard !body.isEmpty else { return nil }
         return Data(base64Encoded: body)
     }
 
+    public static func isSecureDirectory(_ dir: URL) -> Bool {
+        guard let fd = try? openSecureDirectoryFD(at: dir, create: false) else {
+            return false
+        }
+        Darwin.close(fd)
+        return true
+    }
+
     /// 已导入的内部证书。
     public func importedCertificates() -> [CertificateInfo] {
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: certsDir, includingPropertiesForKeys: nil)) ?? []
-        return files
-            .filter { $0.pathExtension == "crt" || $0.pathExtension == "pem" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            .map { fileURL in
-                let name = fileURL.deletingPathExtension().lastPathComponent
-                let data = (try? Data(contentsOf: fileURL)) ?? Data()
-                let fp = Self.sha256Fingerprint(of: data)
-                return CertificateInfo(name: name, url: fileURL, sha256Fingerprint: fp)
+        guard Self.isSecureDirectory(root),
+              let dirFD = try? Self.openSecureDirectoryFD(at: certsDir, create: false) else {
+            return []
+        }
+        guard let dp = Darwin.fdopendir(dirFD) else {
+            Darwin.close(dirFD)
+            return []
+        }
+        defer { Darwin.closedir(dp) }
+
+        let curFD = Darwin.dirfd(dp)
+        var entries: [(fileName: String, info: CertificateInfo)] = []
+        while let ent = Darwin.readdir(dp) {
+            let fileName: String = withUnsafePointer(to: ent.pointee.d_name) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: Int(ent.pointee.d_namlen) + 1) { cStr in
+                    String(cString: cStr)
+                }
             }
+            guard fileName != ".", fileName != ".." else { continue }
+            let ext = (fileName as NSString).pathExtension.lowercased()
+            guard ext == "crt" || ext == "pem" else { continue }
+            guard let data = Self.readSecureRegularFile(named: fileName, inDirFD: curFD) else {
+                continue
+            }
+            let fileURL = certsDir.appendingPathComponent(fileName)
+            let name = (fileName as NSString).deletingPathExtension
+            let fp = Self.sha256Fingerprint(of: data)
+            entries.append((fileName, CertificateInfo(name: name, url: fileURL, sha256Fingerprint: fp)))
+        }
+        return entries.sorted { $0.fileName < $1.fileName }.map(\.info)
     }
 
     public func trust(_ certificate: ProbedCertificate, for url: URL) throws {
@@ -164,27 +538,46 @@ public final class TrustStore: Sendable {
               Self.sha256Fingerprint(of: der) == certificate.sha256Fingerprint else {
             throw TrustStoreError.notACertificate
         }
+        try Self.ensureSecureDirectory(at: root)
         let dest = certsDir.appendingPathComponent("\(origin.endpoint).crt")
-        try der.write(to: dest, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest.path)
+        try Self.writeSecureAtomically(der, to: dest, in: certsDir)
     }
 
     public func removeCertificate(name: String) throws {
         guard name == URL(fileURLWithPath: name).lastPathComponent,
-              !name.isEmpty, !name.contains("\0"), name != ".", name != ".." else {
+              Self.isSafeSingleFilename(name) else {
             throw TrustStoreError.notACertificate
         }
+        guard Self.isSecureDirectory(root) else {
+            throw TrustStoreError.insecureStoragePath(root.path)
+        }
+        let dirFD = try Self.openSecureDirectoryFD(at: certsDir, create: false)
+        defer { Darwin.close(dirFD) }
         for ext in ["crt", "pem"] {
-            let dest = certsDir.appendingPathComponent("\(name).\(ext)")
-            if FileManager.default.fileExists(atPath: dest.path) {
-                try FileManager.default.removeItem(at: dest)
+            let fileName = "\(name).\(ext)"
+            var st = stat()
+            if Darwin.fstatat(dirFD, fileName, &st, AT_SYMLINK_NOFOLLOW) == 0 {
+                guard (st.st_mode & S_IFMT) == S_IFREG else {
+                    throw TrustStoreError.insecureStoragePath(certsDir.appendingPathComponent(fileName).path)
+                }
+                guard Darwin.unlinkat(dirFD, fileName, 0) == 0 || errno == ENOENT else {
+                    throw TrustStoreError.insecureStoragePath(certsDir.appendingPathComponent(fileName).path)
+                }
+            } else if errno != ENOENT {
+                throw TrustStoreError.insecureStoragePath(certsDir.appendingPathComponent(fileName).path)
             }
         }
     }
 
-    func pinnedCertificate(for origin: SVNOrigin) -> String? {
-        guard origin.scheme == "https",
-              let data = try? Data(contentsOf: certsDir.appendingPathComponent("\(origin.endpoint).crt")),
+    public func pinnedCertificate(for origin: SVNOrigin) -> String? {
+        guard origin.scheme == "https" else { return nil }
+        guard Self.isSecureDirectory(root),
+              let dirFD = try? Self.openSecureDirectoryFD(at: certsDir, create: false) else {
+            return nil
+        }
+        defer { Darwin.close(dirFD) }
+        let fileName = "\(origin.endpoint).crt"
+        guard let data = Self.readSecureRegularFile(named: fileName, inDirFD: dirFD),
               let der = Self.certificateDER(data) else { return nil }
         return der.base64EncodedString()
     }
@@ -282,12 +675,14 @@ public enum TrustStoreError: Error, LocalizedError {
     case notACertificate
     case cannotFetchCertificate
     case opensslUnavailable
+    case insecureStoragePath(String)
 
     public var errorDescription: String? {
         switch self {
         case .notACertificate: return "不是有效的 PEM/DER 证书"
         case .cannotFetchCertificate: return "无法获取服务器证书"
         case .opensslUnavailable: return "系统 openssl 不可用"
+        case .insecureStoragePath(let path): return "证书或配置存储路径不安全（拒绝符号链接或非当前用户属主）：\(path)"
         }
     }
 }
@@ -433,7 +828,8 @@ public enum SVNURLSanitizer {
               scheme == rawScheme else {
             return nil
         }
-        guard components.query == nil, components.fragment == nil else {
+        guard components.query == nil, components.percentEncodedQuery == nil,
+              components.fragment == nil, components.percentEncodedFragment == nil else {
             return nil
         }
         if components.path.rangeOfCharacter(from: .controlCharacters) != nil ||
@@ -446,7 +842,8 @@ public enum SVNURLSanitizer {
             components.scheme = "file"
             components.percentEncodedUser = nil
             components.percentEncodedPassword = nil
-            if let host = components.host, !host.isEmpty && host.lowercased() != "localhost" {
+            guard components.port == nil else { return nil }
+            if let host = components.host, !host.isEmpty {
                 return nil
             }
             components.host = ""
@@ -456,9 +853,7 @@ public enum SVNURLSanitizer {
                 path.removeLast()
             }
             components.percentEncodedPath = path
-            guard let url = components.url, url.isFileURL,
-                  url.user == nil, url.password == nil,
-                  (url.host?.isEmpty ?? true) else {
+            guard let url = components.url, SVNOrigin.isValidLocalFileURL(url) else {
                 return nil
             }
             return url.absoluteString
@@ -542,45 +937,123 @@ public enum SVNURLSanitizer {
         return redactCredentials(inMessage: trimmed)
     }
 
-    /// 脱敏任意日志或错误消息中形如 `scheme://user:pass@host` 或 `user:pass@` 的内嵌凭据。
+    private static func redactAuthHeaders(in text: String) -> String {
+        guard text.localizedCaseInsensitiveContains("authorization:") else { return text }
+        let utf8 = Array(text.utf8)
+        let count = utf8.count
+        var out: [UInt8] = []
+        out.reserveCapacity(count)
+
+        let proxyPrefix = Array("proxy-authorization:".utf8)
+        let authPrefix = Array("authorization:".utf8)
+        let redactedBytes = Array("<redacted>".utf8)
+
+        func isIdentifierChar(_ b: UInt8) -> Bool {
+            (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) ||
+            (b >= 0x30 && b <= 0x39) || b == 0x5F || b == 0x2D
+        }
+        func matchesCI(at idx: Int, prefix: [UInt8]) -> Bool {
+            guard idx + prefix.count <= count else { return false }
+            for k in 0..<prefix.count {
+                var c = utf8[idx + k]
+                if c >= 0x41 && c <= 0x5A { c += 32 }
+                if c != prefix[k] { return false }
+            }
+            return true
+        }
+
+        var i = 0
+        while i < count {
+            let boundaryOK = (i == 0) || !isIdentifierChar(utf8[i - 1])
+            var hdrLen = 0
+            if boundaryOK {
+                if matchesCI(at: i, prefix: proxyPrefix) {
+                    hdrLen = proxyPrefix.count
+                } else if matchesCI(at: i, prefix: authPrefix) {
+                    hdrLen = authPrefix.count
+                }
+            }
+            guard hdrLen > 0 else {
+                out.append(utf8[i])
+                i += 1
+                continue
+            }
+
+            let closeDelim: UInt8?
+            if i > 0 {
+                switch utf8[i - 1] {
+                case 0x28: closeDelim = 0x29 // '(' -> ')'
+                case 0x5B: closeDelim = 0x5D // '[' -> ']'
+                case 0x27: closeDelim = 0x27 // '\''
+                case 0x22: closeDelim = 0x22 // '"'
+                default: closeDelim = nil
+                }
+            } else {
+                closeDelim = nil
+            }
+
+            out.append(contentsOf: utf8[i..<(i + hdrLen)])
+            i += hdrLen
+            while i < count && (utf8[i] == 0x20 || utf8[i] == 0x09) {
+                out.append(utf8[i])
+                i += 1
+            }
+            let valStart = i
+            while i < count && utf8[i] != 0x0D && utf8[i] != 0x0A {
+                if let closeDelim, utf8[i] == closeDelim {
+                    break
+                }
+                i += 1
+            }
+            if i > valStart {
+                out.append(contentsOf: redactedBytes)
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// 脱敏任意日志或错误消息中形如 `scheme://user:pass@host`、`//user:pass@host`、`user:pass@` 或 `Authorization:` 头的内嵌凭据。
     public static func redactCredentials(inMessage message: String) -> String {
-        guard message.contains("@") else { return message }
         var result = message
-        let schemePatterns = [
-            // 1. 含 scheme，且 user:pass 中口令可能包含 '/'、'?'、'#'、'@'，后跟合法主机名/IPv6/端口/路径
-            #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/:<>"']+):([^\s<>"']+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"']|$))"#,
-            // 2. 含 scheme，首个 '/' 前的任意 userinfo（允许含 '?'、'#'、'@'）
-            #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/<>"']+)@"#,
-        ]
-        for pattern in schemePatterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-                let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
-                result = regex.stringByReplacingMatches(
-                    in: result,
-                    options: [],
-                    range: nsRange,
-                    withTemplate: "$1<redacted>@"
-                )
+        if result.contains("@") {
+            let schemePatterns = [
+                // 1. 含 scheme，且 user:pass 中口令可能包含 '/'、'?'、'#'、'@'、引号等，后跟合法主机名/IPv6/端口/路径或闭合标点 ),;]
+                #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/:<>"']+):((?:(?!://)[^\s<>])+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"'),;\]]|$))"#,
+                // 2. 含 scheme，首个 '/' 前的任意 userinfo（允许含 '?'、'#'、'@'）
+                #"([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/<>"']+)@"#,
+                // 2b. 协议相对 URL：//user:pass@host
+                #"(^|[\s(\[<,;'\"=])(//)([^\s/:<>"']+):((?:(?!://)[^\s<>])+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"'),;\]]|$))"#,
+            ]
+            for (idx, pattern) in schemePatterns.enumerated() {
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                    let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+                    result = regex.stringByReplacingMatches(
+                        in: result,
+                        options: [],
+                        range: nsRange,
+                        withTemplate: idx == 2 ? "$1$2<redacted>@" : "$1<redacted>@"
+                    )
+                }
+            }
+            let fallbackPatterns = [
+                // 3. 不含 scheme 的 user:pass@host（允许口令中含 '/'、'?'、'#'、'@'，后跟主机名/IPv6/端口/路径或闭合标点 ),;]）
+                #"([^\s:/?#<>"']+):([^\s<>"']+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"'),;\]]|$))"#,
+                // 4. 不含 scheme 的 user:pass@（允许口令中含 '?'、'#'、'@'，不含 '/'）
+                #"([^\s:/?#<>"']+):([^\s/<>"']+)@"#,
+            ]
+            for pattern in fallbackPatterns {
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                    let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+                    result = regex.stringByReplacingMatches(
+                        in: result,
+                        options: [],
+                        range: nsRange,
+                        withTemplate: "<redacted>@"
+                    )
+                }
             }
         }
-        let fallbackPatterns = [
-            // 3. 不含 scheme 的 user:pass@host（允许口令中含 '/'、'?'、'#'、'@'，后跟主机名/IPv6/端口/路径）
-            #"([^\s:/?#<>"']+):([^\s<>"']+)@(?=(?:\[[0-9a-fA-F:]+\]|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9.-]+/)(?::\d+)?(?:[/\s<>"']|$))"#,
-            // 4. 不含 scheme 的 user:pass@（允许口令中含 '?'、'#'、'@'，不含 '/'）
-            #"([^\s:/?#<>"']+):([^\s/<>"']+)@"#,
-        ]
-        for pattern in fallbackPatterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
-                let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
-                result = regex.stringByReplacingMatches(
-                    in: result,
-                    options: [],
-                    range: nsRange,
-                    withTemplate: "<redacted>@"
-                )
-            }
-        }
-        return result
+        return redactAuthHeaders(in: result)
     }
 }
 
@@ -687,7 +1160,13 @@ public enum AppSettingsStore {
 
     public static func load(from fileURL: URL? = nil) -> AppSettings {
         let targetURL = fileURL ?? defaultSettingsURL
-        guard let data = try? Data(contentsOf: targetURL),
+        let parentDir = targetURL.deletingLastPathComponent()
+        let fileName = targetURL.lastPathComponent
+        guard let dirFD = try? TrustStore.openSecureDirectoryFD(at: parentDir, create: false) else {
+            return AppSettings(repoURL: "", username: "", workingCopyPath: "", rememberPassword: false, recentRepos: [])
+        }
+        defer { Darwin.close(dirFD) }
+        guard let data = TrustStore.readSecureRegularFile(named: fileName, inDirFD: dirFD),
               let raw = try? JSONDecoder().decode(AppSettings.self, from: data) else {
             return AppSettings(repoURL: "", username: "", workingCopyPath: "", rememberPassword: false, recentRepos: [])
         }
@@ -716,37 +1195,8 @@ public enum AppSettingsStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(clean)
         let rootDir = targetURL.deletingLastPathComponent()
-        let fm = FileManager.default
-        try fm.createDirectory(
-            at: rootDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: rootDir.path)
-
-        let tempURL = rootDir.appendingPathComponent(".\(targetURL.lastPathComponent)-\(UUID().uuidString).tmp")
-        defer {
-            if fm.fileExists(atPath: tempURL.path) {
-                try? fm.removeItem(at: tempURL)
-            }
-        }
-
-        guard fm.createFile(
-            atPath: tempURL.path,
-            contents: data,
-            attributes: [.posixPermissions: 0o600]
-        ) else {
-            throw AppSettingsStoreError.temporaryFileCreationFailed(tempURL.path)
-        }
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
-
         do {
-            if fm.fileExists(atPath: targetURL.path) {
-                _ = try fm.replaceItemAt(targetURL, withItemAt: tempURL)
-            } else {
-                try fm.moveItem(at: tempURL, to: targetURL)
-            }
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+            try TrustStore.writeSecureAtomically(data, to: targetURL, in: rootDir)
             lastError = nil
         } catch {
             let redacted = SVNURLSanitizer.redactCredentials(inMessage: error.localizedDescription)

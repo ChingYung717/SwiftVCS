@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CVCSKit
 import CSVNKit
@@ -1717,6 +1718,419 @@ struct CVCSKitTests {
             dotdotLogRejected = true
         }
         expect(dotdotLogRejected)
+
+        // 8c. Audit Round 3 regression checks (SV-V03, SV-V05, SV-V06, SV-V09, SV-V10, SV-H02)
+        // SV-V03: Component-wise openat(..., O_NOFOLLOW) blocks intermediate directory symlinks with ELOOP
+        let outsideDir = tempRoot.appendingPathComponent("outside-secret-dir")
+        try fm.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        let outsideSecret = outsideDir.appendingPathComponent("secret.txt")
+        try "top-secret-outside\n".write(to: outsideSecret, atomically: true, encoding: .utf8)
+        let safeSubDir = wc.appendingPathComponent("confined_ok")
+        try fm.createDirectory(at: safeSubDir, withIntermediateDirectories: true)
+        let safeInsideFile = safeSubDir.appendingPathComponent("inside.txt")
+        try "inside-ok\n".write(to: safeInsideFile, atomically: true, encoding: .utf8)
+        let midLink = wc.appendingPathComponent("mid_symlink")
+        try fm.createSymbolicLink(at: midLink, withDestinationURL: outsideDir)
+        let leafLink = safeSubDir.appendingPathComponent("leaf_symlink.txt")
+        try fm.createSymbolicLink(at: leafLink, withDestinationURL: outsideSecret)
+        defer {
+            try? fm.removeItem(at: leafLink)
+            try? fm.removeItem(at: midLink)
+            try? fm.removeItem(at: safeSubDir)
+        }
+
+        let openedInside: String = try WorkingCopyFileAccess.withConfinedRegularFile(
+            relativePath: "confined_ok/inside.txt",
+            inRoot: wc.path
+        ) { opened in
+            expect(opened.fileSize == 10)
+            return opened.canonicalPath
+        }
+        expect(openedInside.hasSuffix("/confined_ok/inside.txt"))
+
+        var midSymlinkErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.withConfinedRegularFile(relativePath: "mid_symlink/secret.txt", inRoot: wc.path) { _ in }
+        } catch let err as WorkingCopyFileError {
+            midSymlinkErr = err
+        }
+        expect(midSymlinkErr == .openFailed(ELOOP))
+
+        var leafSymlinkErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.withConfinedRegularFile(relativePath: "confined_ok/leaf_symlink.txt", inRoot: wc.path) { _ in }
+        } catch let err as WorkingCopyFileError {
+            leafSymlinkErr = err
+        }
+        expect(leafSymlinkErr == .openFailed(ELOOP))
+
+        var dotdotConfinedErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.withConfinedRegularFile(relativePath: "../outside-secret-dir/secret.txt", inRoot: wc.path) { _ in }
+        } catch let err as WorkingCopyFileError {
+            dotdotConfinedErr = err
+        }
+        expect(dotdotConfinedErr == .invalidPath)
+
+        expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.html"))
+        expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.SVG"))
+        expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.rtf"))
+        expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.webarchive"))
+        expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.docx"))
+        for richExt in ["odt", "ott", "sxw", "stw", "wordml", "xml", "shtml", "shtm", "mht", "mhtml", "docm", "dot", "dotx"] {
+            expect(WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.\(richExt)"))
+        }
+        expect(!WorkingCopyFileAccess.isUnsafeForTextEdit("/tmp/a.swift"))
+
+        // SV-V03 Round-2: Header sniffing rejects rich-text/HTML/XML/WordML even without extension
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data("{\\rtf1\\ansi test}".utf8)))
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data("  \n<!DOCTYPE html><html></html>".utf8)))
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data("<html><body>x</body></html>".utf8)))
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data("<?xml version=\"1.0\"?>".utf8)))
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data("<?mso-application progid=\"Word.Document\"?>".utf8)))
+        expect(WorkingCopyFileAccess.isUnsafeTextEditData(Data([0xEF, 0xBB, 0xBF] + Array("{\\rtf1".utf8))))
+        expect(!WorkingCopyFileAccess.isUnsafeTextEditData(Data("plain utf8 text\nline 2\n".utf8)))
+
+        let disguisedRTF = safeSubDir.appendingPathComponent("disguised_noext")
+        try "{\\rtf1\\ansi secret}".write(to: disguisedRTF, atomically: true, encoding: .utf8)
+        let sniffedUnsafe: Bool = try WorkingCopyFileAccess.withConfinedRegularFile(
+            relativePath: "confined_ok/disguised_noext",
+            inRoot: wc.path
+        ) { opened in
+            WorkingCopyFileAccess.isUnsafeTextEditContent(fileDescriptor: opened.fileDescriptor)
+        }
+        expect(sniffedUnsafe)
+
+        // SV-V03 Round-2: Hard link to file outside WC rejected by both openConfinedRegularFile and resolveConfinedPathForReveal
+        let hardLinkedOutside = safeSubDir.appendingPathComponent("hardlink_secret.txt")
+        expect(Darwin.link(outsideSecret.path, hardLinkedOutside.path) == 0)
+        defer { try? fm.removeItem(at: hardLinkedOutside) }
+        var hardLinkOpenErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.withConfinedRegularFile(relativePath: "confined_ok/hardlink_secret.txt", inRoot: wc.path) { _ in }
+        } catch let err as WorkingCopyFileError {
+            hardLinkOpenErr = err
+        }
+        expect(hardLinkOpenErr == .hardLinked)
+
+        var hardLinkRevealErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.resolveConfinedPathForReveal(relativePath: "confined_ok/hardlink_secret.txt", inRoot: wc.path)
+        } catch let err as WorkingCopyFileError {
+            hardLinkRevealErr = err
+        }
+        expect(hardLinkRevealErr == .hardLinked)
+
+        // SV-V03 Round-2: resolveConfinedPathForReveal allows files & directories inside WC, rejects symlinks and '..'
+        let revealedFile = try WorkingCopyFileAccess.resolveConfinedPathForReveal(relativePath: "confined_ok/inside.txt", inRoot: wc.path)
+        expect(revealedFile.hasSuffix("/confined_ok/inside.txt"))
+        let revealedDir = try WorkingCopyFileAccess.resolveConfinedPathForReveal(relativePath: "confined_ok", inRoot: wc.path)
+        expect(revealedDir.hasSuffix("/confined_ok"))
+        var revealSymErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.resolveConfinedPathForReveal(relativePath: "mid_symlink/secret.txt", inRoot: wc.path)
+        } catch let err as WorkingCopyFileError {
+            revealSymErr = err
+        }
+        expect(revealSymErr == .openFailed(ELOOP))
+        var revealDotDotErr: WorkingCopyFileError? = nil
+        do {
+            _ = try WorkingCopyFileAccess.resolveConfinedPathForReveal(relativePath: "../outside-secret-dir/secret.txt", inRoot: wc.path)
+        } catch let err as WorkingCopyFileError {
+            revealDotDotErr = err
+        }
+        expect(revealDotDotErr == .invalidPath)
+
+        // SV-V01 Round-2: IPv6 SVNOrigin.authPrefix & endpoint include brackets
+        let ipv6Origin = require(SVNOrigin(require(URL(string: "https://[::1]:8443/repo"))))
+        expect(ipv6Origin.endpoint == "[::1]:8443")
+        expect(ipv6Origin.authPrefix == "https://[::1]:8443")
+        let ipv6Service = require(KeychainStore.service(for: require(URL(string: "https://[::1]:8443/repo"))))
+        expect(ipv6Service.contains("https://[::1]:8443/repo"))
+
+        // SV-V04 Round-2: Offline workingCopyReposRoot matches repo URL
+        let offlineReposRoot = require(SVNClient.workingCopyReposRoot(at: wc))
+        expect(SVNClient.isURL(offlineReposRoot, insideOrEqualTo: repo))
+        expect(SVNClient.isURL(repo, insideOrEqualTo: offlineReposRoot))
+
+        // SV-V05 Round-2: buildRepoURL rejects root containing ?, #, .., %2e%2e, %00, control chars
+        for badRootStr in [
+            "https://svn.example.com/repos?q=1",
+            "https://svn.example.com/repos#frag",
+            "https://svn.example.com/repos/../other",
+            "https://svn.example.com/repos/%2e%2e/other",
+            "https://svn.example.com/repos/%2E./other",
+            "https://svn.example.com/repos/%00bad",
+        ] {
+            var rootRejected = false
+            do {
+                if let u = URL(string: badRootStr) {
+                    _ = try SVNClient.buildRepoURL(root: u, repoRelativePath: "/a")
+                } else {
+                    rootRejected = true
+                }
+            } catch {
+                rootRejected = true
+            }
+            expect(rootRejected)
+        }
+
+        // SV-V05 Round-2: resolveRootURLSync rejects upward file:// ancestor escape (e.g. tempRoot or file:///tmp)
+        var ancestorEscapeRejected = false
+        do {
+            _ = try await client.diffFile(
+                revision: 1,
+                change: ChangedPath(action: .added, path: "/a.txt", kind: .file),
+                repoRootURL: tempRoot,
+                maxBytes: 4096
+            )
+        } catch {
+            ancestorEscapeRejected = true
+        }
+        expect(ancestorEscapeRejected)
+
+        var siblingRepoRejected = false
+        do {
+            _ = try await client.diffFile(
+                revision: 1,
+                change: ChangedPath(action: .added, path: "/a.txt", kind: .file),
+                repoRootURL: tempRoot.appendingPathComponent("other-repo"),
+                maxBytes: 4096
+            )
+        } catch {
+            siblingRepoRejected = true
+        }
+        expect(siblingRepoRejected)
+
+        // SV-V05 Round-2: isValidServerReposRoot validates same-origin and ancestor boundary
+        expect(SVNClient.isValidServerReposRoot(
+            require(URL(string: "https://svn.example.com/repos/app")),
+            for: require(URL(string: "https://svn.example.com/repos/app/trunk"))
+        ))
+        expect(!SVNClient.isValidServerReposRoot(
+            require(URL(string: "https://evil.example.com/repos/app")),
+            for: require(URL(string: "https://svn.example.com/repos/app/trunk"))
+        ))
+        expect(!SVNClient.isValidServerReposRoot(
+            require(URL(string: "https://svn.example.com/repos/other")),
+            for: require(URL(string: "https://svn.example.com/repos/app/trunk"))
+        ))
+        expect(!SVNClient.isValidServerReposRoot(
+            require(URL(string: "file:///")),
+            for: require(URL(string: "file:///tmp/repo/trunk"))
+        ))
+
+        // SV-V09 Round-2: file:// with port and remote URL with query/fragment must be rejected
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file://:1234/tmp/repo"))))
+        expect(SVNURLSanitizer.sanitizeForPersistence("file://:1234/tmp/repo") == nil)
+        expect(SVNOrigin(require(URL(string: "https://svn.example.com/repo?q=1"))) == nil)
+        expect(SVNOrigin(require(URL(string: "https://svn.example.com/repo#frag"))) == nil)
+        expect(SVNOrigin(require(URL(string: "https://svn.example.com/repo?"))) == nil)
+        expect(SVNOrigin(require(URL(string: "https://svn.example.com/repo#"))) == nil)
+
+        // SV-V09 Round-2b: Poisoned .svn/wc.db URL fails closed in SVNClient.update, commit, and log
+        let poisonedWC = tempRoot.appendingPathComponent("poisoned-wc-svv09")
+        try runProcess(svn, ["checkout", repo.absoluteString, poisonedWC.path])
+        let poisonedFile = poisonedWC.appendingPathComponent("a.txt")
+        try "modified-for-commit\n".write(to: poisonedFile, atomically: true, encoding: .utf8)
+        let sqliteDB = poisonedWC.appendingPathComponent(".svn/wc.db").path
+        try runProcess("/usr/bin/sqlite3", [
+            sqliteDB,
+            "UPDATE REPOSITORY SET root = 'svn+ssh://%2doProxyCommand=id@127.0.0.1/repo' WHERE id = 1;"
+        ])
+        let isPoisonedInvalid: Bool
+        if case .invalidURL = SVNClient.inspectWorkingCopyURL(at: poisonedWC) {
+            isPoisonedInvalid = true
+        } else {
+            isPoisonedInvalid = false
+        }
+        expect(isPoisonedInvalid)
+        let poisonedClient = try SVNClient()
+        var poisonedUpdateRejected = false
+        do {
+            _ = try await poisonedClient.update(workingCopy: poisonedWC, revision: nil, progress: nil)
+        } catch {
+            poisonedUpdateRejected = true
+        }
+        expect(poisonedUpdateRejected)
+
+        var poisonedCommitRejected = false
+        do {
+            _ = try await poisonedClient.commit(workingCopy: poisonedWC, paths: ["a.txt"], message: "should fail", progress: nil)
+        } catch {
+            poisonedCommitRejected = true
+        }
+        expect(poisonedCommitRejected)
+
+        var poisonedLogRejected = false
+        do {
+            _ = try await poisonedClient.log(workingCopy: poisonedWC, path: nil, limit: 1, startRevision: nil)
+        } catch {
+            poisonedLogRejected = true
+        }
+        expect(poisonedLogRejected)
+        try? fm.removeItem(at: poisonedWC)
+
+        // SV-V10 Round-2: Swift credential redaction covers trailing ),;], peg @123, //user:pass@host, and Authorization headers
+        let parenSlash = SVNURLSanitizer.redactCredentials(inMessage: "(https://alice:p/s@svn.example.com), retry")
+        expect(!parenSlash.contains("p/s") && !parenSlash.contains("alice") && parenSlash == "(https://<redacted>@svn.example.com), retry")
+        let pegSlash = SVNURLSanitizer.redactCredentials(inMessage: "Error https://alice:top/secret@svn.example.com/repo/file.txt@123 failed")
+        expect(!pegSlash.contains("top/secret") && pegSlash.contains("https://<redacted>@svn.example.com/repo/file.txt@123"))
+        let schemeRel = SVNURLSanitizer.redactCredentials(inMessage: "See //alice:secret@svn.example.com/repo")
+        expect(!schemeRel.contains("secret") && schemeRel.contains("//<redacted>@svn.example.com/repo"))
+        let authHeader = SVNURLSanitizer.redactCredentials(inMessage: "Authorization: Basic dXNlcjpwYXNz\r\nProxy-Authorization: Bearer tok123\r\nHost: x")
+        expect(!authHeader.contains("dXNlcjpwYXNz") && !authHeader.contains("tok123"))
+        expect(authHeader == "Authorization: <redacted>\r\nProxy-Authorization: <redacted>\r\nHost: x")
+        let inlineAuth = SVNURLSanitizer.redactCredentials(inMessage: "HTTP (Authorization: Basic dXNlcjpwYXNz) retry")
+        expect(inlineAuth == "HTTP (Authorization: <redacted>) retry")
+
+        // SV-H02 Round-2: TrustStore rejects 0o022 writable dirs, symlinked files/parents, and oversized (>1 MB) files
+        let trustRoot = tempRoot.appendingPathComponent("isolated-trust-root")
+        let isolatedStore = TrustStore(rootDirectory: trustRoot)
+        let isolatedCertsDir = trustRoot.appendingPathComponent("pinned-certs")
+        expect(TrustStore.isSecureDirectory(trustRoot))
+        expect(TrustStore.isSecureDirectory(isolatedCertsDir))
+
+        // Group/world-writable directory (0o777 / 0o775) rejected
+        expect(Darwin.chmod(isolatedCertsDir.path, 0o777) == 0)
+        expect(!TrustStore.isSecureDirectory(isolatedCertsDir))
+        expect(isolatedStore.importedCertificates().isEmpty)
+        expect(isolatedStore.pinnedCertificate(for: ipv6Origin) == nil)
+        var insecureRemoveRejected = false
+        do {
+            try isolatedStore.removeCertificate(name: "test")
+        } catch {
+            insecureRemoveRejected = true
+        }
+        expect(insecureRemoveRejected)
+        expect(Darwin.chmod(isolatedCertsDir.path, 0o700) == 0)
+        expect(TrustStore.isSecureDirectory(isolatedCertsDir))
+
+        // Symlinked .crt inside pinned-certs ignored on read and rejected on remove
+        let symCert = isolatedCertsDir.appendingPathComponent("evil.example:443.crt")
+        try fm.createSymbolicLink(at: symCert, withDestinationURL: outsideSecret)
+        expect(isolatedStore.importedCertificates().isEmpty)
+        var symCertRemoveRejected = false
+        do {
+            try isolatedStore.removeCertificate(name: "evil.example:443")
+        } catch {
+            symCertRemoveRejected = true
+        }
+        expect(symCertRemoveRejected)
+        try? fm.removeItem(at: symCert)
+
+        // Oversized (> 1 MB) settings.json rejected cleanly without unbounded read
+        let bigDir = tempRoot.appendingPathComponent("oversized-settings-dir")
+        try fm.createDirectory(at: bigDir, withIntermediateDirectories: true)
+        expect(Darwin.chmod(bigDir.path, 0o700) == 0)
+        let bigSettingsFile = bigDir.appendingPathComponent("settings.json")
+        let bigPayload = Data(repeating: 0x20, count: 1_200_000)
+        try bigPayload.write(to: bigSettingsFile)
+        let loadedBig = AppSettingsStore.load(from: bigSettingsFile)
+        expect(loadedBig.repoURL.isEmpty && loadedBig.workingCopyPath.isEmpty)
+        try? fm.removeItem(at: bigDir)
+        try? fm.removeItem(at: trustRoot)
+
+        // SV-V05: buildRepoURL rejects traversal and mismatched explicit rootURL
+        let sampleRoot = require(URL(string: "https://svn.example.com:8443/repos/app"))
+        let validBuilt = try SVNClient.buildRepoURL(root: sampleRoot, repoRelativePath: "/trunk/Sources/main.swift")
+        expect(validBuilt.absoluteString == "https://svn.example.com:8443/repos/app/trunk/Sources/main.swift")
+        for badRel in ["/../other/secret", "trunk/../../other", "/./file", "/a/\0b"] {
+            var rejected = false
+            do {
+                _ = try SVNClient.buildRepoURL(root: sampleRoot, repoRelativePath: badRel)
+            } catch {
+                rejected = true
+            }
+            expect(rejected)
+        }
+        var badRootRejected = false
+        do {
+            _ = try SVNClient.buildRepoURL(root: require(URL(string: "file://evil.host/repo")), repoRelativePath: "/a")
+        } catch {
+            badRootRejected = true
+        }
+        expect(badRootRejected)
+
+        var crossOriginDiffRejected = false
+        do {
+            _ = try await client.diffFile(
+                revision: 1,
+                change: ChangedPath(action: .added, path: "/a.txt", kind: .file),
+                repoRootURL: require(URL(string: "https://evil.example.com/repo")),
+                maxBytes: 4096
+            )
+        } catch {
+            crossOriginDiffRejected = true
+        }
+        expect(crossOriginDiffRejected)
+
+        // SV-V06: Line-anchored PEM extraction ignores Subject-embedded PEM markers & non-Base64 lines
+        let fakeSubjectOutput = """
+        depth=0 CN = -----BEGIN CERTIFICATE-----fake-----END CERTIFICATE-----
+        s:/CN=-----BEGIN CERTIFICATE-----
+        i:/CN=-----END CERTIFICATE-----
+        -----BEGIN CERTIFICATE-----
+        NOT!VALID!BASE64!LINE
+        -----END CERTIFICATE-----
+        -----BEGIN CERTIFICATE-----
+        MIIB
+        -----BEGIN CERTIFICATE-----
+        QUJDRA==
+        -----END CERTIFICATE-----
+        """
+        let extractedPEMs = TrustStore.extractPEMBlocks(from: fakeSubjectOutput)
+        expect(extractedPEMs.count == 1)
+        expect(extractedPEMs.first == "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----")
+
+        // SV-V09: Unified file:// validation and tightened svn+ssh user validation
+        expect(SVNOrigin.isValidLocalFileURL(require(URL(string: "file:///tmp/repo"))))
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file://evil.host/repo"))))
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file://localhost/repo"))))
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file:///tmp/repo?x=1"))))
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file:///tmp/repo#frag"))))
+        expect(!SVNOrigin.isValidLocalFileURL(require(URL(string: "file:///tmp/repo%00bad"))))
+        expect(SVNOrigin(require(URL(string: "svn+ssh://alice@svn.example.com/repo"))) != nil)
+        expect(SVNOrigin(require(URL(string: "svn+ssh://a%20-oX@svn.example.com/repo"))) == nil)
+        expect(SVNOrigin(require(URL(string: "svn+ssh://u%00x@svn.example.com/repo"))) == nil)
+        expect(SVNOrigin(require(URL(string: "svn+ssh://u%2Fx@svn.example.com/repo"))) == nil)
+        expect(SVNOrigin(require(URL(string: "svn+ssh://u%3Ax@svn.example.com/repo"))) == nil)
+
+        // SV-H02: AppSettingsStore rejects symlinked directory, ignoreRules validates via C inspect_node first
+        let symlinkCfgDir = tempRoot.appendingPathComponent("symlink-cfg-dir")
+        try fm.createSymbolicLink(at: symlinkCfgDir, withDestinationURL: outsideDir)
+        var symlinkSettingsRejected = false
+        do {
+            try AppSettingsStore.saveThrowing(AppSettings(repoURL: "https://svn.example.com/r"),
+                                              to: symlinkCfgDir.appendingPathComponent("settings.json"))
+        } catch {
+            symlinkSettingsRejected = true
+        }
+        expect(symlinkSettingsRejected)
+        try? fm.removeItem(at: symlinkCfgDir)
+
+        var badIgnoreDirRejected = false
+        do {
+            _ = try await client.ignoreRules(workingCopy: wc, directory: "../outside-secret-dir")
+        } catch {
+            badIgnoreDirRejected = true
+        }
+        expect(badIgnoreDirRejected)
+
+        // SV-V10: Streaming cat writes directly to file descriptor
+        var pipeFDs: [Int32] = [-1, -1]
+        expect(Darwin.pipe(&pipeFDs) == 0)
+        try await client.cat(path: "z_tail.txt", revision: nil, writingTo: pipeFDs[1])
+        Darwin.close(pipeFDs[1])
+        var streamedBytes = Data()
+        var readBuf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = Darwin.read(pipeFDs[0], &readBuf, readBuf.count)
+            if n > 0 { streamedBytes.append(contentsOf: readBuf[..<n]) }
+            else { break }
+        }
+        Darwin.close(pipeFDs[0])
+        expect(!streamedBytes.isEmpty)
 
         // 9. Verify no /tmp/csvn-*diff* or /tmp/csvn-err-* temporary files were leaked
         let tmpEntries = (try? fm.contentsOfDirectory(atPath: "/tmp")) ?? []

@@ -4,8 +4,11 @@ import contextlib
 import http.server
 import os
 from pathlib import Path
+import pty
 import re
+import select
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -341,5 +344,308 @@ with tempfile.TemporaryDirectory(prefix="swiftvcs-security-") as temp:
         )
         assert result.returncode == 1 and not hits, (result.stderr, hits)
         assert "同一 SVN 端点" in result.stderr
+
+    # SV-V01: Pre-existing wildcard [groups] and poisoned [__swiftvcs_scoped_ca__] in ~/.subversion/servers
+    # must NEVER break --ca host scoping or allow %(...)s config interpolation.
+    svn_cfg_dir = home / ".subversion"
+    svn_cfg_dir.mkdir(parents=True, exist_ok=True)
+    (svn_cfg_dir / "servers").write_text(
+        "[groups]\n"
+        "all = *\n"
+        "wild_loopback = 127.*, localhost\n"
+        "__swiftvcs_scoped_ca__ = 127.0.0.1\n\n"
+        "[__swiftvcs_scoped_ca__]\n"
+        "ssl-authority-files = /nonexistent/poison.pem\n\n"
+        "[all]\n"
+        "http-timeout = 30\n"
+    )
+    with endpoint(leaf_cert, leaf_key) as (url, hits):
+        # Reject %(...)s interpolation in --ca path before connecting, with non-empty descriptive error
+        pct_ca = root / "%(http-proxy-password)s.pem"
+        pct_ca.write_bytes(ca_cert.read_bytes())
+        pct_res = run(env, url, "--ca", str(pct_ca), "--user", user, "--password", password)
+        assert pct_res.returncode != 0 and not hits, (pct_res.stderr, hits)
+        assert "CA" in pct_res.stderr or "非法" in pct_res.stderr, pct_res.stderr
+
+        # Repeated runs verify deterministic scoping regardless of apr_hash_t seed
+        for _ in range(5):
+            hits.clear()
+            ok_res = run(env, url, "--ca", str(ca_cert), "--user", user, "--password", password)
+            assert any(authorized for _, authorized in hits), (ok_res.stderr, hits)
+
+        # SV-V01 Round-2: Uppercase __SWIFTVCS_SCOPED_CA__ in ~/.subversion/servers must NOT break --ca scoping
+        (svn_cfg_dir / "servers").write_text(
+            "[groups]\n"
+            "all = *\n"
+            "__SWIFTVCS_SCOPED_CA__ = 127.0.0.1\n\n"
+            "[__SWIFTVCS_SCOPED_CA__]\n"
+            "ssl-authority-files = /nonexistent/poison-upper.pem\n"
+        )
+        hits.clear()
+        upper_res = run(env, url, "--ca", str(ca_cert), "--user", user, "--password", password)
+        assert any(authorized for _, authorized in hits), (upper_res.stderr, hits)
+
+    # SV-V04: Poisoned replaced node in .svn/wc.db pointing to rogue loopback URL must NEVER trigger outbound HTTP
+    ssrf_doc = working / "ssrf_doc.txt"
+    ssrf_doc.write_text("v1\n")
+    subprocess.run([svn, "add", str(ssrf_doc)], env=env, check=True, capture_output=True)
+    subprocess.run([svn, "propset", "k", "v", str(ssrf_doc)], env=env, check=True, capture_output=True)
+    subprocess.run([svn, "commit", str(working), "-m", "add doc"], env=env, check=True, capture_output=True)
+    subprocess.run([svn, "update", str(working)], env=env, check=True, capture_output=True)
+    subprocess.run([svn, "delete", str(ssrf_doc)], env=env, check=True, capture_output=True)
+    ssrf_doc.write_text("replaced\n")
+    subprocess.run([svn, "add", str(ssrf_doc)], env=env, check=True, capture_output=True)
+    with endpoint() as (rogue_url, rogue_hits):
+        wc_db = working / ".svn" / "wc.db"
+        conn = sqlite3.connect(str(wc_db))
+        try:
+            conn.execute(
+                "INSERT INTO REPOSITORY (id, root, uuid) VALUES (2, ?, '00000000-0000-0000-0000-000000000000')",
+                (rogue_url,),
+            )
+            conn.execute(
+                "UPDATE NODES SET repos_id = 2 WHERE local_relpath = 'ssrf_doc.txt' AND op_depth = 0"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        diff_res = subprocess.run(
+            [binary, "diff", str(working), "ssrf_doc.txt"],
+            env=env, capture_output=True, text=True, timeout=25,
+        )
+        assert diff_res.returncode == 0, (diff_res.stdout, diff_res.stderr)
+        assert not rogue_hits, f"SV-V04 regression: passive SSRF hit {rogue_hits}"
+
+    # SV-V04 Round-2 (P0): Poisoning REPOSITORY id=1 ITSELF to an HTTP URL on a replaced WC must NEVER
+    # trigger outbound HTTP during default offline `vcsctl diff <wc>`.
+    ssrf_wc1 = root / "ssrf-id1-wc"
+    subprocess.run([svn, "checkout", repository.as_uri(), str(ssrf_wc1)],
+                   env=env, check=True, capture_output=True)
+    ssrf_doc1 = ssrf_wc1 / "ssrf_doc.txt"
+    subprocess.run([svn, "delete", str(ssrf_doc1)], env=env, check=True, capture_output=True)
+    ssrf_doc1.write_text("replaced id1\n")
+    subprocess.run([svn, "add", str(ssrf_doc1)], env=env, check=True, capture_output=True)
+    with endpoint() as (rogue_id1_url, rogue_id1_hits):
+        wc_db1 = ssrf_wc1 / ".svn" / "wc.db"
+        conn = sqlite3.connect(str(wc_db1))
+        try:
+            conn.execute("UPDATE REPOSITORY SET root = ? WHERE id = 1", (rogue_id1_url,))
+            conn.commit()
+        finally:
+            conn.close()
+        diff_id1 = subprocess.run(
+            [binary, "diff", str(ssrf_wc1), "ssrf_doc.txt"],
+            env=env, capture_output=True, text=True, timeout=25,
+        )
+        assert diff_id1.returncode == 0, (diff_id1.stdout, diff_id1.stderr)
+        assert not rogue_id1_hits, f"SV-V04 P0 regression: vcsctl diff hit REPOSITORY id=1 {rogue_id1_hits}"
+
+    # SV-V09 Round-2: Poisoned invalid WC URL (svn+ssh option injection or file://host) must fail closed on update/log
+    for bad_wc_url in (
+        "svn+ssh://-oProxyCommand=id@127.0.0.1/repo",
+        "file://evil.host/tmp/repo",
+        "file://:1234/tmp/repo",
+    ):
+        bad_wc = root / f"bad-wc-{abs(hash(bad_wc_url))}"
+        subprocess.run([svn, "checkout", repository.as_uri(), str(bad_wc)],
+                       env=env, check=True, capture_output=True)
+        conn = sqlite3.connect(str(bad_wc / ".svn" / "wc.db"))
+        try:
+            conn.execute("UPDATE REPOSITORY SET root = ? WHERE id = 1", (bad_wc_url,))
+            conn.commit()
+        finally:
+            conn.close()
+        for subcmd in (["update", str(bad_wc)], ["log", str(bad_wc), "--limit", "1"]):
+            res = subprocess.run([binary, *subcmd], env=env, capture_output=True, text=True, timeout=25)
+            assert res.returncode != 0, (bad_wc_url, subcmd, res.stdout, res.stderr)
+            assert "非法" in res.stderr, (bad_wc_url, subcmd, res.stderr)
+
+    # SV-V02 Round-2: `vcsctl add <wc>` allows ignored symlinks & declared svn:externals subdirs, blocks unignored symlinks
+    svv02_wc = root / "svv02-wc"
+    subprocess.run([svn, "checkout", repository.as_uri(), str(svv02_wc)],
+                   env=env, check=True, capture_output=True)
+    subprocess.run([svn, "propset", "svn:ignore", "node_modules\n", str(svv02_wc)],
+                   env=env, check=True, capture_output=True)
+    subprocess.run([svn, "propset", "svn:externals", f"{repository.as_uri()} ext_sub\n", str(svv02_wc)],
+                   env=env, check=True, capture_output=True)
+    subprocess.run([svn, "update", str(svv02_wc)], env=env, check=True, capture_output=True)
+    assert (svv02_wc / "ext_sub" / ".svn").is_dir()
+    nm = svv02_wc / "node_modules"
+    nm.mkdir()
+    (nm / "binlink").symlink_to("/etc/hosts")
+    legit_new = svv02_wc / "legit_new.txt"
+    legit_new.write_text("ok\n")
+    add_ok = subprocess.run([binary, "add", str(svv02_wc)], env=env, capture_output=True, text=True, timeout=25)
+    assert add_ok.returncode == 0, (add_ok.stdout, add_ok.stderr)
+    # Unignored symlink must still be rejected
+    bad_link = svv02_wc / "unignored_bad_link"
+    bad_link.symlink_to("/etc/hosts")
+    add_bad = subprocess.run([binary, "add", str(svv02_wc)], env=env, capture_output=True, text=True, timeout=25)
+    assert add_bad.returncode != 0, (add_bad.stdout, add_bad.stderr)
+    bad_link.unlink()
+
+    # SV-V02 Round-2b: Unpopulated or spoofed-empty-.svn svn:externals targets MUST NOT bypass validation
+    subprocess.run(
+        [svn, "propset", "svn:externals",
+         f"{repository.as_uri()} ext_sub\n{repository.as_uri()} fake_ext\n{repository.as_uri()} fake_ext2\n",
+         str(svv02_wc)],
+        env=env, check=True, capture_output=True,
+    )
+    fake_ext = svv02_wc / "fake_ext"
+    fake_ext.mkdir()
+    (fake_ext / "evil_link").symlink_to("/etc/hosts")
+    add_fake1 = subprocess.run([binary, "add", str(svv02_wc)], env=env, capture_output=True, text=True, timeout=25)
+    assert add_fake1.returncode != 0, (add_fake1.stdout, add_fake1.stderr)
+    st_fake1 = subprocess.run([svn, "status", str(fake_ext)], env=env, capture_output=True, text=True, check=True).stdout
+    assert not st_fake1.startswith("A"), st_fake1
+    shutil.rmtree(fake_ext)
+
+    fake_ext2 = svv02_wc / "fake_ext2"
+    (fake_ext2 / ".svn").mkdir(parents=True)
+    (fake_ext2 / "sub").mkdir()
+    (fake_ext2 / "sub" / "evil_link2").symlink_to("/etc/hosts")
+    add_fake2 = subprocess.run([binary, "add", str(svv02_wc)], env=env, capture_output=True, text=True, timeout=25)
+    assert add_fake2.returncode != 0, (add_fake2.stdout, add_fake2.stderr)
+    st_fake2 = subprocess.run([svn, "status", str(fake_ext2)], env=env, capture_output=True, text=True, check=True).stdout
+    assert not st_fake2.startswith("A"), st_fake2
+    shutil.rmtree(fake_ext2)
+
+    # SV-V03 Round-2: `vcsctl propset --file` rejects symlinks and FIFOs without hanging
+    sym_prop_file = root / "sym-prop-val"
+    sym_prop_file.symlink_to("/etc/hosts")
+    sym_ps = subprocess.run(
+        [binary, "propset", str(svv02_wc), "user:test", "--file", str(sym_prop_file)],
+        env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert sym_ps.returncode != 0, (sym_ps.stdout, sym_ps.stderr)
+    fifo_prop_file = root / "fifo-prop-val"
+    os.mkfifo(fifo_prop_file)
+    fifo_ps = subprocess.run(
+        [binary, "propset", str(svv02_wc), "user:test", "--file", str(fifo_prop_file)],
+        env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert fifo_ps.returncode != 0, (fifo_ps.stdout, fifo_ps.stderr)
+
+    # SV-V08: When stdout/stderr is a TTY, vcsctl escapes ANSI/OSC, 8-bit C1, CR, and Unicode Bidi/LS/PS; vcsctl cat remains raw.
+    ansi_wc = root / "ansi-wc"
+    subprocess.run([svn, "checkout", repository.as_uri(), str(ansi_wc)],
+                   env=env, check=True, capture_output=True)
+    ansi_file = ansi_wc / "ansi.txt"
+    ansi_payload = b"\x1b[32mRAW_CAT\x1b[0m\n"
+    ansi_file.write_bytes(ansi_payload)
+    subprocess.run([svn, "add", str(ansi_file)], env=env, check=True, capture_output=True)
+    bidi_and_c1_msg = "msg \x1b[31mRED\x1b[0m \x1b]52;c;AAAA\x07 \u009b31mC1 \u202eRLO\u2066LRI\u200fRLM\u061cALM\u2028LS\u2029PS"
+    subprocess.run(
+        [svn, "commit", str(ansi_wc), "-m", bidi_and_c1_msg],
+        env=env, check=True, capture_output=True,
+    )
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            [binary, "log", str(ansi_wc), "--limit", "1"],
+            env=env, stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        tty_chunks = []
+        while True:
+            rlist, _, _ = select.select([master_fd], [], [], 10.0)
+            if not rlist:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                tty_chunks.append(chunk)
+            except OSError:
+                break
+        rc = proc.wait(timeout=15)
+        tty_out = b"".join(tty_chunks)
+        assert rc == 0, tty_out
+        assert b"\x1b[" not in tty_out and b"\x1b]" not in tty_out and b"\x07" not in tty_out, tty_out
+        assert "\u009b".encode() not in tty_out, tty_out
+        assert "\u202e".encode() not in tty_out and "\u2066".encode() not in tty_out, tty_out
+        assert "\u200f".encode() not in tty_out and "\u061c".encode() not in tty_out, tty_out
+        assert "\u2028".encode() not in tty_out and "\u2029".encode() not in tty_out, tty_out
+        assert b"\\x1B[31mRED\\x1B[0m" in tty_out and b"\\x1B]52;c;AAAA\\x07" in tty_out, tty_out
+        assert b"\\x9B31mC1" in tty_out, tty_out
+        assert b"\\u{202E}RLO\\u{2066}LRI\\u{200F}RLM\\u{061C}ALM\\u{2028}LS\\u{2029}PS" in tty_out, tty_out
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+        os.close(master_fd)
+
+    # SV-V08 Round-2: CR (\r) in stdout (`propget`) and stderr (`die()`) on TTY are escaped as \x0D
+    cr_prop_file = root / "cr-prop-val"
+    cr_prop_file.write_bytes(b"line1\rOVERWRITE")
+    subprocess.run(
+        [binary, "propset", str(ansi_wc), "user:crtest", "--file", str(cr_prop_file)],
+        env=env, check=True, capture_output=True,
+    )
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            [binary, "propget", str(ansi_wc), "user:crtest"],
+            env=env, stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        prop_chunks = []
+        while True:
+            rlist, _, _ = select.select([master_fd], [], [], 10.0)
+            if not rlist:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                prop_chunks.append(chunk)
+            except OSError:
+                break
+        rc = proc.wait(timeout=15)
+        prop_tty = b"".join(prop_chunks)
+        assert rc == 0, prop_tty
+        assert b"line1\\x0DOVERWRITE" in prop_tty, prop_tty
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+        os.close(master_fd)
+
+    # SV-V08 Round-2: stderr `die()` on TTY escapes Bidi, CR, and ANSI sequences too
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            [binary, "unknown-\x1b[31m\r\u202ebad"],
+            env=env, stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        err_chunks = []
+        while True:
+            rlist, _, _ = select.select([master_fd], [], [], 10.0)
+            if not rlist:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+                if not chunk:
+                    break
+                err_chunks.append(chunk)
+            except OSError:
+                break
+        rc = proc.wait(timeout=15)
+        err_tty = b"".join(err_chunks)
+        assert rc != 0
+        assert b"\x1b[" not in err_tty and "\u202e".encode() not in err_tty, err_tty
+        assert b"\\x1B[31m\\x0D\\u{202E}bad" in err_tty, err_tty
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+        os.close(master_fd)
+
+    cat_res = subprocess.run(
+        [binary, "cat", repository.as_uri(), "ansi.txt"],
+        env=env, capture_output=True, timeout=25,
+    )
+    assert cat_res.returncode == 0 and cat_res.stdout == ansi_payload, (cat_res.returncode, cat_res.stdout)
 
 print("Loopback security checks passed")

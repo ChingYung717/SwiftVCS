@@ -76,6 +76,18 @@ jobs:
           if grep -E '/opt/homebrew|/usr/local' "$RUNNER_TEMP/swiftvcs-dylibs.txt"; then
             exit 1
           fi
+          main_rpaths="$(otool -l "$app/Contents/MacOS/VCSExplorer" | awk '/cmd LC_RPATH/{f=1;next} f && /path /{print $2; f=0}')"
+          if [ "$main_rpaths" != "@executable_path/../Frameworks" ]; then
+            echo "Unexpected LC_RPATH on VCSExplorer: $main_rpaths" >&2
+            exit 1
+          fi
+          for lib in "$app/Contents/Frameworks/"*.dylib; do
+            lib_rpaths="$(otool -l "$lib" | awk '/cmd LC_RPATH/{f=1;next} f && /path /{print $2; f=0}')"
+            if [ -n "$lib_rpaths" ]; then
+              echo "Unexpected LC_RPATH on $lib: $lib_rpaths" >&2
+              exit 1
+            fi
+          done
           codesign --verify --deep --strict "$app"
           codesign -dvv "$app" 2>&1 | grep -Eq 'flags=.*runtime' || { echo "Hardened Runtime missing!" >&2; exit 1; }
           unzip -tq dist/VCSExplorer-arm64.zip

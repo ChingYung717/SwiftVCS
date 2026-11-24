@@ -23,8 +23,12 @@
   - 针对使用自签名证书或内部未知私有 CA 的企业 HTTPS SVN 服务器，SwiftVCS 提供「先抓取服务器叶证书 → 用户核对管理员通过独立渠道提供的 `SHA-256` 指纹 → 确认后保存到 `~/.config/vcs-explorer/pinned-certs/<host>:<port>.crt`」的两步核验流程（CLI 对应 `vcsctl info <url> --fetch-cert <host> --fingerprint <sha256>`）。
   - **重要边界**：由于 Subversion (`libsvn_ra_serf`) 仅在默认系统 CA 或显式配置的 CA 链校验失败（`SVN_AUTH_SSL_UNKNOWNCA`）时才触发 `svn_auth_ssl_server_trust_prompt_func_t` 回调，该机制本质上是**针对自签名/未知 CA 的 `host:port` 叶证书信任例外**，而**不是**能拦截任意公共受信任 CA 签发替代证书的严格公钥/叶证书固定（Strict Pinning）。
   - **主机名与有效期强制校验**：即使叶证书 `SHA-256` 指纹已导入信任库，`CSVNShim` 仅放行 `SVN_AUTH_SSL_UNKNOWNCA`，**绝不放行**主机名不匹配（`SVN_AUTH_SSL_CNMISMATCH`）、证书已过期（`SVN_AUTH_SSL_EXPIRED`）或尚未生效（`SVN_AUTH_SSL_NOTYETVALID`）。若服务器证书缺少与连接地址匹配的 SAN/CN，请在服务端重新签发包含正确 SAN 的证书。
-- **使用私有 CA 根证书**：可通过 `vcsctl --ca /path/to/ca.pem` 或 `--trust-bundle /path/to/ca-bundle.pem` 为当前 SVN 会话显式指定受信任的 CA 证书包。
+- **使用私有 CA 根证书（`--ca` / `--trust-bundle` 隔离边界 · SV-V01）**：可通过 `vcsctl --ca /path/to/ca.pem` 或 `--trust-bundle /path/to/ca-bundle.pem` 为当前 SVN 会话显式指定受信任的 CA 证书包。SwiftVCS 会校验路径为可读常规文件（禁止分号、百分号 `%(...)s` 插值与控制字符），并在内存配置中从所有既有 `[groups]` 通配项剥离匹配当前主机名的模式，确保该自定义 CA 严格绑定到目标主机而不外泄至其他主机（如跨主机 301 重定向）。**边界说明**：受 `libsvn` `[groups]` 机制所限，自定义 CA 隔离粒度为**主机名级（不含端口）**，同一主机上的不同端口在同一会话中将共享该自定义 CA；若需 `host:port` 精确隔离，请使用叶证书指纹信任例外。
 - **严格固定模式（SV-03 规划说明）**：若未来需要「即使服务端出示由系统默认 CA 签发的其他合法证书也必须拒绝」的严格 Pinning 模式，需单独引入显式隔离的 Subversion 配置与会话层策略，当前版本不作此宣称。
+
+### 3. 预览包签名与 `disable-library-validation` 过渡说明 (SV-H01)
+- **CI Ad-Hoc 预览包过渡边界**：CI 自动构建的 ad-hoc 预览版 `VCSExplorer.app` 已启用 Hardened Runtime（`--options runtime`，阻断 `DYLD_INSERT_LIBRARIES` 注入与非授权调试附加），但因内置 22 个无 Team ID 的 Homebrew 动态库（`Contents/Frameworks/*.dylib`），在 ad-hoc 签名下暂保留 `com.apple.security.cs.disable-library-validation` entitlement（参见 `scripts/preview-adhoc.entitlements`）。
+- **部署建议**：使用未公证的 ad-hoc 预览包时，请将其置于受权限保护的目录（如 `/Applications`），避免长期存放在其他本地不可信进程可写的目录中（防止替换 `Contents/Frameworks/*.dylib`）。使用 Developer ID 正式签名并公证发布时（`make_app.sh` 指定非 `-` 签名身份），构建脚本会自动移除 `disable-library-validation` 并对所有内置动态库统一签名。
 
 ---
 
@@ -41,7 +45,11 @@
   - Importing a leaf certificate after verifying its `SHA-256` fingerprint in the GUI or via `vcsctl info --fetch-cert <host> --fingerprint <sha256>` grants a trust exception for `SVN_AUTH_SSL_UNKNOWNCA` on that exact `host:port` when the server certificate matches the saved leaf certificate.
   - Because `libsvn_ra_serf` only invokes the server-trust callback when normal CA validation fails, this mode is a **self-signed / unknown-CA trust exception**, not strict certificate pinning against certificates issued by trusted CAs.
   - **Strict Hostname & Validity Enforcement**: `SVN_AUTH_SSL_CNMISMATCH`, `SVN_AUTH_SSL_EXPIRED`, and `SVN_AUTH_SSL_NOTYETVALID` are never bypassed, even when the leaf certificate fingerprint matches.
-- **Private CA Bundles**: Pass `--ca /path/to/ca.pem` or `--trust-bundle /path/to/ca-bundle.pem` to validate against a custom CA bundle.
+- **Private CA Bundles & Hostname-Scoping Boundary (SV-V01)**: Pass `--ca /path/to/ca.pem` or `--trust-bundle /path/to/ca-bundle.pem` to validate against a custom CA bundle. The path must be a readable regular file and may not contain `;`, `%` (`%(option)s` interpolation), or control characters. SwiftVCS strips matching glob patterns from pre-existing `[groups]` entries in memory so the custom CA applies strictly to the target hostname and never leaks across cross-host redirects. **Boundary**: because `libsvn` `[groups]` matches by hostname only (without port), different ports on the same hostname share the custom CA within that session; use the leaf-certificate exception flow when `host:port` isolation is required.
+
+### 3. Preview Package Signing & `disable-library-validation` Caveat (SV-H01)
+- **Transitional Ad-Hoc Preview Entitlement**: CI ad-hoc preview builds of `VCSExplorer.app` enable Hardened Runtime (`--options runtime`, blocking `DYLD_INSERT_LIBRARIES` and unauthorized debugger attachment), but retain `com.apple.security.cs.disable-library-validation` (`scripts/preview-adhoc.entitlements`) so macOS permits loading the 22 bundled Homebrew `.dylib` libraries that lack a Developer ID Team ID.
+- **Deployment Guidance**: Install ad-hoc preview builds in a protected location (such as `/Applications`) rather than directories writable by untrusted local processes. Signing with a Developer ID identity in `make_app.sh` automatically drops `disable-library-validation` and signs all bundled `.dylib` files under the same Team ID.
 
 ---
 

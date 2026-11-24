@@ -1,5 +1,6 @@
 import CVCSKit
 import CSVNShim
+import Darwin
 import Foundation
 
 /// SVN 后端：把 libsvn 的同步 C 接口包装成 `RepositoryClient` 协议。
@@ -49,6 +50,10 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     public var repositoryRoot: URL? {
         stateLock.withLock { _rootURL }
+    }
+
+    public var currentOrigin: SVNOrigin? {
+        baseURL.flatMap(SVNOrigin.init)
     }
 
     // MARK: 初始化
@@ -163,8 +168,13 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     private func createHandle(url: URL?, credentials: Credentials?) throws
         -> (handle: OpaquePointer, user: String?, password: String?, realm: String?) {
-        if let url, url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
-            throw VCSError.invalidArgument("请通过独立参数传递凭据")
+        if let url {
+            if url.password != nil || (url.user != nil && url.scheme?.lowercased() != "svn+ssh") {
+                throw VCSError.invalidArgument("请通过独立参数传递凭据")
+            }
+            guard SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil else {
+                throw VCSError.invalidArgument("仓库 URL 不合法")
+            }
         }
         var user = scopedCredentials.username
         var secret = scopedCredentials.password
@@ -201,7 +211,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         var errbuf = [CChar](repeating: 0, count: 2048)
         let strings = [user, secret, configDir, origin?.authPrefix, realm, pin,
                        origin?.scheme == "https" ? trustBundlePath : nil, origin?.host]
-        let cStrings = strings.map { value in value.flatMap { strdup($0) } }
+        var cStrings: [UnsafeMutablePointer<CChar>?] = []
+        cStrings.reserveCapacity(strings.count)
         defer {
             for value in cStrings {
                 if let value {
@@ -213,10 +224,21 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 }
             }
         }
+        for value in strings {
+            if let value {
+                guard let dup = strdup(value) else {
+                    throw VCSError.underlying("内存分配失败")
+                }
+                cStrings.append(dup)
+            } else {
+                cStrings.append(nil)
+            }
+        }
         guard let h = csvn_context_create(cStrings[0], cStrings[1], cStrings[2], cStrings[3],
                                           cStrings[4], cStrings[5], cStrings[6], cStrings[7],
                                           &errbuf, Int32(errbuf.count)) else {
-            throw VCSError.underlying("无法初始化 SVN 上下文：\(String(cString: errbuf))")
+            let errMsg = SVNURLSanitizer.redactCredentials(inMessage: String(cString: errbuf))
+            throw VCSError.underlying("无法初始化 SVN 上下文：\(errMsg)")
         }
         return (h, user, secret, realm)
     }
@@ -275,10 +297,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
     }
 
-    /// 把 shim 的返回码翻译成统一的 VCSError。
+    /// 把 shim 的返回码翻译成统一的 VCSError（并二次脱敏任何残留凭据）。
     private func check(_ rc: Int32) throws {
         guard rc != 0 else { return }
-        let msg = handle.map { String(cString: csvn_last_error($0)) } ?? ""
+        let rawMsg = handle.map { String(cString: csvn_last_error($0)) } ?? ""
+        let msg = SVNURLSanitizer.redactCredentials(inMessage: rawMsg)
         switch rc {
         case -1:
             throw VCSError.authenticationFailed(msg)
@@ -304,25 +327,157 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     private func url(for path: String?) throws -> URL {
         guard let base = baseURL else { throw VCSError.underlying("尚未连接仓库") }
         guard let path, !path.isEmpty else { return base }
-        guard !path.contains("\0") else { throw VCSError.invalidArgument("仓库路径包含非法字符") }
-        var result = base
-        for rawComp in path.split(separator: "/") where !rawComp.isEmpty {
+        return try Self.buildRepoURL(root: base, repoRelativePath: path)
+    }
+
+    /// 校验仓库根 URL 自身合法性，拒绝 `?`、`#`、控制字符、`..`、`%2e%2e` 与 `%00`。
+    public static func validateSafeRootURL(_ root: URL) throws {
+        let isLocalFile = SVNOrigin.isValidLocalFileURL(root)
+        let rootOrigin = isLocalFile ? nil : SVNOrigin(root)
+        guard isLocalFile || rootOrigin != nil else {
+            throw VCSError.invalidArgument("仓库根 URL 不合法")
+        }
+        let raw = root.absoluteString
+        let loweredRaw = raw.lowercased()
+        guard root.query == nil,
+              root.fragment == nil,
+              !raw.contains("?"),
+              !raw.contains("#"),
+              raw.rangeOfCharacter(from: .controlCharacters) == nil,
+              !loweredRaw.contains("%00"),
+              !loweredRaw.contains("%2e%2e") else {
+            throw VCSError.invalidArgument("仓库根 URL 包含非法字符或路径穿越序列")
+        }
+        guard let components = URLComponents(url: root, resolvingAgainstBaseURL: false),
+              components.query == nil,
+              components.percentEncodedQuery == nil,
+              components.fragment == nil,
+              components.percentEncodedFragment == nil else {
+            throw VCSError.invalidArgument("仓库根 URL 不合法")
+        }
+        for rawSeg in components.percentEncodedPath.split(separator: "/") {
+            let seg = String(rawSeg)
+            let decoded = seg.removingPercentEncoding ?? seg
+            if seg == ".." || decoded == ".." || decoded.contains("/") || decoded.contains("\0") {
+                throw VCSError.invalidArgument("仓库根 URL 不允许包含 .. 路径穿越")
+            }
+        }
+        for seg in root.path.split(separator: "/") {
+            if seg == ".." {
+                throw VCSError.invalidArgument("仓库根 URL 不允许包含 .. 路径穿越")
+            }
+        }
+    }
+
+    /// 校验服务端返回的 `repos_root` 必须与 `base` 同源（或均为合法本地 `file://`），且为 `base` 的合法祖先路径。
+    public static func isValidServerReposRoot(_ candidate: URL, for base: URL) -> Bool {
+        guard (try? validateSafeRootURL(candidate)) != nil else { return false }
+        let normBase = trimTrailingSlash(base)
+        let normCand = trimTrailingSlash(candidate)
+        if SVNOrigin.isValidLocalFileURL(normBase) {
+            guard SVNOrigin.isValidLocalFileURL(normCand) else { return false }
+            let bp = normalizePrivateAlias(lexicalURLPath(normBase))
+            let cp = normalizePrivateAlias(lexicalURLPath(normCand))
+            return cp != "/" && (bp == cp || bp.hasPrefix(cp + "/"))
+        }
+        guard let baseOrigin = SVNOrigin(normBase),
+              let candOrigin = SVNOrigin(normCand),
+              baseOrigin == candOrigin else {
+            return false
+        }
+        let bp = lexicalURLPath(normBase)
+        let cp = lexicalURLPath(normCand)
+        if cp.isEmpty || cp == "/" {
+            return true
+        }
+        return bp == cp || bp.hasPrefix(cp + "/")
+    }
+
+    /// 校验 `candidate` 与 `boundary` 同源且等于或位于 `boundary` 内部（绝不允许向上逃逸到祖先目录或同源其他仓库）。
+    public static func isURL(_ candidate: URL, insideOrEqualTo boundary: URL) -> Bool {
+        let normCand = trimTrailingSlash(candidate)
+        let normBound = trimTrailingSlash(boundary)
+        if SVNOrigin.isValidLocalFileURL(normBound) {
+            guard SVNOrigin.isValidLocalFileURL(normCand) else { return false }
+            let cp = normalizePrivateAlias(lexicalURLPath(normCand))
+            let bp = normalizePrivateAlias(lexicalURLPath(normBound))
+            return bp != "/" && (cp == bp || cp.hasPrefix(bp + "/"))
+        }
+        guard let candOrigin = SVNOrigin(normCand),
+              let boundOrigin = SVNOrigin(normBound),
+              candOrigin == boundOrigin else {
+            return false
+        }
+        let cp = lexicalURLPath(normCand)
+        let bp = lexicalURLPath(normBound)
+        if bp.isEmpty || bp == "/" {
+            return cp.isEmpty || cp.hasPrefix("/")
+        }
+        return cp == bp || cp.hasPrefix(bp + "/")
+    }
+
+    /// 根据仓库根 URL 与仓库内相对路径拼出完整文件 URL，严禁 `\0`、`.`、`..` 路径穿越并校验结果仍归属 `root` 端点与路径前缀。
+    public static func buildRepoURL(root: URL, repoRelativePath: String) throws -> URL {
+        try validateSafeRootURL(root)
+        let isLocalFile = SVNOrigin.isValidLocalFileURL(root)
+        let rootOrigin = isLocalFile ? nil : SVNOrigin(root)
+        guard !repoRelativePath.contains("\0"),
+              repoRelativePath.rangeOfCharacter(from: .controlCharacters) == nil else {
+            throw VCSError.invalidArgument("仓库路径包含非法字符")
+        }
+
+        let cleanRoot = trimTrailingSlash(root)
+        var result = cleanRoot
+        for rawComp in repoRelativePath.split(separator: "/") where !rawComp.isEmpty {
             let component = String(rawComp)
             guard component != ".", component != ".." else {
                 throw VCSError.invalidArgument("仓库路径不允许包含 . 或 ..")
             }
             result = result.appendingPathComponent(component)
         }
+
+        let cleanResult = trimTrailingSlash(result)
+        let rootPath = lexicalURLPath(cleanRoot)
+        let resPath = lexicalURLPath(cleanResult)
+        if isLocalFile {
+            guard SVNOrigin.isValidLocalFileURL(cleanResult) else {
+                throw VCSError.invalidArgument("生成的本地仓库 URL 不合法")
+            }
+            let inside = rootPath == "/"
+                ? resPath.hasPrefix("/")
+                : (resPath == rootPath || resPath.hasPrefix(rootPath + "/"))
+            guard inside else {
+                throw VCSError.invalidArgument("仓库路径超出仓库根目录范围")
+            }
+        } else {
+            guard let resOrigin = SVNOrigin(cleanResult), resOrigin == rootOrigin else {
+                throw VCSError.invalidArgument("仓库路径超出仓库源站范围")
+            }
+            let inside = (rootPath.isEmpty || rootPath == "/")
+                ? (resPath.isEmpty || resPath.hasPrefix("/"))
+                : (resPath == rootPath || resPath.hasPrefix(rootPath + "/"))
+            guard inside else {
+                throw VCSError.invalidArgument("仓库路径超出仓库根目录范围")
+            }
+        }
         return result
     }
 
-    /// 根据仓库根 URL 与以 `/` 开头的仓库内路径拼出完整文件 URL。
-    private static func buildRepoURL(root: URL, repoRelativePath: String) -> URL {
-        var result = root
-        for component in repoRelativePath.split(separator: "/") where !component.isEmpty {
-            result = result.appendingPathComponent(String(component))
+    private static func lexicalURLPath(_ url: URL) -> String {
+        var p = url.standardized.path
+        while p.count > 1 && p.hasSuffix("/") {
+            p.removeLast()
         }
-        return result
+        return p
+    }
+
+    private static func normalizePrivateAlias(_ path: String) -> String {
+        for prefix in ["/private/var", "/private/tmp", "/private/etc"] {
+            if path == prefix || path.hasPrefix(prefix + "/") {
+                return String(path.dropFirst("/private".count))
+            }
+        }
+        return path
     }
 
     private static func trimTrailingSlash(_ url: URL) -> URL {
@@ -334,34 +489,21 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     /// 在队列内获取或推导仓库根 URL（必须在 queue 内调用）。
+    /// 若已缓存 `self.rootURL` 或可由 `baseURL` 解析出仓库根，严禁通过 `explicit` 逃逸到其外部祖先目录或同源其他仓库。
     private func resolveRootURLSync(handle h: OpaquePointer, explicit: URL? = nil) throws -> URL {
-        if let explicit {
-            let normExplicit = Self.trimTrailingSlash(explicit)
-            let uStr = normExplicit.absoluteString
-            if let cached = self.rootURL {
-                let cachedNorm = Self.trimTrailingSlash(cached)
-                let cachedStr = cachedNorm.absoluteString
-                if uStr == cachedStr || uStr.hasPrefix(cachedStr + "/") {
-                    return cachedNorm
-                }
-            }
-            return normExplicit
-        }
-
+        var authoritativeRoot: URL? = nil
         if let cached = self.rootURL {
             let cachedNorm = Self.trimTrailingSlash(cached)
-            let cachedStr = cachedNorm.absoluteString
             if let base = self.baseURL {
-                let uStr = Self.trimTrailingSlash(base).absoluteString
-                if uStr == cachedStr || uStr.hasPrefix(cachedStr + "/") {
-                    return cachedNorm
+                if Self.isValidServerReposRoot(cachedNorm, for: base) {
+                    authoritativeRoot = cachedNorm
                 }
             } else {
-                return cachedNorm
+                authoritativeRoot = cachedNorm
             }
         }
 
-        if let probeURL = self.baseURL {
+        if authoritativeRoot == nil, let probeURL = self.baseURL {
             var rootBuf = [CChar](repeating: 0, count: 2048)
             let rc = probeURL.absoluteString.withCString { u in
                 csvn_get_repos_root(h, u, &rootBuf, Int32(rootBuf.count))
@@ -371,13 +513,32 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             }
             if rc == 0 {
                 let s = String(cString: rootBuf)
-                if !s.isEmpty, let resolved = URL(string: s) {
-                    let normResolved = Self.trimTrailingSlash(resolved)
-                    self.rootURL = normResolved
-                    return normResolved
+                guard !s.isEmpty, let resolved = URL(string: s),
+                      Self.isValidServerReposRoot(resolved, for: probeURL) else {
+                    throw VCSError.invalidArgument("服务端返回的仓库根 URL 不合法或超出当前仓库范围")
                 }
+                let normResolved = Self.trimTrailingSlash(resolved)
+                self.rootURL = normResolved
+                authoritativeRoot = normResolved
+            } else {
+                authoritativeRoot = Self.trimTrailingSlash(probeURL)
             }
-            return Self.trimTrailingSlash(probeURL)
+        }
+
+        if let explicit {
+            let normExplicit = Self.trimTrailingSlash(explicit)
+            try Self.validateSafeRootURL(normExplicit)
+            if let authRoot = authoritativeRoot {
+                guard Self.isURL(normExplicit, insideOrEqualTo: authRoot) else {
+                    throw VCSError.invalidArgument("仓库根 URL 超出当前仓库根目录范围")
+                }
+                return authRoot
+            }
+            return normExplicit
+        }
+
+        if let authRoot = authoritativeRoot {
+            return authRoot
         }
         throw VCSError.underlying("尚未连接仓库")
     }
@@ -390,8 +551,44 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return relative.hasPrefix("/") ? relative : workingCopy.appendingPathComponent(relative).path
     }
 
+    public enum WorkingCopyURLStatus: Sendable, Equatable {
+        case valid(URL)
+        case invalidURL(String)
+        case unavailable
+    }
+
+    /// 离线读取并校验本地工作副本关联的仓库 URL，区分「非工作副本/不可用」与「.svn/wc.db 含非法 URL」。
+    public static func inspectWorkingCopyURL(at workingCopy: URL) -> WorkingCopyURLStatus {
+        var errbuf = [CChar](repeating: 0, count: 512)
+        guard let ctx = csvn_context_create(nil, nil, nil, nil, nil, nil, nil, nil, &errbuf, Int32(errbuf.count)) else {
+            return .unavailable
+        }
+        defer { csvn_context_destroy(ctx) }
+        var out = [CChar](repeating: 0, count: 2048)
+        let rc = workingCopy.path.withCString { p in
+            csvn_wc_url(ctx, p, &out, Int32(out.count))
+        }
+        guard rc == 0 else { return .unavailable }
+        let str = String(cString: out)
+        guard !str.isEmpty,
+              let clean = SVNURLSanitizer.sanitizeForPersistence(str),
+              let url = URL(string: clean),
+              SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil else {
+            return .invalidURL(SVNURLSanitizer.redactCredentials(inMessage: str))
+        }
+        return .valid(url)
+    }
+
     /// 离线读取本地工作副本所关联的远端仓库 URL（直接查询 `.svn/wc.db`）。
     public static func workingCopyURL(at workingCopy: URL) -> URL? {
+        if case .valid(let url) = inspectWorkingCopyURL(at: workingCopy) {
+            return url
+        }
+        return nil
+    }
+
+    /// 离线读取本地工作副本所关联的完整仓库根 URL（纯本地元数据，不发起任何网络请求）。
+    public static func workingCopyReposRoot(at workingCopy: URL) -> URL? {
         var errbuf = [CChar](repeating: 0, count: 512)
         guard let ctx = csvn_context_create(nil, nil, nil, nil, nil, nil, nil, nil, &errbuf, Int32(errbuf.count)) else {
             return nil
@@ -399,14 +596,17 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         defer { csvn_context_destroy(ctx) }
         var out = [CChar](repeating: 0, count: 2048)
         let rc = workingCopy.path.withCString { p in
-            csvn_wc_url(ctx, p, &out, Int32(out.count))
+            csvn_wc_repos_root(ctx, p, &out, Int32(out.count))
         }
         guard rc == 0 else { return nil }
         let str = String(cString: out)
-        guard !str.isEmpty, let clean = SVNURLSanitizer.sanitizeForPersistence(str) else {
+        guard !str.isEmpty,
+              let clean = SVNURLSanitizer.sanitizeForPersistence(str),
+              let url = URL(string: clean),
+              (try? validateSafeRootURL(url)) != nil else {
             return nil
         }
-        return URL(string: clean)
+        return trimTrailingSlash(url)
     }
 
     // MARK: 1. 连接
@@ -446,11 +646,11 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let resolvedRootURL: URL?
             if rootRC == 0 {
                 let rootStr = String(cString: rootBuf)
-                if !rootStr.isEmpty, let resolved = URL(string: rootStr) {
-                    resolvedRootURL = Self.trimTrailingSlash(resolved)
-                } else {
-                    resolvedRootURL = nil
+                guard !rootStr.isEmpty, let resolved = URL(string: rootStr),
+                      Self.isValidServerReposRoot(resolved, for: url) else {
+                    throw VCSError.invalidArgument("服务端返回的仓库根 URL 不合法或超出当前仓库范围")
                 }
+                resolvedRootURL = Self.trimTrailingSlash(resolved)
             } else {
                 resolvedRootURL = nil
             }
@@ -588,6 +788,9 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
         return try await performWrite {
             let h = try self.requireHandle()
+            if case .invalidURL = Self.inspectWorkingCopyURL(at: workingCopy) {
+                throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝同步")
+            }
             let wc = workingCopy.path
             progress?(VCSTaskProgress(phase: "正在同步工作副本", completed: 0, total: 1, currentPath: wc))
             var rev: Int32 = 0
@@ -876,17 +1079,22 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     }
 
     public func diff(workingCopy: URL, paths: [String]) async throws -> [FileDiff] {
-        try await diff(workingCopy: workingCopy, paths: paths, maxBytes: 32 * 1024 * 1024)
+        try await diff(workingCopy: workingCopy, paths: paths, maxBytes: 32 * 1024 * 1024, allowRemoteReplacedBase: false)
     }
 
-    public func diff(workingCopy: URL, paths: [String], maxBytes: Int) async throws -> [FileDiff] {
+    public func diff(workingCopy: URL, paths: [String], allowRemoteReplacedBase: Bool) async throws -> [FileDiff] {
+        try await diff(workingCopy: workingCopy, paths: paths, maxBytes: 32 * 1024 * 1024, allowRemoteReplacedBase: allowRemoteReplacedBase)
+    }
+
+    public func diff(workingCopy: URL, paths: [String], maxBytes: Int, allowRemoteReplacedBase: Bool = false) async throws -> [FileDiff] {
         let defaultTotal = max(64 * 1024 * 1024, maxBytes > 0 ? min(maxBytes * 2, 128 * 1024 * 1024) : 64 * 1024 * 1024)
         return try await diff(
             workingCopy: workingCopy,
             paths: paths,
             maxBytes: maxBytes,
             totalMaxBytes: defaultTotal,
-            maxSections: 4096
+            maxSections: 4096,
+            allowRemoteReplacedBase: allowRemoteReplacedBase
         )
     }
 
@@ -895,7 +1103,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         paths: [String],
         maxBytes: Int,
         totalMaxBytes: Int,
-        maxSections: Int
+        maxSections: Int,
+        allowRemoteReplacedBase: Bool = false
     ) async throws -> [FileDiff] {
         guard maxBytes >= 0 else { throw VCSError.invalidArgument("差异字节上限不能为负数") }
         guard totalMaxBytes >= 0 else { throw VCSError.invalidArgument("差异总字节上限不能为负数") }
@@ -1116,9 +1325,17 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                     continue
                 }
                 let old = try self.propertySnapshot {
-                    csvn_wc_property_snapshot(h, path, 1, status.kind == .replaced ? 1 : 0, $0, $1)
+                    csvn_wc_property_snapshot_ex(
+                        h,
+                        path,
+                        1,
+                        status.kind == .replaced ? 1 : 0,
+                        allowRemoteReplacedBase ? 1 : 0,
+                        $0,
+                        $1
+                    )
                 }
-                let new = try self.propertySnapshot { csvn_wc_property_snapshot(h, path, 0, 0, $0, $1) }
+                let new = try self.propertySnapshot { csvn_wc_property_snapshot_ex(h, path, 0, 0, 0, $0, $1) }
                 let changes = self.propertyChanges(from: old, to: new)
                 guard !changes.isEmpty else { continue }
                 if let index = indexByPath[relative] {
@@ -1153,7 +1370,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         let changes = try await perform {
             let h = try self.requireHandle()
             let root = try self.resolveRootURLSync(handle: h, explicit: repoRootURL)
-            let target = Self.buildRepoURL(root: root, repoRelativePath: change.path)
+            let target = try Self.buildRepoURL(root: root, repoRelativePath: change.path)
             func snapshot(_ url: URL, _ revision: Int32) throws -> [String: Data] {
                 try self.propertySnapshot {
                     csvn_properties(h, nil, url.absoluteString, nil, revision, revision, 0, $0, $1)
@@ -1162,7 +1379,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let old: [String: Data]
             if (change.action == .added || change.action == .replaced),
                let source = change.copyFromPath, let copyRev32 = nativeCopyRevision {
-                old = try snapshot(Self.buildRepoURL(root: root, repoRelativePath: source), copyRev32)
+                old = try snapshot(try Self.buildRepoURL(root: root, repoRelativePath: source), copyRev32)
             } else if change.action == .added {
                 old = [:]
             } else {
@@ -1177,8 +1394,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     private func diffFileContent(revision: Int, nativeRevision: Int32, nativeCopyRevision: Int32?, change: ChangedPath,
                                  repoRootURL: URL?, maxBytes: Int) async throws -> FileDiff {
         if change.kind == .directory {
-            let fallbackURL = (repoRootURL ?? self.rootURL ?? self.baseURL)
-                .map { Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
+            let fallbackURL = try (repoRootURL ?? self.rootURL ?? self.baseURL)
+                .map { try Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
                 ?? URL(fileURLWithPath: change.path)
             return FileDiff(
                 id: change.path,
@@ -1192,8 +1409,8 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
 
         if Self.isKnownBinaryPath(change.path) {
-            let fallbackURL = (repoRootURL ?? self.rootURL ?? self.baseURL)
-                .map { Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
+            let fallbackURL = try (repoRootURL ?? self.rootURL ?? self.baseURL)
+                .map { try Self.buildRepoURL(root: $0, repoRelativePath: change.path) }
                 ?? URL(fileURLWithPath: change.path)
             let ext = (change.path as NSString).pathExtension.lowercased()
             return FileDiff(
@@ -1210,7 +1427,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         return try await perform {
             let h = try self.requireHandle()
             let root = try self.resolveRootURLSync(handle: h, explicit: repoRootURL)
-            let targetURL = Self.buildRepoURL(root: root, repoRelativePath: change.path)
+            let targetURL = try Self.buildRepoURL(root: root, repoRelativePath: change.path)
 
             func catContent(url: URL, rev: Int32) throws -> (data: Data, truncated: Bool)? {
                 guard rev >= 0 else { return nil }
@@ -1278,7 +1495,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             case .added:
                 if let copyFrom = change.copyFromPath, !copyFrom.isEmpty,
                    let copyRev32 = nativeCopyRevision, copyRev32 > 0 {
-                    let fromURL = Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
+                    let fromURL = try Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
                     var textPtr: UnsafeMutablePointer<CChar>? = nil
                     var len: Int = 0
                     var truncated: Int32 = 0
@@ -1387,7 +1604,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             case .replaced:
                 if let copyFrom = change.copyFromPath, !copyFrom.isEmpty,
                    let copyRev32 = nativeCopyRevision, copyRev32 > 0 {
-                    let fromURL = Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
+                    let fromURL = try Self.buildRepoURL(root: root, repoRelativePath: copyFrom)
                     var textPtr2: UnsafeMutablePointer<CChar>? = nil
                     var len2: Int = 0
                     var truncated2: Int32 = 0
@@ -1520,7 +1737,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
                 if !matches { continue }
             }
             if results.count >= effectiveMaxFiles || remainingTotalBytes <= 0 {
-                let targetURL = Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)
+                let targetURL = (try? Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)) ?? logTarget
                 results.append(
                     FileDiff(
                         id: change.path,
@@ -1550,7 +1767,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                let targetURL = Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)
+                let targetURL = (try? Self.buildRepoURL(root: logTarget, repoRelativePath: change.path)) ?? logTarget
                 results.append(
                     FileDiff(
                         id: change.path,
@@ -1752,12 +1969,21 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     ) async throws -> CommitResult {
         try await performWrite {
             let h = try self.requireHandle()
+            if case .invalidURL = Self.inspectWorkingCopyURL(at: workingCopy) {
+                throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝提交")
+            }
             let targets = try self.writeTargets(workingCopy, paths, exact: exact, committing: true)
             progress?(VCSTaskProgress(phase: "正在提交改动", completed: 0, total: targets.count, currentPath: targets.first))
 
             var cStrings: [UnsafeMutablePointer<CChar>] = []
+            cStrings.reserveCapacity(targets.count)
             defer { for s in cStrings { free(s) } }
-            cStrings = targets.map { strdup($0) }
+            for target in targets {
+                guard let dup = strdup(target) else {
+                    throw VCSError.underlying("无法分配路径")
+                }
+                cStrings.append(dup)
+            }
 
             var rev: Int32 = 0
             var committed: Int32 = 0
@@ -1792,8 +2018,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             let h = try self.requireHandle()
             let targets = try self.writeTargets(workingCopy, paths, exact: exact, committing: false)
             var cStrings: [UnsafeMutablePointer<CChar>] = []
+            cStrings.reserveCapacity(targets.count)
             defer { for s in cStrings { free(s) } }
-            cStrings = targets.map { strdup($0) }
+            for target in targets {
+                guard let dup = strdup(target) else {
+                    throw VCSError.underlying("无法分配路径")
+                }
+                cStrings.append(dup)
+            }
 
             let count = try Self.nativeInteger(cStrings.count, field: "目标数量", minimum: 1)
             let rc = cStrings.withUnsafeBufferPointer { buf in
@@ -1952,7 +2184,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
         }
         return try await performWrite {
             guard let targetURL = Self.workingCopyURL(at: URL(fileURLWithPath: root)),
-                  (source.isFileURL && targetURL.isFileURL) ||
+                  (SVNOrigin.isValidLocalFileURL(source) && SVNOrigin.isValidLocalFileURL(targetURL)) ||
                     (SVNOrigin(source) != nil && SVNOrigin(source) == SVNOrigin(targetURL)) else {
                 throw VCSError.invalidArgument("合并源必须与目标使用同一 SVN 端点")
             }
@@ -2008,7 +2240,7 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             root = try writeRoot(wc)
             path = relative
         case .repository(let url):
-            guard (url.isFileURL || SVNOrigin(url) != nil), url.user == nil, url.password == nil,
+            guard (SVNOrigin.isValidLocalFileURL(url) || SVNOrigin(url) != nil), url.user == nil, url.password == nil,
                   url.query == nil, url.fragment == nil else {
                 throw VCSError.invalidArgument("需要不含凭据、查询参数或片段的仓库 URL")
             }
@@ -2076,11 +2308,15 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
 
     public func ignoreRules(workingCopy: URL, directory: String) async throws -> IgnoreRules {
         let root = try writeRoot(workingCopy)
-        let url = URL(fileURLWithPath: root).appendingPathComponent(directory)
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else { throw VCSError.invalidArgument("请选择工作副本目录") }
+        // 先经 C 层 inspect_node 校验目标确实是当前工作副本内合法受控节点，避免工作副本外目录存在性探测
         let properties = try await properties(at: .workingCopy(root: workingCopy, path: directory), inherited: true)
+        let targetPath = directory == "."
+            ? root
+            : URL(fileURLWithPath: root).appendingPathComponent(directory).path
+        var st = stat()
+        guard Darwin.lstat(targetPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw VCSError.invalidArgument("请选择工作副本目录")
+        }
         let defaults = try await perform {
             let h = try self.requireHandle()
             return try self.readNativeStrings { csvn_default_ignores(h, $0, $1) }
@@ -2133,29 +2369,29 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             // （svn_client_log4 的 target 既接受工作副本路径，也接受 URL）
             //
             // 工作副本子目录没有自己的 .svn；让 libsvn 查询所属工作副本。
-            let isWorkingCopyDir = workingCopy.isFileURL &&
-                Self.workingCopyURL(at: workingCopy) != nil
+            // 若 .svn/wc.db 中记录了非法仓库 URL，必须 Fail-Closed 拒绝，防止误当本地 file:// 仓库或触发注入。
+            let isWorkingCopyDir: Bool
+            if workingCopy.isFileURL {
+                switch Self.inspectWorkingCopyURL(at: workingCopy) {
+                case .valid:
+                    isWorkingCopyDir = true
+                case .invalidURL:
+                    throw VCSError.invalidArgument("工作副本包含非法的仓库 URL，已拒绝读取日志")
+                case .unavailable:
+                    isWorkingCopyDir = false
+                }
+            } else {
+                isWorkingCopyDir = false
+            }
             let target: String
             if !isWorkingCopyDir, workingCopy.scheme != nil {
-                guard (workingCopy.isFileURL && workingCopy.user == nil && workingCopy.password == nil
-                       && (workingCopy.host?.isEmpty ?? true)) ||
-                      SVNOrigin(workingCopy) != nil else {
+                guard SVNOrigin.isValidLocalFileURL(workingCopy) || SVNOrigin(workingCopy) != nil else {
                     throw VCSError.invalidArgument("请通过独立参数传递凭据")
                 }
-                var u = workingCopy
-                if let path, !path.isEmpty {
-                    guard !path.contains("\0") else {
-                        throw VCSError.invalidArgument("仓库路径包含非法字符")
-                    }
-                    for rawComp in path.split(separator: "/") where !rawComp.isEmpty {
-                        let comp = String(rawComp)
-                        guard comp != ".", comp != ".." else {
-                            throw VCSError.invalidArgument("仓库路径不允许包含 . 或 ..")
-                        }
-                        u = u.appendingPathComponent(comp)
-                    }
-                }
-                target = u.absoluteString
+                let resolved = (path?.isEmpty == false)
+                    ? try Self.buildRepoURL(root: workingCopy, repoRelativePath: path!)
+                    : workingCopy
+                target = resolved.absoluteString
             } else {
                 if let path, !path.isEmpty {
                     guard !path.contains("\0"), !path.hasPrefix("/"),
@@ -2249,8 +2485,14 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
             }
             try self.validateWriteTargets(targets, root: root, adding: true)
             var cStrings: [UnsafeMutablePointer<CChar>] = []
+            cStrings.reserveCapacity(targets.count)
             defer { for s in cStrings { free(s) } }
-            cStrings = targets.map { strdup($0) }
+            for target in targets {
+                guard let dup = strdup(target) else {
+                    throw VCSError.underlying("无法分配路径")
+                }
+                cStrings.append(dup)
+            }
 
             let count = try Self.nativeInteger(cStrings.count, field: "目标数量", minimum: 1)
             let rc = cStrings.withUnsafeBufferPointer { buf in
@@ -2266,6 +2508,40 @@ public final class SVNClient: RepositoryClient, @unchecked Sendable {
     /// 读取远端仓库中指定路径文件的内容（`svn cat`）。
     public func cat(path: String, revision: Int? = nil) async throws -> Data {
         try await cat(path: path, revision: revision, maxBytes: 0).data
+    }
+
+    /// 流式读取远端仓库中指定路径文件的内容并写入目标文件描述符（避免大文件无界占用内存）。
+    public func cat(path: String, revision: Int? = nil, writingTo fd: Int32) async throws {
+        let nativeRevision = try Self.nativeInteger(revision ?? 0, field: "修订号")
+        let target = try url(for: path)
+        try await perform {
+            let h = try self.requireHandle()
+            var targetFD = fd
+            let writeCB: csvn_stream_write_cb = { baton, data, len in
+                guard let baton, let data else { return -1 }
+                let outFD = baton.assumingMemoryBound(to: Int32.self).pointee
+                var remaining = len
+                var cursor = UnsafeRawPointer(data)
+                while remaining > 0 {
+                    let n = Darwin.write(outFD, cursor, remaining)
+                    if n > 0 {
+                        remaining -= n
+                        cursor = cursor.advanced(by: n)
+                    } else if n < 0 && errno == EINTR {
+                        continue
+                    } else {
+                        return -1
+                    }
+                }
+                return 0
+            }
+            let rc = target.absoluteString.withCString { u in
+                withUnsafeMutablePointer(to: &targetFD) { fdPtr in
+                    csvn_cat_stream(h, u, nativeRevision, writeCB, fdPtr)
+                }
+            }
+            try self.check(rc)
+        }
     }
 
     /// 读取远端仓库中指定路径文件的内容（支持 `maxBytes` C 层流式截断保护）。
